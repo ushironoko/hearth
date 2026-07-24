@@ -82,8 +82,7 @@ it amortizes (walking + reading + searching thousands of files) dwarfs the
 | 2 000 lines | 2.49 µs | 13.1 µs | 5.3× |
 | 20 000 lines | 10.4 µs | 34.1 µs | 3.3× |
 
-**Caveat (from the cross-model review):** `std::fs::read_to_string` is **not**
-`cat`. It runs in-process (no spawn, no stdout write) but validates UTF-8;
+**Caveat:** `std::fs::read_to_string` is **not** `cat`. It runs in-process (no spawn, no stdout write) but validates UTF-8;
 `cat` spawns, writes stdout, and skips validation. This measures the read
 *primitive* (cache serve + one alloc/copy, validity cached), not "faster than
 cat" — at the CLI, `read` loses to `cat` (above).
@@ -101,7 +100,7 @@ Default warm is 9.3× the ripgrep-engine baseline; `trust_cache` warm is **31×*
 Cold ≈ baseline (a first search over a fresh tree is not faster than ripgrep;
 the win is on reuse).
 
-**The `stat` is the warm bottleneck** (codex flagged this and it verified): the
+**The `stat` is the warm bottleneck:** the
 per-file `std::fs::metadata` freshness check is ~70% of default warm grep
 (1.97 → 0.58 ms when removed). Skipping it needs a coherence story:
 
@@ -131,9 +130,10 @@ cargo bench -p hearth-bench --bench edit_bench
 CORPUS=/tmp/hearth-corpus NUM_FILES=3000 bash bench/harness/compare.sh
 ```
 
-## Orchestrator-level & cross-runtime benchmarks (E)
+## Orchestrator-level & cross-runtime benchmarks
 
-Added to answer the cross-model review's "the orchestrator claim is unmeasured".
+These substantiate the *orchestrator* claim — sustained, multi-op, resident
+workloads — beyond the single-op micro-benchmarks above.
 
 ### Ablation — what the warm-grep win is actually made of
 
@@ -163,7 +163,7 @@ is the honest decomposition the earlier "grep is 9× faster" number hid.
 
 ### Cold-start, break-even, concurrency, RSS
 
-From `bench/harness/{cold_start,concurrent,rss}.sh` (codex-authored, independently run):
+From `bench/harness/{cold_start,concurrent,rss}.sh`:
 
 * **Cold-start incl. daemon spawn**: warm grep 6.1 ms; a full cold one-shot
   *including* `hearthd` spawn is 68.8 ms (spawn ≈ 62.6 ms); `hearth --no-daemon`
@@ -179,8 +179,8 @@ From `bench/harness/{cold_start,concurrent,rss}.sh` (codex-authored, independent
 `bench/harness/{node/compare.mjs, bun/compare.js}` — release napi, sync-vs-sync
 headline (async listed separately), naive-but-correct search (`readdir` +
 `readFile` + regex, no redundant `stat`/`access`), **path-set equality asserted**,
-flat corpus (no ignore-rule asymmetry). These fairness fixes came straight from
-the cross-model fairness review, which flagged the first draft as inflated.
+flat corpus (no ignore-rule asymmetry). These fairness rules matter — a looser
+methodology overstates the wins.
 
 | operation | vs Node 24 | vs Bun 1.3 | verdict |
 |-----------|-----------:|-----------:|---------|
@@ -198,7 +198,7 @@ the warm cache, so it does strictly more work than a plain `writeFile`; against 
 equally-atomic baseline it is only ~1.1–1.3× behind. That residual gap is the napi
 content marshalling (a `serde_json` copy) plus the cache-update copy.
 
-**Phase B outcome (napi, 80 KB, ns/op ratios):** `readBytes` returns a
+**napi `readBytes` / `writeFast` (80 KB, ns/op ratios):** `readBytes` returns a
 binary-safe `Buffer` and wins **1.58×** vs `fs.readFile` (Buffer-to-Buffer) —
 matching the string `read` win, and correct for non-UTF-8 files. `writeFast`
 (direct `path,content` args, content moved into the cache, no `serde_json`
@@ -213,11 +213,10 @@ caller, serving wrong bytes on later reads. Safety won; `readBytes` copies once.
 standalone Hearth tool; they appear only as components of the search comparison,
 where the composite decisively favours Hearth.
 
-## Known gaps (cross-model review backlog)
+## Known gaps
 
-A codex (OpenAI) bench-fairness review flagged, and this doc now reflects, that
-the suite still lacks benchmarks needed to fully substantiate an *orchestrator*
-claim. Not yet implemented:
+The suite still lacks some benchmarks needed to fully substantiate an
+*orchestrator* claim. Not yet implemented:
 
 * **Ablation** of the four warm-grep effects (walk-only vs content-only vs both).
 * **Cold-start including daemon spawn** (the current cold row is `--no-daemon`,

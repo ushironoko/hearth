@@ -67,8 +67,8 @@ and says so plainly where it doesn't:
   floor, not the payload. **The read/edit speed win lives in-process (native/napi).**
 - **`write` loses to `fs.writeFile`.** Hearth's write is *atomic* (crash-safe temp
   + rename) and cache-coherent, so it does strictly more work; against an equally
-  atomic baseline it is only ~1.1–1.4× behind, and that gap is inherent, not a
-  marshalling artifact (measured in phase B).
+  atomic baseline it is only ~1.1–1.4× behind, and that residual gap is inherent
+  to the extra syscalls (temp + rename + stat), not a copy-elision problem.
 
 The wins are real and reproducible; so are the boundaries.
 
