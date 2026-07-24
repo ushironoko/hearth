@@ -1,0 +1,29 @@
+[package]
+name = "hearth-napi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node.js (napi-rs) bindings for the Hearth tool orchestrator"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hearth-core = { workspace = true }
+hearth-tools = { workspace = true }
+hearth-proto = { workspace = true }
+
+napi = { workspace = true }
+napi-derive = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+mimalloc = { workspace = true }
+
+[build-dependencies]
+napi-build = { workspace = true }
+
+[features]
+default = []
+profiling = ["hearth-core/profiling"]

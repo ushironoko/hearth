@@ -1,0 +1,32 @@
+{
+  "name": "@hearth/napi",
+  "version": "0.1.0",
+  "description": "Node.js bindings for the Hearth tool orchestrator",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "type": "commonjs",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "hearth.*.node"
+  ],
+  "napi": {
+    "binaryName": "hearth",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.7.4"
+  }
+}

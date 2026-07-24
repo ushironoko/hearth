@@ -1,0 +1,38 @@
+[package]
+name = "hearth-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hearth tools: read, write, edit, bash, grep — built on the shared engine"
+
+[dependencies]
+hearth-core = { workspace = true }
+hearth-proto = { workspace = true }
+
+compact_str = { workspace = true }
+smallvec = { workspace = true }
+memchr = { workspace = true }
+bstr = { workspace = true }
+rustc-hash = { workspace = true }
+
+# grep engine (ripgrep stack)
+grep-searcher = { workspace = true }
+grep-regex = { workspace = true }
+grep-matcher = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+regex = { workspace = true }
+
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+crossbeam-channel = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

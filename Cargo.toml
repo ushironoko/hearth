@@ -1,0 +1,107 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/hearth-proto",
+  "crates/hearth-core",
+  "crates/hearth-tools",
+  "crates/hearth-daemon",
+  "crates/hearth-cli",
+  "crates/hearth-napi",
+  "bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+license = "MIT"
+repository = "https://github.com/ushironoko/hearth"
+
+[workspace.dependencies]
+# Internal crates (path deps)
+hearth-proto = { path = "crates/hearth-proto" }
+hearth-core = { path = "crates/hearth-core" }
+hearth-tools = { path = "crates/hearth-tools" }
+
+# --- Performance primitives (curated from vize_carton) ---
+bumpalo = { version = "=3.20.3", features = ["collections", "boxed"] }
+compact_str = { version = "=0.10.0", features = ["serde"] }
+smallvec = { version = "=1.15.2", features = ["union", "serde"] }
+rustc-hash = "=2.1.3"
+xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
+phf = { version = "=0.14.0", features = ["macros"] }
+memchr = "=2.8.3"
+bstr = "=1.13.0"
+
+# --- Concurrency / sync ---
+parking_lot = "=0.12.5"
+dashmap = "=6.2.1"
+crossbeam-channel = "=0.5.16"
+crossbeam-deque = "=0.8.7"
+crossbeam-utils = "=0.8.22"
+rayon = "=1.12.0"
+num_cpus = "=1.17.0"
+once_cell = "=1.21.4"
+
+# --- Filesystem / search engine (ripgrep stack) ---
+grep-searcher = "=0.1.17"
+grep-regex = "=0.1.14"
+grep-matcher = "=0.1.9"
+grep-cli = "=0.1.12"
+ignore = "=0.4.31"
+globset = "=0.4.19"
+regex = "=1.13.1"
+regex-automata = "=0.4.16"
+walkdir = "=2.5.0"
+memmap2 = "=0.9.11"
+notify = "=8.2.0"
+notify-debouncer-full = "=0.7.0"
+
+# --- Serialization / transport ---
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+serde_bytes = "=0.11.19"
+rmp-serde = "=1.3.1"
+bytes = "=1.12.1"
+
+# --- Errors / util ---
+thiserror = "=2.0.19"
+libc = "=0.2.189"
+nix = { version = "=0.31.3", features = ["socket", "uio"] }
+clap = { version = "=4.6.4", features = ["derive"] }
+
+# --- Allocator ---
+mimalloc = { version = "=0.1.52", default-features = false }
+
+# --- napi-rs (Node.js bindings) ---
+napi = { version = "=3.11.0", default-features = false, features = ["napi4", "napi8", "serde-json"] }
+napi-derive = "=3.6.0"
+napi-build = "=2.3.2"
+
+# --- Dev / bench ---
+criterion = { version = "=0.8.2", features = ["html_reports"] }
+tempfile = "=3.27.0"
+insta = "=1.48.0"
+
+# Aggressive release build: single codegen unit + fat LTO.
+# NOTE: panic = "unwind" (the default) is kept intentionally — the napi addon
+# turns Rust panics into JS exceptions and the worker pools use catch_unwind,
+# both of which require unwinding.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# A dev profile that is still fast enough to run benchmarks against while iterating.
+[profile.release-dev]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false

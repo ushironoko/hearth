@@ -1,0 +1,15 @@
+[package]
+name = "hearth-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared request/response protocol types for the Hearth tool orchestrator"
+
+[dependencies]
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+compact_str = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }

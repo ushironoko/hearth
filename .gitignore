@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / napi
+node_modules
+*.node
+crates/hearth-napi/index.js
+crates/hearth-napi/index.d.ts
+crates/hearth-napi/npm/**/*.node
+
+# bench artifacts
+/bench/corpus
+/target/criterion
+*.profraw
+
+.DS_Store

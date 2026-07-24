@@ -1,0 +1,27 @@
+[package]
+name = "hearth-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hearth CLI: talks to the resident daemon, or runs the engine inline"
+
+[[bin]]
+name = "hearth"
+path = "src/main.rs"
+
+[dependencies]
+hearth-core = { workspace = true }
+hearth-tools = { workspace = true }
+hearth-proto = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+
+[features]
+default = []
+profiling = ["hearth-core/profiling"]
