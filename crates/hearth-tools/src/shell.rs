@@ -1,31 +1,35 @@
-//! An opt-in warm-shell pool for `bash` (default off).
+//! An opt-in pipe-based warm-shell pool for `bash` (default off).
 //!
 //! Keeps a small pool of long-lived `/bin/sh` processes so a command avoids the
-//! ~1–2 ms per-command process spawn. Robustness comes from a deliberately
-//! simple protocol: the command's stdout **and** stderr are redirected to temp
-//! files, so the shell's control pipe carries only a single unambiguous marker
-//! line (`<nonce> <exit_code>`). That removes every classic warm-shell hazard —
-//! stdout/stderr marker collision, the trailing-newline problem, and the
-//! read-both-pipes deadlock. Each command runs in a `( … )` subshell with stdin
-//! from `/dev/null`, so cwd/env/variable changes never leak between commands
-//! (parity with spawn-per-command).
+//! per-command process spawn. Each shell keeps persistent stdout and stderr
+//! pipes. Two reader threads drain those pipes concurrently for every command,
+//! preventing either stream from filling up and deadlocking the other.
 //!
-//! On any anomaly (shell died, write failed, we can't spawn) the caller falls
-//! back to a fresh spawn, so a broken warm shell never returns wrong output.
-//! A timeout kills the shell's whole process group and discards it.
+//! A fresh, random 128-bit nonce delimits each command on both streams. Output
+//! is everything before the nonce, so output with or without a trailing newline
+//! is preserved exactly. Commands run through `eval` on a single-quoted string,
+//! which makes syntactically incomplete commands fail immediately instead of
+//! leaving the warm shell waiting for more input. Every command runs in an
+//! isolated `( … )` subshell with stdin from `/dev/null`, so cwd, environment,
+//! and variable changes never leak between commands.
 //!
-//! Known limitation: a syntactically incomplete command (e.g. an unbalanced
-//! quote) leaves the warm shell waiting for input and will hit the timeout; the
-//! always-correct spawn path (the default) does not have this property.
+//! On any protocol anomaly the caller falls back to a fresh spawn, so a broken
+//! warm shell never returns incorrect output. A timeout kills the shell's whole
+//! process group and returns the partial output collected from both pipes.
+//!
+//! Unlike the temp-file protocol, correctness relies on the random nonce not
+//! occurring naturally in command output. The collision probability is
+//! approximately 2^-128 per command.
 
 use parking_lot::Mutex;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::io::{BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 /// The outcome of a warm-shell run.
 pub enum Outcome {
@@ -46,8 +50,15 @@ pub struct WarmShellPool {
 
 impl Default for WarmShellPool {
     fn default() -> Self {
-        let max = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8);
-        Self { free: Mutex::new(Vec::new()), max, seq: AtomicU64::new(0) }
+        let max = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 8);
+        Self {
+            free: Mutex::new(Vec::new()),
+            max,
+            seq: AtomicU64::new(0),
+        }
     }
 }
 
@@ -55,6 +66,7 @@ struct WarmShell {
     child: Child,
     stdin: ChildStdin,
     out: Option<BufReader<ChildStdout>>,
+    err: Option<BufReader<ChildStderr>>,
     pgid: i32,
 }
 
@@ -71,13 +83,20 @@ fn spawn_shell() -> std::io::Result<WarmShell> {
     let mut child = Command::new("/bin/sh")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .process_group(0) // own group so a timeout can kill the whole tree
         .spawn()?;
     let stdin = child.stdin.take().expect("piped stdin");
     let out = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let err = BufReader::new(child.stderr.take().expect("piped stderr"));
     let pgid = child.id() as i32;
-    Ok(WarmShell { child, stdin, out: Some(out), pgid })
+    Ok(WarmShell {
+        child,
+        stdin,
+        out: Some(out),
+        err: Some(err),
+        pgid,
+    })
 }
 
 /// Single-quote a value for safe injection into the shell script.
@@ -93,6 +112,147 @@ fn sh_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+enum Msg {
+    Out {
+        data: Vec<u8>,
+        exit: Option<i32>,
+        reader: BufReader<ChildStdout>,
+    },
+    OutEof {
+        data: Vec<u8>,
+    },
+    Err {
+        data: Vec<u8>,
+        reader: BufReader<ChildStderr>,
+    },
+    ErrEof {
+        data: Vec<u8>,
+    },
+}
+
+#[derive(Default)]
+struct Collected {
+    out: Option<Vec<u8>>,
+    err: Option<Vec<u8>>,
+    exit: Option<i32>,
+    out_reader: Option<BufReader<ChildStdout>>,
+    err_reader: Option<BufReader<ChildStderr>>,
+    broken: bool,
+}
+
+impl Collected {
+    fn receive(&mut self, msg: Msg) {
+        match msg {
+            Msg::Out { data, exit, reader } => {
+                self.out = Some(data);
+                self.exit = exit;
+                self.out_reader = Some(reader);
+            }
+            Msg::OutEof { data } => {
+                self.out = Some(data);
+                self.broken = true;
+            }
+            Msg::Err { data, reader } => {
+                self.err = Some(data);
+                self.err_reader = Some(reader);
+            }
+            Msg::ErrEof { data } => {
+                self.err = Some(data);
+                self.broken = true;
+            }
+        }
+    }
+
+    fn has_both(&self) -> bool {
+        self.out.is_some() && self.err.is_some()
+    }
+
+    fn drain(&mut self, rx: &Receiver<Msg>) {
+        while !self.has_both() {
+            match rx.recv() {
+                Ok(msg) => self.receive(msg),
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn strings(&mut self) -> (String, String) {
+        let out = String::from_utf8_lossy(&self.out.take().unwrap_or_default()).into_owned();
+        let err = String::from_utf8_lossy(&self.err.take().unwrap_or_default()).into_owned();
+        (out, err)
+    }
+}
+
+fn read_stdout(mut reader: BufReader<ChildStdout>, nonce: Vec<u8>, tx: mpsc::Sender<Msg>) {
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 65_536];
+    let mut marker = None;
+
+    loop {
+        if let Some(pos) = marker {
+            let suffix = &buf[pos + nonce.len()..];
+            if let Some(newline) = memchr::memchr(b'\n', suffix) {
+                let code = std::str::from_utf8(&suffix[..newline])
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                    .unwrap_or(-1);
+                let _ = tx.send(Msg::Out {
+                    data: buf[..pos].to_vec(),
+                    exit: Some(code),
+                    reader,
+                });
+                return;
+            }
+        }
+
+        let prev_len = buf.len();
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => {
+                let _ = tx.send(Msg::OutEof { data: buf });
+                return;
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if marker.is_none() {
+                    let overlap = nonce.len().saturating_sub(1);
+                    let search_from = prev_len.saturating_sub(overlap);
+                    marker =
+                        memchr::memmem::find(&buf[search_from..], &nonce).map(|p| search_from + p);
+                }
+            }
+        }
+    }
+}
+
+fn read_stderr(mut reader: BufReader<ChildStderr>, nonce: Vec<u8>, tx: mpsc::Sender<Msg>) {
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 65_536];
+
+    loop {
+        let prev_len = buf.len();
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => {
+                let _ = tx.send(Msg::ErrEof { data: buf });
+                return;
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                let overlap = nonce.len().saturating_sub(1);
+                let search_from = prev_len.saturating_sub(overlap);
+                if let Some(pos) =
+                    memchr::memmem::find(&buf[search_from..], &nonce).map(|p| search_from + p)
+                {
+                    let _ = tx.send(Msg::Err {
+                        data: buf[..pos].to_vec(),
+                        reader,
+                    });
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl WarmShellPool {
@@ -115,15 +275,11 @@ impl WarmShellPool {
 
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let nonce = format!("__HEARTH_{pid}_{n}__");
-        let tmp = std::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
-        let out_file = tmp.join(format!(".hearth-sh-{pid}-{n}.out"));
-        let err_file = tmp.join(format!(".hearth-sh-{pid}-{n}.err"));
+        let r_hi = RandomState::new().build_hasher().finish();
+        let r_lo = RandomState::new().build_hasher().finish();
+        let nonce = format!("__HEARTH_{pid}_{n}_{r_hi:016x}{r_lo:016x}__");
 
-        let outcome = self.run_once(&mut shell, command, cwd, env, timeout, &nonce, &out_file, &err_file);
-
-        let _ = std::fs::remove_file(&out_file);
-        let _ = std::fs::remove_file(&err_file);
+        let outcome = self.run_once(&mut shell, command, cwd, env, timeout, &nonce);
 
         match &outcome {
             Outcome::Done(..) => {
@@ -140,7 +296,6 @@ impl WarmShellPool {
         outcome
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_once(
         &self,
         shell: &mut WarmShell,
@@ -149,10 +304,8 @@ impl WarmShellPool {
         env: &[(String, String)],
         timeout: Duration,
         nonce: &str,
-        out_file: &std::path::Path,
-        err_file: &std::path::Path,
     ) -> Outcome {
-        let mut script = String::with_capacity(command.len() + 128);
+        let mut script = String::with_capacity(command.len() + 192);
         script.push_str("( cd ");
         script.push_str(&sh_quote(cwd));
         script.push_str(" && { ");
@@ -163,68 +316,72 @@ impl WarmShellPool {
             script.push_str(&sh_quote(v));
             script.push_str("; ");
         }
-        script.push_str(command);
-        script.push_str("; } ) </dev/null >");
-        script.push_str(&sh_quote(&out_file.to_string_lossy()));
-        script.push_str(" 2>");
-        script.push_str(&sh_quote(&err_file.to_string_lossy()));
-        script.push('\n');
+        script.push_str("eval ");
+        script.push_str(&sh_quote(command));
+        script.push_str("; } ) </dev/null\n");
+        script.push_str("__hec=$?\n");
         script.push_str("printf '%s %d\\n' ");
         script.push_str(&sh_quote(nonce));
-        script.push_str(" \"$?\"\n");
+        script.push_str(" \"$__hec\"\n");
+        script.push_str("printf '%s\\n' ");
+        script.push_str(&sh_quote(nonce));
+        script.push_str(" 1>&2\n");
 
         if shell.stdin.write_all(script.as_bytes()).is_err() || shell.stdin.flush().is_err() {
             return Outcome::Retry;
         }
 
-        // The control pipe carries only the marker line. Read it on a thread so
-        // we can time out; hand the reader back on success.
-        let mut out = shell.out.take().expect("reader present");
+        let out = shell.out.take().expect("stdout reader present");
+        let err = shell.err.take().expect("stderr reader present");
         let (tx, rx) = mpsc::channel();
-        let nonce_owned = nonce.to_string();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match out.read_line(&mut line) {
-                    Ok(0) => {
-                        let _ = tx.send((None, out));
-                        return;
-                    }
-                    Ok(_) => {
-                        if let Some(rest) = line.strip_prefix(&nonce_owned) {
-                            let code = rest.trim().parse::<i32>().unwrap_or(-1);
-                            let _ = tx.send((Some(code), out));
-                            return;
-                        }
-                        // ignore anything that isn't the marker (shouldn't occur)
-                    }
-                    Err(_) => {
-                        let _ = tx.send((None, out));
-                        return;
-                    }
+        let out_tx = tx.clone();
+        let out_nonce = nonce.as_bytes().to_vec();
+        let err_nonce = out_nonce.clone();
+        let out_handle = std::thread::spawn(move || read_stdout(out, out_nonce, out_tx));
+        let err_handle = std::thread::spawn(move || read_stderr(err, err_nonce, tx));
+
+        let deadline = Instant::now() + timeout;
+        let mut collected = Collected::default();
+        let mut timed_out = false;
+
+        while !collected.has_both() && !collected.broken {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(msg) => collected.receive(msg),
+                Err(RecvTimeoutError::Timeout) => {
+                    timed_out = true;
+                    break;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    collected.broken = true;
+                    break;
                 }
             }
-        });
-
-        let read_file = |p: &std::path::Path| -> String {
-            std::fs::read(p).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
-        };
-
-        match rx.recv_timeout(timeout) {
-            Ok((Some(code), out)) => {
-                shell.out = Some(out);
-                Outcome::Done(read_file(out_file), read_file(err_file), code)
-            }
-            // Shell hit EOF before the marker → it died; fall back to spawn.
-            Ok((None, _)) => Outcome::Retry,
-            Err(RecvTimeoutError::Timeout) => {
-                // SAFETY: kill our own child's process group; the reader thread
-                // then sees EOF and exits, dropping the moved-out reader.
-                unsafe { libc::kill(-shell.pgid, libc::SIGKILL) };
-                Outcome::TimedOut(read_file(out_file), read_file(err_file))
-            }
-            Err(_) => Outcome::Retry,
         }
+
+        if timed_out || collected.broken {
+            // SAFETY: kill our own child's process group so both pipe readers
+            // hit EOF and can always be drained and joined.
+            unsafe { libc::kill(-shell.pgid, libc::SIGKILL) };
+            collected.drain(&rx);
+        }
+
+        let _ = out_handle.join();
+        let _ = err_handle.join();
+
+        if timed_out {
+            let (out, err) = collected.strings();
+            return Outcome::TimedOut(out, err);
+        }
+        if collected.broken || !collected.has_both() {
+            return Outcome::Retry;
+        }
+
+        shell.out = collected.out_reader.take();
+        shell.err = collected.err_reader.take();
+        let exit = collected.exit.unwrap_or(-1);
+        let (out, err) = collected.strings();
+        Outcome::Done(out, err, exit)
     }
 }
+

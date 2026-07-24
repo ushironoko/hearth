@@ -189,6 +189,25 @@ fn warm_shell_correctness() {
 }
 
 #[test]
+fn warm_shell_incomplete_command_fast_fail() {
+    // A syntactically incomplete command (unbalanced quote) must fail fast via
+    // `eval`, not block until the timeout, and the pool must stay healthy.
+    let dir = tempfile::tempdir().unwrap();
+    let eng = warm_engine(dir.path());
+    let start = std::time::Instant::now();
+    let r = run(&eng, "echo \"foo", Some(5000));
+    assert!(!r.timed_out, "incomplete command must NOT hit the timeout");
+    assert_ne!(r.exit_code, 0, "incomplete command must fail with a non-zero exit");
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(2000),
+        "incomplete command must fail fast, well under the 5s timeout"
+    );
+    let r2 = run(&eng, "echo ok", None);
+    assert_eq!(r2.stdout, "ok\n");
+    assert_eq!(r2.exit_code, 0);
+}
+
+#[test]
 fn bash_runs_and_times_out() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());

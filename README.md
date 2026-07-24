@@ -175,10 +175,15 @@ bash bench/harness/compare.sh                  # end-to-end CLI vs ripgrep/cat/s
   materialized once); compiled-matcher cache (regex + glob sets cached on the
   engine via a type-erased extension, so a repeated pattern is compiled once);
   **opt-in warm-shell pool for `bash`** (`--warm-shell` / `warmShell` /
-  `EngineConfig::warm_shell`) — **3.0× faster than spawn-per-command** (694 µs vs
-  2.10 ms for a trivial command), all 8 correctness cases pass (cwd isolation,
-  large output, stdin, timeout recovery), falls back to a fresh spawn on any
-  anomaly. This gives `bash` the resident advantage the other tools already had.
+  `EngineConfig::warm_shell`) — a **pipe-based** protocol (persistent stdout/stderr
+  pipes, a random 128-bit per-command nonce marker, `eval`-wrapped commands),
+  **3.8× faster than spawn-per-command** (546 µs vs 2.08 ms), all 8 correctness
+  cases pass (cwd isolation, large output, stdin, timeout recovery) **plus
+  fast-fail on syntactically-incomplete commands**, falling back to a fresh spawn
+  on any anomaly. This gives `bash` the resident advantage the other tools had.
+  (The design came from an *ultracode* competition: a cross-model codex PoC beat
+  the initial temp-file implementation by 1.3× and fixed its unbalanced-quote
+  limitation; it was reviewed and integrated here.)
 * **Backlog** (ranked by value/effort): **B** napi zero-copy read
   (`Buffer`/external ArrayBuffer) — closes the large-read copy and lets `read`
   return bytes without a decode; content-grep fd-passing. Lower-value:
