@@ -8,8 +8,8 @@ Two layers are measured because Hearth has two very different surfaces:
    These are **component microbenchmarks**, not end-to-end product numbers.
 2. **CLI level** — `bench/harness/compare.sh` (hyperfine). A fresh `hearth`
    process connects to a long-lived `hearthd` over a Unix socket each run, vs
-   the real installed tool (`rg`/`cat`/`sed`). This is the honest
-   product-level, end-to-end comparison; it pays an IPC tax ∝ payload size.
+   the real installed tool (`rg`/`cat`/`sed`). This is the product-level,
+   end-to-end comparison; it pays an IPC tax ∝ payload size.
 
 Hardware: Apple Silicon, 10 cores, 32 GB, macOS 25.3, Rust 1.95, `--release`
 (`lto="fat"`, `codegen-units=1`). Corpus (`gen-corpus`): a **`git init`-ed**
@@ -30,7 +30,7 @@ file, a >4 MiB file, and a heavy-tailed size distribution.
 | `read` small file | `cat` | `cat` 1.57× faster |
 | `edit` (reset each run) | `sed -i` | `sed` 1.29× faster |
 
-**The honest headline:** *repeated `grep` (all three modes) over an unchanged
+**The headline:** *repeated `grep` (all three modes) over an unchanged
 git-tracked tree, via a warm daemon, is 1.34–4.53× faster than one-shot
 ripgrep.* The advantage is resident amortization — the cold one-shot path is
 only ≈ ripgrep. `read` and `edit` **lose** at the CLI: their payload (file
@@ -148,7 +148,7 @@ workloads — beyond the single-op micro-benchmarks above.
 
 So the ~9.7× warm win is **content-cache-dominated** (14.8 → 2.0 ms once content is
 warm) with a modest walk-cache contribution (19.2 → 14.8 ms); they compound. This
-is the honest decomposition the earlier "grep is 9× faster" number hid.
+is the decomposition the earlier "grep is 9× faster" number hid.
 
 ### Multi-op amortization (the actual orchestrator workload)
 
@@ -191,7 +191,7 @@ methodology overstates the wins.
 | `write` vs plain `writeFileSync` | 3.9× **slower** | 5.7× **slower** | Hearth loses |
 | `write` vs **atomic** (temp+rename) | 1.3× **slower** | 1.1× **slower** | Hearth ~parity, slightly slower |
 
-**Honest verdict:** Hearth's `read` and `grep` beat Node and Bun `fs` decisively
+**Verdict:** Hearth's `read` and `grep` beat Node and Bun `fs` decisively
 even under a scrupulously fair, sync-vs-sync, release comparison. **`write` is the
 exception** — it is *atomic* (temp + rename, crash-safe replace) and also refreshes
 the warm cache, so it does strictly more work than a plain `writeFile`; against an

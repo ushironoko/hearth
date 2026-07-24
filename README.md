@@ -30,8 +30,8 @@ Three surfaces, one core:
 - **Daemon + CLI** — `hearthd` (a resident server) and the thin `hearth` client,
   talking length-prefixed msgpack over a Unix socket.
 
-Full design in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); full, honest
-benchmark methodology in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+Full design in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); full benchmark
+methodology in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ---
 
@@ -55,10 +55,10 @@ What that buys, **measured** (Apple Silicon, `--release`; see
   faster than spawning a shell per command.
 - **`edit`** is ~2× a naive disk read-replace-write for large files.
 
-### Honest about the limits
+### Limits
 
-Hearth wins where the amortized work it saves exceeds the cost of reaching it,
-and says so plainly where it doesn't:
+Hearth wins where the amortized work it saves exceeds the cost of reaching it.
+Where it doesn't:
 
 - **CLI `read`/`edit` of a small file lose to `cat`/`sed`.** A daemon-client must
   spawn a process *and* round-trip a socket; for a trivial op that costs ~as much
@@ -69,8 +69,6 @@ and says so plainly where it doesn't:
   + rename) and cache-coherent, so it does strictly more work; against an equally
   atomic baseline it is only ~1.1–1.4× behind, and that residual gap is inherent
   to the extra syscalls (temp + rename + stat), not a copy-elision problem.
-
-The wins are real and reproducible; so are the boundaries.
 
 ---
 
@@ -215,6 +213,5 @@ let hits = grep(&engine, &GrepParams {
 - The default is always correct; the fast paths (`--trust-cache`, `--warm-shell`)
   are opt-in and documented with their trade-offs.
 - Benchmarks are held to a fair standard (sync-vs-sync, path-set equality,
-  atomicity caveats) — see the "honest" framing in `docs/BENCHMARKS.md` before
-  quoting a number.
+  atomicity caveats) — see `docs/BENCHMARKS.md` before quoting a number.
 - Rust edition 2024, functional-leaning style, no hidden global state.
