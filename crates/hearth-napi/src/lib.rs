@@ -97,6 +97,24 @@ impl HearthEngine {
         serde_json::to_value(r).map_err(json_err)
     }
 
+    /// Fast write: takes `path` and `content` directly (no JSON params object),
+    /// so `content` is passed once from JS and **moved** into the cache — one
+    /// fewer full-content copy than `write`.
+    #[napi]
+    pub fn write_fast(&self, path: String, content: String) -> Result<Value> {
+        let r = hearth_tools::write_owned(&self.engine, &path, content, true).map_err(json_err)?;
+        serde_json::to_value(r).map_err(json_err)
+    }
+
+    /// Read a file's raw bytes as a Node `Buffer` (binary-safe; also avoids the
+    /// UTF-8 string construction of `read`). One copy out of the shared cache.
+    #[napi]
+    pub fn read_bytes(&self, params: Value) -> Result<Buffer> {
+        let p: ReadParams = serde_json::from_value(params).map_err(json_err)?;
+        let bytes = hearth_tools::read_bytes(&self.engine, &p).map_err(json_err)?;
+        Ok(Buffer::from(bytes))
+    }
+
     #[napi]
     pub fn edit(&self, params: Value) -> Result<Value> {
         let p: EditParams = serde_json::from_value(params).map_err(json_err)?;

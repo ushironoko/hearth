@@ -5,6 +5,20 @@ use hearth_core::{profile, Engine};
 use hearth_proto::{ReadParams, ReadResult, ToolError, ToolResult};
 use std::fmt::Write as _;
 
+/// Read the whole file's raw bytes from the warm cache (a single copy out of the
+/// shared buffer). Used by the napi `readBytes` binary-safe API. Returning the
+/// cached buffer *without* copying is unsafe here — a JS `Buffer` is mutable and
+/// would corrupt the shared cache entry — so this copies, exactly like the
+/// `read` String path.
+pub fn read_bytes(engine: &Engine, params: &ReadParams) -> ToolResult<Vec<u8>> {
+    profile!("tool.read_bytes", {
+        let path = resolve_path(engine, &params.path);
+        let trust = engine.stat_free(&path);
+        let (entry, _hit) = engine.files().get_trusting(&path, trust)?;
+        Ok(entry.bytes().to_vec())
+    })
+}
+
 /// Read a file (optionally a line window), reusing the shared file cache.
 pub fn read(engine: &Engine, params: &ReadParams) -> ToolResult<ReadResult> {
     profile!("tool.read", {

@@ -184,11 +184,17 @@ bash bench/harness/compare.sh                  # end-to-end CLI vs ripgrep/cat/s
   (The design came from an *ultracode* competition: a cross-model codex PoC beat
   the initial temp-file implementation by 1.3× and fixed its unbalanced-quote
   limitation; it was reviewed and integrated here.)
-* **Backlog** (ranked by value/effort): **B** napi zero-copy read
-  (`Buffer`/external ArrayBuffer) — closes the large-read copy and lets `read`
-  return bytes without a decode; content-grep fd-passing. Lower-value:
-  persistent worker pool (thread spawn is already cheap), `>4 MiB` mmap policy
-  (niche), own-content write (the `write` loss is mostly inherent atomicity — B
-  narrows the *atomic-vs-atomic* gap only). (CLI small-`read` beating `cat` is
-  **not** on the list — architecturally impossible for a daemon-client; that win
-  lives in-process.)
+* **B (napi) — done, with an honest outcome:** `readBytes` returns a binary-safe
+  Node `Buffer` and **wins 1.58× vs `fs.readFile`** (Buffer-to-Buffer). True
+  zero-copy into the shared cache was **rejected** — a JS `Buffer` is mutable and
+  would corrupt the shared, mtime-validated cache entry — so `readBytes` copies
+  once, like `read`. `writeFast` (direct `path,content` args, content **moved**
+  into the cache) shaved only ~1.04× off `write`: the `write` loss to `fs` is
+  **confirmed inherent** to atomicity (temp+rename+stat syscalls dominate, not
+  the content copies), so it stays ~1.4× behind an atomic `writeFile` and loses
+  to a plain one. Documented, not papered over.
+* **Backlog** (low-value): content-grep fd-passing; persistent worker pool
+  (thread spawn is already cheap); `>4 MiB` mmap policy (niche). (CLI small-`read`
+  beating `cat`, and `write` beating a non-atomic `writeFile`, are **not** on the
+  list — both are structurally impossible; those wins live in-process / are the
+  cost of crash-safety.)

@@ -196,8 +196,20 @@ even under a scrupulously fair, sync-vs-sync, release comparison. **`write` is t
 exception** — it is *atomic* (temp + rename, crash-safe replace) and also refreshes
 the warm cache, so it does strictly more work than a plain `writeFile`; against an
 equally-atomic baseline it is only ~1.1–1.3× behind. That residual gap is the napi
-content marshalling (a `serde_json` copy) plus the cache-update copy — both
-targeted by the napi zero-copy work (phase B). `fs.stat`/`access`/`readdir` have no
+content marshalling (a `serde_json` copy) plus the cache-update copy.
+
+**Phase B outcome (napi, 80 KB, ns/op ratios):** `readBytes` returns a
+binary-safe `Buffer` and wins **1.58×** vs `fs.readFile` (Buffer-to-Buffer) —
+matching the string `read` win, and correct for non-UTF-8 files. `writeFast`
+(direct `path,content` args, content moved into the cache, no `serde_json`
+intermediate) came out only **1.04×** faster than `write` (211 → 202 µs): the
+two saved content copies are tiny next to the atomic temp+rename+stat syscalls,
+so `writeFast` still loses **1.42×** to an atomic `writeFile` and **3.37×** to a
+plain one. This **confirms the write loss is inherent to atomicity**, not a
+marshalling artifact — a real, measured negative result. True zero-copy `read`
+via an external `Buffer` was **rejected**: a JS `Buffer` is mutable and a view
+into the shared, mtime-validated cache entry could be silently corrupted by the
+caller, serving wrong bytes on later reads. Safety won; `readBytes` copies once. `fs.stat`/`access`/`readdir` have no
 standalone Hearth tool; they appear only as components of the search comparison,
 where the composite decisively favours Hearth.
 

@@ -17,8 +17,8 @@ mod write;
 pub use bash::bash;
 pub use edit::edit;
 pub use grep::grep;
-pub use read::read;
-pub use write::write;
+pub use read::{read, read_bytes};
+pub use write::{write, write_owned};
 
 pub use hearth_core::Engine;
 pub use hearth_proto as proto;

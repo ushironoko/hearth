@@ -25,6 +25,12 @@ assert.equal(r2.cacheHit, true);
 const e = eng.edit({ path: join(dir, "a.rs"), oldString: "42", newString: "43", replaceAll: false });
 assert.equal(e.replacements, 1);
 
+// writeFast (moves content) + readBytes (binary-safe Buffer)
+const wf = eng.writeFast(join(dir, "d.txt"), "fast\ncontent\n");
+assert.equal(wf.bytesWritten, 13);
+const rb = eng.readBytes({ path: join(dir, "d.txt") });
+assert.ok(Buffer.isBuffer(rb) && rb.toString("utf8") === "fast\ncontent\n", "readBytes byte-exact");
+
 // grep sync
 const g = eng.grep({ pattern: "fn ", path: dir, mode: "content", globs: ["*.rs"] });
 assert.equal(g.totalMatches, 2);
