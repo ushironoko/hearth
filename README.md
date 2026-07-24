@@ -2,9 +2,9 @@
 
 **A resident, all-in-one agent-tool orchestrator.** `read`, `write`, `edit`,
 `bash`, and `grep` are served by one warm, long-lived engine that bundles a file
-cache, a directory-walk cache, a sharded profiler, an adaptive self-optimizer,
-and a warm-shell pool — all shared across every tool and reachable from native
-Rust, from Node.js (napi-rs), and over a Unix-socket daemon + CLI.
+cache, a directory-walk cache, and a warm-shell pool — all shared across every
+tool and reachable from native Rust, from Node.js (napi-rs), and over a
+Unix-socket daemon + CLI.
 
 Built in Rust, inspired by the *corsa-bind* orchestration model and the
 *vize_carton* performance substrate.
@@ -80,12 +80,11 @@ The wins are real and reproducible; so are the boundaries.
 
 ```
                  ┌──────────────────────── one resident Engine ─────────────────────────┐
-   native Rust ──┤  FileCache   — mtime/size-validated, UTF-8-validity cached, LRU        │
-   napi (Node) ──┤  WalkCache   — parallel ignore-walk cached per root, glob post-filter  │
-   daemon/CLI  ──┤  Profiler    — sharded timing + histogram + allocation counters        │
-                 │  Optimizer   — adaptive byte-budget LRU + hysteresis controller         │
-                 │  WarmShells  — opt-in pooled shells for bash                            │
+   native Rust ──┤  FileCache   — file contents cached, validated by mtime/size           │
+   napi (Node) ──┤  WalkCache   — directory walk (+ .gitignore) cached per root            │
+   daemon/CLI  ──┤  WarmShells  — opt-in pooled shells for bash                            │
                  │  fs-watch    — best-effort proactive invalidation                       │
+                 │  (caches are bounded by an LRU byte budget, so the daemon stays small)  │
                  └──────────────────────────────────────────────────────────────────────┘
    crates:  hearth-proto → hearth-core → hearth-tools → { hearth-daemon, hearth-cli, hearth-napi }
 ```
@@ -117,10 +116,6 @@ call.
   marker on both streams and `eval`-wrapped commands (fast-fail on incomplete
   input); subshell-isolated, `/dev/null` stdin, timeout kills the group, and any
   anomaly falls back to a fresh spawn.
-- **Adaptive self-optimizer.** A background loop reads the cache's live hit-rate
-  and grows/shrinks a byte budget with hysteresis, enforcing it via LRU eviction —
-  closing the measurement→tuning loop in-process (where *vize_carton*'s profiler
-  stops at human-read recommendations).
 
 ### At the boundaries
 
@@ -208,7 +203,7 @@ let hits = grep(&engine, &GrepParams {
 | Crate | Role |
 |-------|------|
 | `hearth-proto` | Shared request/response types (the one contract; `serde`, `camelCase`). |
-| `hearth-core`  | The resident `Engine`: caches, profiler, optimizer, warm-shells, fs-watch. |
+| `hearth-core`  | The resident `Engine`: the shared caches, warm-shells, and fs-watch. |
 | `hearth-tools` | The five tools + msgpack transport, built on the engine. |
 | `hearth-daemon`| `hearthd` — the Unix-socket server. |
 | `hearth-cli`   | `hearth` — the thin client (daemon or inline). |
@@ -222,5 +217,4 @@ let hits = grep(&engine, &GrepParams {
 - Benchmarks are held to a fair standard (sync-vs-sync, path-set equality,
   atomicity caveats) — see the "honest" framing in `docs/BENCHMARKS.md` before
   quoting a number.
-- Rust edition 2024, functional-leaning style, no hidden globals except the
-  process-wide allocator hook the profiler necessarily rides on.
+- Rust edition 2024, functional-leaning style, no hidden global state.
