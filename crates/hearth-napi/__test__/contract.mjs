@@ -6,7 +6,17 @@
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { errorKind, rejects, run, sleep, suite, tempDir, test, throws } from "./harness.mjs";
+import {
+  errorKind,
+  rejects,
+  run,
+  sleep,
+  spinUpLoad,
+  suite,
+  tempDir,
+  test,
+  throws,
+} from "./harness.mjs";
 
 const entry = process.env.HEARTH_ENTRY ?? new URL("../index.js", import.meta.url).href;
 const { HearthEngine } = await import(entry);
@@ -144,6 +154,57 @@ test("streams ordered chunks that reconstruct the result", async () => {
   assert.equal(text("stderr"), result.stderr);
   const seqs = chunks.map((c) => c.seq);
   assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b));
+});
+
+test("a settled promise means every chunk was already delivered", async () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+
+  // `bashStream` hands chunks to JS without blocking, so the promise must not
+  // settle until they have actually run — otherwise a streaming caller loses
+  // the tail, and a `collectOutput: false` caller loses everything.
+  //
+  // The window only opens when the worker thread and the JS thread compete for
+  // a core: on an idle machine libuv drains the callback queue before resolving
+  // the promise every single time, and the bug is invisible. So this test
+  // creates the contention itself, and uses the command shape that reproduced
+  // it — one that writes a little and exits immediately, leaving no time for
+  // the queue to drain on its own.
+  //
+  // It is a sampling test, not a proof: a single run catches a regression
+  // roughly 90% of the time, which across the CI matrix is decisive. It cannot
+  // fail when the code is correct.
+  const load = await spinUpLoad();
+  try {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const chunks = [];
+      const result = await engine.bashStream({ command: "printf x" }, (c) => chunks.push(c));
+      assert.equal(
+        chunks.length,
+        result.chunks,
+        `attempt ${attempt}: result reported ${result.chunks} chunk(s), the callback saw ${chunks.length}`,
+      );
+      assert.equal(chunks.map((c) => c.text).join(""), result.stdout, `attempt ${attempt}`);
+    }
+  } finally {
+    await load.stop();
+  }
+});
+
+test("nothing is delivered twice when output is also collected", async () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  const chunks = [];
+  const result = await engine.bashStream({ command: "seq 5000" }, (c) => chunks.push(c));
+
+  const streamed = chunks.map((c) => c.text).join("");
+  assert.equal(streamed, result.stdout);
+  assert.equal(streamed.split("\n").filter(Boolean).length, 5000, "no duplicated lines");
+  assert.deepEqual(
+    chunks.map((c) => Number(c.seq)),
+    chunks.map((_, i) => i + 1),
+    "sequence numbers are dense and start at 1",
+  );
 });
 
 test("chunks arrive while the command is still running", async () => {

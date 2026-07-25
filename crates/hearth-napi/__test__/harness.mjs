@@ -60,6 +60,31 @@ export function errorKind(error) {
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Saturate the CPU with busy worker threads, so a test can observe races that
+ * only appear when threads compete for a core.
+ *
+ * Each worker self-terminates after `budgetMs` even if `stop()` is never
+ * reached, so a failing test can never leave the machine pinned.
+ */
+export async function spinUpLoad({ budgetMs = 30_000 } = {}) {
+  const { Worker } = await import("node:worker_threads");
+  const os = await import("node:os");
+  const count = Math.max(2, os.availableParallelism?.() ?? os.cpus().length);
+  const workers = Array.from(
+    { length: count },
+    () => new Worker(`const t=Date.now(); while(Date.now()-t<${budgetMs});`, { eval: true }),
+  );
+  // Let them actually start competing before the measurement begins.
+  await sleep(100);
+  return {
+    count,
+    stop: async () => {
+      await Promise.all(workers.map((w) => w.terminate()));
+    },
+  };
+}
+
 export async function run(label) {
   let failed = 0;
   for (const { name, fn } of tests) {

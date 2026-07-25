@@ -30,6 +30,8 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 mod types;
 pub use types::*;
@@ -97,6 +99,97 @@ fn split(signal: Option<Abort>) -> (CancelToken, Option<AbortSignal>) {
 
 /// The stream callback `bashStream` calls for every chunk.
 type ChunkCallback = ThreadsafeFunction<BashChunk, (), BashChunk, Status, false>;
+
+/// How long a stalled JS consumer is waited on before the promise settles
+/// anyway. Measured from the *last* delivery, so a slow-but-progressing
+/// consumer is never cut off — only one that has stopped draining entirely.
+const CHUNK_DELIVERY_IDLE_LIMIT: Duration = Duration::from_secs(30);
+
+/// Delivers chunks to JS, and knows when JS has actually received them.
+///
+/// `AsyncTask` settles its promise from the JS thread as soon as `compute`
+/// returns, while a non-blocking threadsafe call is only *queued* at that
+/// point. Without a barrier the promise can therefore settle before the last
+/// chunks are delivered — which a streaming caller sees as silently truncated
+/// output, and a `collectOutput: false` caller sees as no output at all.
+///
+/// Sends stay non-blocking, so a chatty command is not throttled by a JS
+/// round-trip per chunk; the barrier at the end restores the guarantee that a
+/// resolved promise means every chunk has been handed over.
+struct ChunkStream {
+    callback: ChunkCallback,
+    progress: Arc<(Mutex<Progress>, Condvar)>,
+}
+
+#[derive(Default)]
+struct Progress {
+    /// Dispatched but not yet run on the JS thread.
+    pending: usize,
+    /// Monotonic count of deliveries, so the barrier can tell "stalled" from
+    /// "slow".
+    delivered: u64,
+}
+
+impl ChunkStream {
+    fn new(callback: ChunkCallback) -> Self {
+        Self { callback, progress: Arc::new((Mutex::new(Progress::default()), Condvar::new())) }
+    }
+
+    fn send(&self, chunk: proto::BashChunk) {
+        {
+            let (state, _) = &*self.progress;
+            state.lock().unwrap().pending += 1;
+        }
+        let progress = Arc::clone(&self.progress);
+        let status = self.callback.call_with_return_value(
+            chunk.into(),
+            ThreadsafeFunctionCallMode::NonBlocking,
+            move |_returned, _env| {
+                settle(&progress);
+                Ok(())
+            },
+        );
+        if status != Status::Ok {
+            // The completion callback will never run — most likely the
+            // function is closing because the environment is shutting down —
+            // so release the slot here or the barrier would wait it out.
+            settle(&self.progress);
+        }
+    }
+
+    /// Block until every dispatched chunk has run on the JS thread.
+    ///
+    /// Returns false if the consumer stalled and the wait was abandoned, which
+    /// the caller reports rather than hiding.
+    fn drain(&self) -> bool {
+        let (state, delivered) = &*self.progress;
+        let mut guard = state.lock().unwrap();
+        let mut last_delivered = guard.delivered;
+        let mut idle_since = Instant::now();
+        while guard.pending > 0 {
+            let remaining = CHUNK_DELIVERY_IDLE_LIMIT.saturating_sub(idle_since.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, _) = delivered.wait_timeout(guard, remaining).unwrap();
+            guard = next;
+            if guard.delivered != last_delivered {
+                last_delivered = guard.delivered;
+                idle_since = Instant::now();
+            }
+        }
+        true
+    }
+}
+
+fn settle(progress: &Arc<(Mutex<Progress>, Condvar)>) {
+    let (state, delivered) = &**progress;
+    let mut guard = state.lock().unwrap();
+    guard.pending = guard.pending.saturating_sub(1);
+    guard.delivered += 1;
+    drop(guard);
+    delivered.notify_all();
+}
 
 /// A resident Hearth engine: shared warm caches, warm shells, and profiler.
 ///
@@ -342,7 +435,7 @@ impl HearthEngine {
                 engine: self.engine.clone(),
                 params: params.into(),
                 cancel,
-                on_chunk: Some(on_chunk),
+                on_chunk: Some(ChunkStream::new(on_chunk)),
             },
             signal,
         )
@@ -478,7 +571,7 @@ pub struct BashTask {
     engine: Engine,
     params: proto::BashParams,
     cancel: CancelToken,
-    on_chunk: Option<ChunkCallback>,
+    on_chunk: Option<ChunkStream>,
 }
 
 #[napi]
@@ -488,16 +581,27 @@ impl Task for BashTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         match &self.on_chunk {
-            // Non-blocking: a slow JS consumer must not stall the pipe readers,
-            // which is what a full pipe buffer would turn into a deadlock.
-            Some(callback) => hearth_tools::bash_stream(
-                &self.engine,
-                &self.params,
-                &self.cancel,
-                &mut |chunk| {
-                    callback.call(chunk.into(), ThreadsafeFunctionCallMode::NonBlocking);
-                },
-            ),
+            Some(stream) => {
+                let result = hearth_tools::bash_stream(
+                    &self.engine,
+                    &self.params,
+                    &self.cancel,
+                    &mut |chunk| stream.send(chunk),
+                );
+                // Do not let the promise settle ahead of the chunks it
+                // describes. `result` is held first so a command failure is
+                // still reported even if the consumer then stalls.
+                if !stream.drain() && result.is_ok() {
+                    return Err(Error::new(
+                        Status::GenericFailure,
+                        format!(
+                            "{}: the chunk callback stopped accepting output",
+                            proto::ErrorKind::Internal.as_str()
+                        ),
+                    ));
+                }
+                result
+            }
             None => hearth_tools::bash_cancellable(&self.engine, &self.params, &self.cancel),
         }
         .map_err(task_err)
