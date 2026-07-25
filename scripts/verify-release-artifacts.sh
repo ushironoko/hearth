@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Every target declared in package.json must have its compiled addon sitting in
-# the matching npm/ platform package before anything is published. A missing
-# binary otherwise ships as a package that installs fine and then fails to load.
+# the matching npm/ platform package before anything is published — and must
+# still be there after `npm pack`, since a wrong `files` entry produces a package
+# that installs fine and then cannot load.
+#
+# Packing each platform package is the only way to check the second part: the
+# binary being on disk says nothing about whether it is in the tarball.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,13 +36,32 @@ while IFS= read -r target; do
     missing=1
     continue
   fi
-  binary="$package_dir/npm/$dir/hearth.$dir.node"
-  if [ -f "$binary" ]; then
-    printf 'ok   %-28s %s (%s bytes)\n' "$target" "npm/$dir" "$(wc -c < "$binary" | tr -d ' ')"
-  else
+  addon="hearth.$dir.node"
+  binary="$package_dir/npm/$dir/$addon"
+  if [ ! -f "$binary" ]; then
     printf 'MISS %-28s %s\n' "$target" "npm/$dir"
     missing=1
+    continue
   fi
+
+  # Pack into a scratch directory and confirm the addon survived into the
+  # tarball. `npm pack` writes relative to --pack-destination, so nothing is
+  # left behind in the package directory.
+  scratch="$(mktemp -d)"
+  if ! tarball="$(cd "$package_dir/npm/$dir" && npm pack --silent --pack-destination "$scratch" 2>/dev/null)"; then
+    printf 'FAIL %-28s %s (npm pack failed)\n' "$target" "npm/$dir"
+    missing=1
+    rm -rf "$scratch"
+    continue
+  fi
+  if tar -tzf "$scratch/$tarball" | grep -qx "package/$addon"; then
+    printf 'ok   %-28s %s (%s bytes, in tarball)\n' \
+      "$target" "npm/$dir" "$(wc -c < "$binary" | tr -d ' ')"
+  else
+    printf 'FAIL %-28s %s (addon missing from the packed tarball)\n' "$target" "npm/$dir"
+    missing=1
+  fi
+  rm -rf "$scratch"
 done <<< "$targets"
 
 if [ "$missing" -ne 0 ]; then

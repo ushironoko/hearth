@@ -78,9 +78,9 @@ released independently; they are not published to crates.io today.
    **publish** — gated on the `npm-publish` environment, and the only job with
    `id-token: write`. It publishes the tree the previous job verified, rather
    than rebuilding, so what ships is what was tested. Platform packages go
-   first on purpose: the root package's `optionalDependencies` name them, so
-   publishing the root first leaves a window where an install resolves to
-   versions that do not exist.
+   first, then it **waits for them to be resolvable** before publishing the
+   root — see below. Finally a fourth job creates the GitHub release with
+   generated notes.
 
 ## Authentication: no tokens
 
@@ -156,6 +156,29 @@ package.
 > select which actions they allow. `npm publish` is the only one this pipeline
 > needs.
 
+## Why the publish order matters
+
+The root package's `optionalDependencies` name the platform packages, so they
+must exist first. But "published" and "resolvable" are not the same moment: npm's
+publish endpoint returns before the new version is visible on every replica.
+
+Publishing the root package into that window produces a release that installs
+*sometimes*. Worse, npm skips an optional dependency it cannot resolve **without
+failing the install** — so the symptom is not a clear error at install time, it
+is a missing addon at `require()` time, for whichever users happened to resolve
+against a replica that had not caught up.
+
+`scripts/await-npm-availability.sh` closes that window: after publishing the
+platform packages it polls `npm view <pkg>@<version>` until each one answers,
+and only then is the root package published. It gives up after five minutes
+rather than hanging a release forever.
+
+`scripts/verify-release-artifacts.sh` guards the related failure one step
+earlier. It is not enough for the addon to be on disk in `npm/<platform>/`: a
+wrong `files` entry would produce a package that installs fine and then cannot
+load. So it packs each platform package and asserts the `.node` is actually
+inside the tarball.
+
 ## Supply-chain posture
 
 The controls this pipeline relies on, and why:
@@ -172,6 +195,7 @@ The controls this pipeline relies on, and why:
 | **zizmor in CI** | Static analysis over these workflows, so a future edit that reintroduces any of the above fails review rather than shipping. |
 | **No caching at all in the release workflow** | A cache is written by other workflows on other refs, so restoring one while building the bytes that get published would let a branch influence a release. CI still caches, but never writes one from a pull request. |
 | **Publish job consumes the verified tree** | The artifact that was smoke-tested is the artifact that is published, rather than a rebuild that could differ. |
+| **`gh release create` rather than a release action** | The one job holding `contents: write` runs a tool already on the runner, instead of granting write access to third-party code. |
 
 Deliberately **not** used: a runner-hardening agent such as `harden-runner`. It
 would add an always-on external service into every job, and the higher-value
