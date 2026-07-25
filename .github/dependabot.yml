@@ -1,0 +1,51 @@
+# Actions are pinned to commit SHAs, which is what makes them immutable — and
+# also what makes them go stale silently. Dependabot is the other half of that
+# control: it moves the SHA and updates the trailing version comment, so pinning
+# does not turn into "never updated".
+#
+# The cooldown deliberately does not react to a release the same day it lands: a
+# compromised release is usually caught within days, and nothing here is urgent
+# enough to be worth being first.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    groups:
+      cargo:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: /crates/hearth-napi
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 5

@@ -42,3 +42,9 @@ test -f "$check_dir/node_modules/@hearth/napi/index.d.ts" ||
 
 echo "installed to $check_dir"
 echo "HEARTH_ENTRY=$entry"
+
+# Export for the rest of a CI job, so a workflow never has to interpolate a
+# path into a `run:` block to point the suites at the installed copy.
+if [ -n "${GITHUB_ENV:-}" ]; then
+  echo "HEARTH_ENTRY=$entry" >> "$GITHUB_ENV"
+fi

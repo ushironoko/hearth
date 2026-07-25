@@ -42,7 +42,6 @@
   },
   "publishConfig": {
     "access": "public",
-    "provenance": true,
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
@@ -54,8 +53,7 @@
     "test:bun": "bun __test__/contract.mjs",
     "test:pi": "node __test__/pi-compat.mjs",
     "smoke": "node smoke.mjs",
-    "version": "napi version",
-    "prepublishOnly": "napi pre-publish -t npm"
+    "version": "napi version"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.4"

@@ -63,40 +63,121 @@ released independently; they are not published to crates.io today.
    git push origin napi-v0.2.0
    ```
 
-3. The `Release @hearth/napi` workflow then:
-   - builds every target on a native runner and smoke-tests each fresh binary;
-   - downloads the artifacts and lays them out into `npm/*` (`napi artifacts`);
-   - applies the tag's version everywhere;
-   - asserts every declared target has a binary
-     (`scripts/verify-release-artifacts.sh`) — a missing one fails the release
-     rather than shipping a package that installs and then cannot load;
-   - packs the tarball, installs it into a scratch directory, and runs the smoke
-     and contract suites against the *installed* copy on both Node and Bun;
-   - publishes each platform package, then the root package.
+3. The `Release @hearth/napi` workflow then runs three jobs:
 
-   Platform packages go first on purpose: the root package's
-   `optionalDependencies` name them, so publishing the root first leaves a
-   window where an install resolves to versions that do not exist.
+   **build** — every target on a native runner, smoke-testing each fresh binary.
 
-## Provenance
+   **verify** — downloads the artifacts, lays them out into `npm/*`
+   (`napi artifacts`), applies the tag's version everywhere, writes the root
+   package's `optionalDependencies` (`napi pre-publish`), asserts every declared
+   target has a binary (`scripts/verify-release-artifacts.sh`), then packs the
+   tarball, installs it into a scratch directory, and runs the smoke and
+   contract suites against the *installed* copy on Node and Bun. It uploads the
+   verified tree.
 
-Publishing runs with `id-token: write` and `--provenance`, so npm records a
-signed attestation linking each tarball to the workflow run and commit that
-produced it. Consumers can check it with:
+   **publish** — gated on the `npm-publish` environment, and the only job with
+   `id-token: write`. It publishes the tree the previous job verified, rather
+   than rebuilding, so what ships is what was tested. Platform packages go
+   first on purpose: the root package's `optionalDependencies` name them, so
+   publishing the root first leaves a window where an install resolves to
+   versions that do not exist.
+
+## Authentication: no tokens
+
+Publishing uses **npm trusted publishing** (OIDC). The workflow does not read an
+npm token, and there is no `NPM_TOKEN` secret to create, rotate, or leak. Each
+publish authenticates with a short-lived credential minted for that specific
+workflow run, which npm matches against a publisher configuration recorded on
+the package itself.
+
+Requirements, all already in the workflow:
+
+- `permissions: id-token: write` on the publish job (and nothing more than
+  `contents: read` besides).
+- npm **11.5.1 or later**. The workflow uses the npm bundled with the Node it
+  installs — one fewer unpinned fetch on the path to a publish than
+  `npm install -g npm@…` would be — and asserts the version rather than
+  assuming it.
+- Node 22.14 or later.
+- No `NODE_AUTH_TOKEN`. `registry-url` is still set, because that is what points
+  npm at the public registry.
+
+**Provenance is automatic.** npm generates and publishes attestations for every
+trusted-publishing release, so `--provenance` is neither passed nor needed.
+Consumers verify with:
 
 ```bash
 npm audit signatures
 ```
 
-`publishConfig.provenance` is also set in `package.json`, so a manual
-`npm publish` from CI keeps the attestation even if the flag is dropped.
+The publish job also runs in a GitHub **environment** (`npm-publish`). That is
+worth configuring with required reviewers in *Settings → Environments*: it means
+a human approves before the OIDC token is minted, and it narrows the identity
+npm will accept.
 
-## Credentials
+### One-time setup per package
 
-The workflow reads `NPM_TOKEN` from repository secrets — an npm **automation**
-token with publish rights on the `@hearth` scope. Creating that token and
-adding it to the repository is a maintainer action and the one step this
-pipeline cannot do for itself. Everything else is in the repo.
+npm requires a package to **already exist** before a trusted publisher can be
+configured for it — unlike PyPI, there is no "pending publisher" for a name that
+has never been published. So each of the five packages needs one bootstrap
+publish, done once, by a human:
+
+```bash
+cd crates/hearth-napi
+pnpm run build                      # produces the local platform's addon
+pnpm exec napi pre-publish -t npm --skip-optional-publish
+
+npm login                           # with 2FA
+for dir in npm/*/; do npm publish "$dir" --access public; done
+npm publish --access public
+```
+
+Then bind each package to this repository and workflow — either through
+*npmjs.com → package → Settings → Trusted publisher*, or from the CLI with
+npm 11.15.0+:
+
+```bash
+for pkg in @hearth/napi @hearth/napi-darwin-arm64 @hearth/napi-darwin-x64 \
+           @hearth/napi-linux-x64-gnu @hearth/napi-linux-arm64-gnu; do
+  npm trust github "$pkg" \
+    --repository ushironoko/hearth \
+    --workflow release.yml \
+    --environment npm-publish
+done
+```
+
+Check it took with `npm trust list <pkg>`. After that every release is
+tokenless; the bootstrap is never repeated, including for new versions.
+
+Adding a *new platform package* later repeats only the bootstrap for that one
+package.
+
+> Trusted publisher configurations created after 20 May 2026 must explicitly
+> select which actions they allow. `npm publish` is the only one this pipeline
+> needs.
+
+## Supply-chain posture
+
+The controls this pipeline relies on, and why:
+
+| control | what it stops |
+|---|---|
+| **Actions pinned to commit SHAs** (`uses: owner/action@<sha> # vX.Y.Z`) | A tag like `v4` is mutable — whoever controls the action repository can repoint it at new code, and every workflow picks that up silently. A SHA cannot be repointed. |
+| **Dependabot with a cooldown** (`.github/dependabot.yml`) | The other half of pinning: SHAs that are never updated are SHAs that never get security fixes. The cooldown means a release is not adopted the same day it lands, which is when a compromised one is most likely still undetected. |
+| **`permissions: {}` at workflow level** | A compromised step inherits nothing. Each job re-grants only what it needs, and only the publish job ever holds `id-token: write`. |
+| **OIDC instead of a long-lived token** | There is no credential at rest to exfiltrate from a secret store, a log, or a malicious dependency's postinstall. |
+| **GitHub environment on the publish job** | Puts a human approval gate in front of the only job that can publish, and scopes the OIDC subject. |
+| **`persist-credentials: false` on checkout** | Keeps the job's git token out of `.git/config`, where a later step or an uploaded artifact could pick it up. |
+| **No `${{ }}` interpolation inside `run:`** | Closes the template-injection path where context data becomes shell code. Values reach scripts through `env:` instead. |
+| **zizmor in CI** | Static analysis over these workflows, so a future edit that reintroduces any of the above fails review rather than shipping. |
+| **No caching at all in the release workflow** | A cache is written by other workflows on other refs, so restoring one while building the bytes that get published would let a branch influence a release. CI still caches, but never writes one from a pull request. |
+| **Publish job consumes the verified tree** | The artifact that was smoke-tested is the artifact that is published, rather than a rebuild that could differ. |
+
+Deliberately **not** used: a runner-hardening agent such as `harden-runner`. It
+would add an always-on external service into every job, and the higher-value
+controls here — SHA pinning, OIDC, least privilege, and the approval gate — do
+not depend on it. That is a judgement call, not an oversight; revisit it if this
+repository starts handling anything more sensitive than a public build.
 
 ## Dry runs
 
