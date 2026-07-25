@@ -119,7 +119,8 @@ pub fn recv_request(stream: &UnixStream) -> io::Result<(Request, Option<OwnedFd>
             }
         }
     }
-    drop(iov); // release the mutable borrow of buf before reading it
+    // End `iov`'s mutable borrow of `buf` before the bytes are read back.
+    let _ = iov;
 
     if n < 4 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "short request frame"));

@@ -8,7 +8,12 @@
     "build:napi": "pnpm --filter @hearth/napi build",
     "build:napi:debug": "pnpm --filter @hearth/napi run build:debug",
     "build:rust": "cargo build --release",
-    "test:rust": "cargo test",
+    "lint:rust": "cargo clippy --workspace --all-targets -- -D warnings",
+    "test:rust": "cargo test --workspace --all-targets",
+    "test:napi": "pnpm --filter @hearth/napi test",
+    "test:napi:bun": "pnpm --filter @hearth/napi run test:bun",
+    "test:pi": "pnpm --filter @hearth/napi run test:pi",
+    "test:tarball": "bash scripts/verify-tarball.sh",
     "bench": "cargo bench -p hearth-bench"
   },
   "packageManager": "pnpm@11.5.0"

@@ -1,8 +1,8 @@
 //! The `read` tool: windowed file reads served from the warm file cache.
 
 use crate::util::resolve_path;
-use hearth_core::{profile, Engine};
-use hearth_proto::{ReadParams, ReadResult, ToolError, ToolResult};
+use hearth_core::{profile, CancelToken, Engine};
+use hearth_proto::{LineWindowMode, ReadParams, ReadResult, ToolError, ToolResult};
 use std::fmt::Write as _;
 
 /// Read the whole file's raw bytes from the warm cache (a single copy out of the
@@ -11,23 +11,52 @@ use std::fmt::Write as _;
 /// would corrupt the shared cache entry — so this copies, exactly like the
 /// `read` String path.
 pub fn read_bytes(engine: &Engine, params: &ReadParams) -> ToolResult<Vec<u8>> {
+    read_bytes_cancellable(engine, params, &CancelToken::none())
+}
+
+/// As [`read_bytes`], but rejects a pre-aborted or mid-flight cancellation.
+pub fn read_bytes_cancellable(
+    engine: &Engine,
+    params: &ReadParams,
+    cancel: &CancelToken,
+) -> ToolResult<Vec<u8>> {
     profile!("tool.read_bytes", {
+        cancel.check()?;
         let path = resolve_path(engine, &params.path);
         let trust = engine.stat_free(&path);
         let (entry, _hit) = engine.files().get_trusting(&path, trust)?;
+        cancel.check()?;
         Ok(entry.bytes().to_vec())
     })
 }
 
 /// Read a file (optionally a line window), reusing the shared file cache.
 pub fn read(engine: &Engine, params: &ReadParams) -> ToolResult<ReadResult> {
+    read_cancellable(engine, params, &CancelToken::none())
+}
+
+/// As [`read`], but rejects a pre-aborted or mid-flight cancellation.
+pub fn read_cancellable(
+    engine: &Engine,
+    params: &ReadParams,
+    cancel: &CancelToken,
+) -> ToolResult<ReadResult> {
     profile!("tool.read", {
+        cancel.check()?;
         let path = resolve_path(engine, &params.path);
         let trust = engine.stat_free(&path);
         let (entry, cache_hit) = engine.files().get_trusting(&path, trust)?;
-        let total_lines = entry.line_index().line_count();
-        let byte_len = entry.bytes().len() as u64;
+        cancel.check()?;
+
+        let idx = entry.line_index();
+        let bytes = entry.bytes();
+        let split_mode = params.line_mode == LineWindowMode::SplitLines;
+        // `split('\n')` counts the empty element after a trailing newline; the
+        // `cat`-style slice does not.
+        let total_lines = if split_mode { idx.split_count() } else { idx.line_count() };
+        let byte_len = bytes.len() as u64;
         let binary = entry.is_binary();
+        let ends_with_newline = bytes.last() == Some(&b'\n');
 
         if binary {
             return Ok(ReadResult {
@@ -38,12 +67,18 @@ pub fn read(engine: &Engine, params: &ReadParams) -> ToolResult<ReadResult> {
                 truncated: false,
                 binary: true,
                 cache_hit,
+                ends_with_newline,
             });
         }
 
-        // Whole-file fast path: no window, no line numbers. `to_text` skips
-        // UTF-8 re-validation on the warm path (validity is cached).
-        if params.offset.is_none() && params.limit.is_none() && !params.line_numbers {
+        // Whole-file fast path: no window, no line numbers, and — in split mode
+        // — no trailing newline to drop. `to_text` skips UTF-8 re-validation on
+        // the warm path (validity is cached).
+        let whole_file = params.offset.is_none()
+            && params.limit.is_none()
+            && !params.line_numbers
+            && !(split_mode && ends_with_newline);
+        if whole_file {
             let content = entry.to_text();
             return Ok(ReadResult {
                 returned_lines: total_lines,
@@ -53,6 +88,7 @@ pub fn read(engine: &Engine, params: &ReadParams) -> ToolResult<ReadResult> {
                 truncated: false,
                 binary: false,
                 cache_hit,
+                ends_with_newline,
             });
         }
 
@@ -68,12 +104,15 @@ pub fn read(engine: &Engine, params: &ReadParams) -> ToolResult<ReadResult> {
             _ => total_lines,
         };
 
-        let idx = entry.line_index();
-        let bytes = entry.bytes();
         let start_off = idx.line_range(start_line).map(|(s, _)| s).unwrap_or(0);
-        // Include the trailing newline of the last line in the window (so the
-        // slice matches `cat`), by ending at the *start* of the following line.
-        let end_off = if end_line < total_lines {
+        let end_off = if split_mode {
+            // Join semantics: stop at the end of the last element's text, so the
+            // window never carries a trailing newline.
+            idx.line_range(end_line).map(|(_, e)| e).unwrap_or(bytes.len())
+        } else if end_line < total_lines {
+            // Slice semantics: include the trailing newline of the last line in
+            // the window (so it matches `cat`) by ending at the start of the
+            // following line.
             idx.line_range(end_line + 1).map(|(s, _)| s).unwrap_or(bytes.len())
         } else {
             bytes.len()
@@ -115,6 +154,7 @@ pub fn read(engine: &Engine, params: &ReadParams) -> ToolResult<ReadResult> {
             truncated,
             binary: false,
             cache_hit,
+            ends_with_newline,
         })
     })
 }

@@ -11,14 +11,18 @@
 //! low-overhead sharded profiler).
 
 pub mod cache;
+pub mod cancel;
 pub mod engine;
 pub mod line_index;
+pub mod pathlock;
 pub mod profiler;
 pub mod singleflight;
 pub mod watch;
 
+pub use cancel::CancelToken;
 pub use engine::{Engine, EngineConfig, Tuning};
 pub use line_index::LineIndex;
+pub use pathlock::{mutation_key, PathGuard, PathLocks};
 
 // Re-export the protocol types so downstream crates can depend on just core.
 pub use hearth_proto as proto;

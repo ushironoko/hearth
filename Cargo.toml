@@ -33,8 +33,16 @@ phf = { version = "=0.14.0", features = ["macros"] }
 memchr = "=2.8.3"
 bstr = "=1.13.0"
 
+# --- Text / diff ---
+# NFKC normalization for the fuzzy edit fallback; `similar` produces the
+# line-level hunks an adapter renders as a display diff / unified patch.
+unicode-normalization = "=0.1.25"
+similar = "=3.1.1"
+
 # --- Concurrency / sync ---
-parking_lot = "=0.12.5"
+# `arc_lock` gives owned `ArcMutexGuard`s, which the per-path mutation queue
+# needs to hand a guard back to the caller without borrowing the registry.
+parking_lot = { version = "=0.12.5", features = ["arc_lock"] }
 dashmap = "=6.2.1"
 crossbeam-channel = "=0.5.16"
 crossbeam-deque = "=0.8.7"

@@ -1,14 +1,32 @@
 {
   "name": "@hearth/napi",
   "version": "0.1.0",
-  "description": "Node.js bindings for the Hearth tool orchestrator",
+  "description": "Node.js bindings for the Hearth tool orchestrator: cancellable, streaming read/write/edit/bash/grep on one resident engine",
+  "keywords": [
+    "napi-rs",
+    "agent-tools",
+    "grep",
+    "ripgrep",
+    "file-cache"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ushironoko/hearth.git",
+    "directory": "crates/hearth-napi"
+  },
+  "homepage": "https://github.com/ushironoko/hearth#readme",
+  "bugs": {
+    "url": "https://github.com/ushironoko/hearth/issues"
+  },
   "main": "index.js",
   "types": "index.d.ts",
   "type": "commonjs",
   "files": [
     "index.js",
     "index.d.ts",
-    "hearth.*.node"
+    "hearth.*.node",
+    "README.md"
   ],
   "napi": {
     "binaryName": "hearth",
@@ -22,9 +40,22 @@
   "engines": {
     "node": ">=18"
   },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "build": "napi build --platform --release",
-    "build:debug": "napi build --platform"
+    "build:debug": "napi build --platform",
+    "artifacts": "napi artifacts",
+    "create-npm-dirs": "napi create-npm-dirs",
+    "test": "node __test__/contract.mjs",
+    "test:bun": "bun __test__/contract.mjs",
+    "test:pi": "node __test__/pi-compat.mjs",
+    "smoke": "node smoke.mjs",
+    "version": "napi version",
+    "prepublishOnly": "napi pre-publish -t npm"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.4"

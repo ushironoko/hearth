@@ -1,17 +1,31 @@
-//! The `write` tool: atomic full-file writes that refresh the warm cache.
+//! The `write` tool: full-file writes that refresh the warm cache.
 
-use crate::util::{atomic_write, resolve_path};
-use hearth_core::{profile, Engine};
-use hearth_proto::{ToolResult, WriteParams, WriteResult};
+use crate::util::{resolve_path, resolve_write_target, write_bytes};
+use hearth_core::{profile, CancelToken, Engine};
+use hearth_proto::{ToolResult, WriteMode, WriteParams, WriteResult};
 use std::sync::Arc;
 
-/// Write `content` to `path` atomically and update the file cache in place so a
-/// following `read`/`edit` is warm without touching the disk again.
+/// Write `content` to `path` and update the file cache in place so a following
+/// `read`/`edit` is warm without touching the disk again.
 pub fn write(engine: &Engine, params: &WriteParams) -> ToolResult<WriteResult> {
+    write_cancellable(engine, params, &CancelToken::none())
+}
+
+/// As [`write`], but polls `cancel` around the blocking steps.
+///
+/// Cancellation is observed *before* the write is issued and again after it
+/// commits; it is never observed in between, because releasing the path's
+/// mutation lock while the bytes were still landing would let a queued mutation
+/// of the same file interleave with this one.
+pub fn write_cancellable(
+    engine: &Engine,
+    params: &WriteParams,
+    cancel: &CancelToken,
+) -> ToolResult<WriteResult> {
     // The dispatch/CLI path only has a borrowed `&params`, so it clones the
     // content once (unavoidable there). The napi fast path calls `write_owned`
     // directly and avoids that clone.
-    write_owned(engine, &params.path, params.content.clone(), params.create_dirs)
+    write_owned_cancellable(engine, params, params.content.clone(), cancel)
 }
 
 /// As [`write`], but takes ownership of `content` and **moves** it into the
@@ -23,18 +37,61 @@ pub fn write_owned(
     content: String,
     create_dirs: bool,
 ) -> ToolResult<WriteResult> {
-    profile!("tool.write", {
-        let path = resolve_path(engine, path);
-        let existed = path.exists();
-        let bytes_written = content.len() as u64;
+    let params = WriteParams {
+        path: path.to_string(),
+        content: String::new(),
+        create_dirs,
+        mode: WriteMode::default(),
+        follow_symlinks: true,
+    };
+    write_owned_cancellable(engine, &params, content, &CancelToken::none())
+}
 
-        let meta = atomic_write(&path, content.as_bytes(), create_dirs)?;
+/// The single implementation every `write` entry point funnels into.
+///
+/// `params.content` is ignored; `content` is the payload, so a caller that
+/// already owns the string hands it over without a copy.
+pub fn write_owned_cancellable(
+    engine: &Engine,
+    params: &WriteParams,
+    content: String,
+    cancel: &CancelToken,
+) -> ToolResult<WriteResult> {
+    profile!("tool.write", {
+        cancel.check()?;
+        let requested = resolve_path(engine, &params.path);
+        let (target, followed_symlink) = resolve_write_target(&requested, params.follow_symlinks);
+
+        // Hold the path's mutation lock across the write *and* the cache
+        // refresh: a concurrent writer must not observe the file changed while
+        // the cache still describes the old bytes.
+        let _guard = engine.lock_path(&target);
+        cancel.check()?;
+
+        let bytes_written = content.len() as u64;
+        let meta = write_bytes(&target, content.as_bytes(), params.create_dirs, params.mode)?;
 
         // Move the content's own allocation into the cache Arc (no extra copy).
         let arc: Arc<[u8]> = Arc::from(content.into_bytes().into_boxed_slice());
-        engine.files().put_written(&path, arc, meta.size, meta.mtime_ns);
+        engine.files().put_written(&target, arc, meta.size, meta.mtime_ns);
+        if followed_symlink {
+            // The link path is a separate cache key; drop it so a `trustCache`
+            // read through the link cannot serve the pre-write bytes.
+            engine.files().invalidate(&requested);
+        }
+        // Creating a file, or rewriting one that steers traversal, changes what
+        // a cached directory walk would have returned.
+        engine.note_mutation(&target, !meta.existed);
+        if followed_symlink && !meta.existed {
+            engine.note_mutation(&requested, true);
+        }
 
         hearth_core::profiler::count("tool.write.bytes", bytes_written);
-        Ok(WriteResult { bytes_written, existed })
+        Ok(WriteResult {
+            bytes_written,
+            existed: meta.existed,
+            path: target.display().to_string(),
+            followed_symlink,
+        })
     })
 }

@@ -29,6 +29,7 @@ fn params(root: &Path) -> GrepParams {
         before_context: 0,
         after_context: 0,
         max_count: None,
+        max_total_count: None,
         hidden: false,
         respect_gitignore: true,
         follow_symlinks: false,
@@ -45,10 +46,9 @@ fn baseline(root: &Path, threads: usize) -> u64 {
     let sink = parking_lot::Mutex::new(Vec::new());
     WalkBuilder::new(root).threads(threads).build_parallel().run(|| {
         Box::new(|res| {
-            if let Ok(e) = res {
-                if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    sink.lock().push(e.into_path());
-                }
+            if let Ok(e) = res
+                && e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                sink.lock().push(e.into_path());
             }
             ignore::WalkState::Continue
         })
@@ -113,11 +113,10 @@ fn bench_grep(c: &mut Criterion) {
     });
     group.bench_function("hearth_cold", |b| {
         b.iter(|| {
-            let eng = Engine::new({
-                let mut cfg = hearth_core::EngineConfig::default();
-                cfg.default_cwd = root.to_path_buf();
-                cfg.enable_optimizer = false;
-                cfg
+            let eng = Engine::new(hearth_core::EngineConfig {
+                default_cwd: root.to_path_buf(),
+                enable_optimizer: false,
+                ..hearth_core::EngineConfig::default()
             });
             black_box(grep(&eng, &p).unwrap().files.len())
         });

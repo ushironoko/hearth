@@ -121,11 +121,12 @@ fn build_request(cmd: &Cmd) -> Request {
             offset: *offset,
             limit: *limit,
             line_numbers: *line_numbers,
+            ..ReadParams::new(path.clone())
         }),
         Cmd::Write { path } => {
             let mut content = String::new();
             let _ = std::io::stdin().read_to_string(&mut content);
-            Request::Write(WriteParams { path: path.clone(), content, create_dirs: true })
+            Request::Write(WriteParams::new(path.clone(), content))
         }
         Cmd::Edit { path, old, new, all } => Request::Edit(EditParams {
             path: path.clone(),
@@ -133,12 +134,9 @@ fn build_request(cmd: &Cmd) -> Request {
             new_string: new.clone(),
             replace_all: *all,
         }),
-        Cmd::Bash { command, timeout_ms } => Request::Bash(BashParams {
-            command: command.clone(),
-            cwd: None,
-            timeout_ms: *timeout_ms,
-            env: vec![],
-        }),
+        Cmd::Bash { command, timeout_ms } => {
+            Request::Bash(BashParams { timeout_ms: *timeout_ms, ..BashParams::new(command.clone()) })
+        }
         Cmd::Grep {
             pattern, path, globs, ignore_case, smart_case, fixed, multiline, files, count,
             before, after, hidden, no_ignore,
@@ -162,6 +160,7 @@ fn build_request(cmd: &Cmd) -> Request {
                 before_context: *before,
                 after_context: *after,
                 max_count: None,
+                max_total_count: None,
                 hidden: *hidden,
                 respect_gitignore: !*no_ignore,
                 follow_symlinks: false,
@@ -187,26 +186,26 @@ fn run(global: &Global, req: Request) -> Response {
     // A read destined for stdout can be streamed: pass our stdout fd so the
     // daemon writes the content straight to it, skipping payload serialization.
     let stream_to_stdout = matches!(req, Request::Read(_)) && !global.json;
-    if !global.no_daemon {
-        if let Ok(stream) = UnixStream::connect(socket_path(global)) {
-            let fd = if stream_to_stdout {
-                Some(std::io::stdout().as_raw_fd())
-            } else {
-                None
-            };
-            if send_request_with_fd(&stream, &req, fd).is_ok() {
-                let mut rd = &stream;
-                if let Ok(resp) = read_msg::<_, Response>(&mut rd) {
-                    return resp;
-                }
+    if !global.no_daemon
+        && let Ok(stream) = UnixStream::connect(socket_path(global)) {
+        let fd = if stream_to_stdout {
+            Some(std::io::stdout().as_raw_fd())
+        } else {
+            None
+        };
+        if send_request_with_fd(&stream, &req, fd).is_ok() {
+            let mut rd = &stream;
+            if let Ok(resp) = read_msg::<_, Response>(&mut rd) {
+                return resp;
             }
         }
     }
     // Inline fallback: a fresh, one-shot engine (cold).
-    let mut cfg = EngineConfig::default();
-    cfg.enable_optimizer = false;
-    cfg.enable_watch = false;
-    let engine = Engine::new(cfg);
+    let engine = Engine::new(EngineConfig {
+        enable_optimizer: false,
+        enable_watch: false,
+        ..EngineConfig::default()
+    });
     dispatch(&engine, req)
 }
 
@@ -263,6 +262,17 @@ fn render(global: &Global, cmd: &Cmd, resp: &Response) -> i32 {
             }
             print!("{out}");
             if g.total_matches == 0 { 1 } else { 0 }
+        }
+        Response::EditBatch(r) => {
+            eprintln!("{} replacement(s)", r.replacements);
+            0
+        }
+        Response::Invalidate(r) => {
+            eprintln!(
+                "invalidated {} file(s), {} walk(s)",
+                r.files_invalidated, r.walks_invalidated
+            );
+            0
         }
         Response::Pong => {
             println!("pong");

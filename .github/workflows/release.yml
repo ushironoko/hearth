@@ -1,0 +1,153 @@
+name: Release @hearth/napi
+
+# Tag-driven. `napi version` writes the version into every platform package, so
+# the tag is the single source of truth for what gets published.
+on:
+  push:
+    tags:
+      - "napi-v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and verify, but do not publish"
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners for every declared target: no cross toolchain, and
+          # the binary is exercised on the platform it ships to.
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          # An older glibc than the newest runner's, so the artifact keeps
+          # working on distributions that have not caught up.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm exec napi build --platform --release --target ${{ matrix.target }}
+        working-directory: crates/hearth-napi
+
+      - name: Smoke the fresh binary
+        # Only where the runner can execute what it just built, which is every
+        # target here since each one is native.
+        run: node crates/hearth-napi/smoke.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/hearth-napi/hearth.*.node
+          if-no-files-found: error
+
+  publish:
+    name: assemble and publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for npm provenance: the publish is signed against this run.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: crates/hearth-napi/artifacts
+
+      - name: Collect artifacts into platform packages
+        run: pnpm exec napi artifacts --output-dir artifacts
+        working-directory: crates/hearth-napi
+
+      - name: Set the published version from the tag
+        # napi-v1.2.3 → 1.2.3, applied to the root package and every platform one.
+        if: startsWith(github.ref, 'refs/tags/napi-v')
+        run: |
+          version="${GITHUB_REF_NAME#napi-v}"
+          npm version "$version" --no-git-tag-version --allow-same-version
+          pnpm exec napi version
+        working-directory: crates/hearth-napi
+
+      - name: Every declared target has a binary
+        run: bash scripts/verify-release-artifacts.sh
+
+      # The Linux x64 artifact is the one this runner can execute, so it is the
+      # one that gets an end-to-end check before anything is published.
+      - name: Verify the packed tarball on Node and Bun
+        run: |
+          cp crates/hearth-napi/npm/linux-x64-gnu/hearth.linux-x64-gnu.node crates/hearth-napi/
+          bash scripts/verify-tarball.sh
+          entry="$(cd .. && pwd)/hearth-tarball-check/node_modules/@hearth/napi/index.js"
+          HEARTH_ENTRY="$entry" node crates/hearth-napi/smoke.mjs
+          HEARTH_ENTRY="$entry" bun crates/hearth-napi/smoke.mjs
+          HEARTH_ENTRY="$entry" node crates/hearth-napi/__test__/contract.mjs
+          HEARTH_ENTRY="$entry" bun crates/hearth-napi/__test__/contract.mjs
+          rm -f crates/hearth-napi/hearth.linux-x64-gnu.node
+
+      - name: Publish
+        if: github.event_name == 'push' || inputs.dry_run == false
+        run: |
+          set -euo pipefail
+          # Platform packages first: the root package's optionalDependencies
+          # point at them, so publishing the root first would briefly resolve to
+          # versions that do not exist yet.
+          for dir in npm/*/; do
+            npm publish "$dir" --provenance --access public
+          done
+          npm publish --provenance --access public
+        working-directory: crates/hearth-napi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Dry run summary
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: |
+          echo "Dry run: artifacts verified, nothing published." >> "$GITHUB_STEP_SUMMARY"
+          (cd crates/hearth-napi && npm pack --dry-run) 2>&1 | tail -40 >> "$GITHUB_STEP_SUMMARY"

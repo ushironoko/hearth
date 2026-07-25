@@ -105,7 +105,7 @@ impl Profiler {
             }
         }
         let mut out: Vec<_> = merged.into_iter().collect();
-        out.sort_by(|a, b| b.1.total.cmp(&a.1.total));
+        out.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.total));
         out
     }
 

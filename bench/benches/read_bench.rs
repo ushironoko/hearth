@@ -28,7 +28,7 @@ fn bench_read(c: &mut Criterion) {
         let ps = path.display().to_string();
         group.throughput(Throughput::Bytes(content.len() as u64));
 
-        let params = ReadParams { path: ps.clone(), offset: None, limit: None, line_numbers: false };
+        let params = ReadParams { offset: None, limit: None, line_numbers: false, ..ReadParams::new(ps.clone()) };
         let _ = read(&eng, &params).unwrap(); // warm the cache
 
         group.bench_with_input(BenchmarkId::new("hearth_warm", name), &params, |b, params| {

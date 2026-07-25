@@ -4,9 +4,15 @@
 //! returning a result struct. No hidden globals: the caller owns the engine and
 //! the shared caches live inside it. The daemon, CLI, and napi addon all call
 //! these same functions.
+//!
+//! Each tool comes in two forms: a plain one, and a `*_cancellable` twin that
+//! also takes a [`CancelToken`]. They are the same code path — the plain form
+//! passes a token that can never be latched, which costs nothing — so there is
+//! no second implementation to drift.
 
 mod bash;
 mod edit;
+mod edit_text;
 mod grep;
 mod read;
 mod shell;
@@ -14,13 +20,20 @@ pub mod transport;
 mod util;
 mod write;
 
-pub use bash::bash;
-pub use edit::edit;
-pub use grep::grep;
-pub use read::{read, read_bytes};
-pub use write::{write, write_owned};
+pub use bash::{bash, bash_cancellable, bash_stream};
+pub use edit::{edit, edit_batch, edit_batch_cancellable, edit_cancellable};
+pub use grep::{grep, grep_cancellable};
+pub use read::{read, read_bytes, read_bytes_cancellable, read_cancellable};
+pub use write::{write, write_cancellable, write_owned, write_owned_cancellable};
 
-pub use hearth_core::Engine;
+/// The pi-compatible text machinery behind `edit_batch`, exposed so a contract
+/// suite can exercise the matching rules directly.
+pub use edit_text::{
+    apply_edits, detect_crlf, diff_hunks, normalize_for_fuzzy_match, normalize_to_lf,
+    restore_line_endings, split_line_count, strip_bom, AppliedEdits,
+};
+
+pub use hearth_core::{CancelToken, Engine};
 pub use hearth_proto as proto;
 
 /// Dispatch a protocol [`Request`] against the engine, returning a [`Response`].
@@ -40,6 +53,10 @@ pub fn dispatch(engine: &Engine, req: hearth_proto::Request) -> hearth_proto::Re
             Ok(r) => Response::Edit(r),
             Err(e) => Response::Error(e),
         },
+        Request::EditBatch(p) => match edit_batch(engine, &p) {
+            Ok(r) => Response::EditBatch(r),
+            Err(e) => Response::Error(e),
+        },
         Request::Bash(p) => match bash(engine, &p) {
             Ok(r) => Response::Bash(r),
             Err(e) => Response::Error(e),
@@ -48,6 +65,12 @@ pub fn dispatch(engine: &Engine, req: hearth_proto::Request) -> hearth_proto::Re
             Ok(r) => Response::Grep(r),
             Err(e) => Response::Error(e),
         },
+        Request::Invalidate(p) => Response::Invalidate(engine.invalidate(
+            std::path::Path::new(&p.path),
+            p.recursive,
+            p.scope,
+        )),
+        Request::ClearCaches => Response::Invalidate(engine.clear_caches()),
         Request::Ping => Response::Pong,
         Request::Stats => Response::Stats(engine.profiler_report()),
         Request::Shutdown => Response::ShuttingDown,

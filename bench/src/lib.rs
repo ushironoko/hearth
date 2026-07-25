@@ -87,20 +87,22 @@ pub fn gen_corpus_skewed(root: &Path, num_files: usize, dirs: usize, lines: usiz
 
 /// A warm engine (optimizer/watch off for benchmark stability).
 pub fn bench_engine(cwd: &Path) -> Engine {
-    let mut cfg = EngineConfig::default();
-    cfg.default_cwd = cwd.to_path_buf();
-    cfg.enable_optimizer = false;
-    cfg.enable_watch = false;
-    Engine::new(cfg)
+    Engine::new(EngineConfig {
+        default_cwd: cwd.to_path_buf(),
+        enable_optimizer: false,
+        enable_watch: false,
+        ..EngineConfig::default()
+    })
 }
 
 /// A warm engine in `trust_cache` mode: warm hits skip the freshness stat
 /// (no fs-watcher; single-writer assumption).
 pub fn bench_engine_trusted(cwd: &Path) -> Engine {
-    let mut cfg = EngineConfig::default();
-    cfg.default_cwd = cwd.to_path_buf();
-    cfg.enable_optimizer = false;
-    cfg.enable_watch = false;
-    cfg.trust_cache = true;
-    Engine::new(cfg)
+    Engine::new(EngineConfig {
+        default_cwd: cwd.to_path_buf(),
+        enable_optimizer: false,
+        enable_watch: false,
+        trust_cache: true,
+        ..EngineConfig::default()
+    })
 }

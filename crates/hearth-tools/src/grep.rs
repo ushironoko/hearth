@@ -2,11 +2,12 @@
 //!
 //! Uses the same core engine as ripgrep (`grep-searcher` + `grep-regex`). The
 //! warm-path advantage over a one-shot `rg` is **composite**, not walk-only:
-//!  1. the **walk cache** reuses the directory traversal + `.gitignore` parse;
-//!  2. `get_bounded` searches **cached file bytes** (`search_slice`) for files
-//!     ≤ 4 MiB, so a repeated search does zero `open()`/`read()` syscalls —
-//!     only one `stat` per file for coherence;
-//!  3. the OS page cache further warms both.
+//! 1. the **walk cache** reuses the directory traversal + `.gitignore` parse;
+//! 2. `get_bounded` searches **cached file bytes** (`search_slice`) for files
+//!    ≤ 4 MiB, so a repeated search does zero `open()`/`read()` syscalls —
+//!    only one `stat` per file for coherence;
+//! 3. the OS page cache further warms both.
+//!
 //! Files above the cap fall back to `grep-searcher`'s own IO (`search_path`).
 //! Per-file search is parallelised across worker threads.
 
@@ -15,15 +16,29 @@ use dashmap::DashMap;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use hearth_core::cache::WalkKey;
-use hearth_core::{profile, Engine};
+use hearth_core::{profile, CancelToken, Engine};
 use hearth_proto::{
     FileMatches, GrepLine, GrepMode, GrepParams, GrepResult, ToolError, ToolResult,
 };
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub fn grep(engine: &Engine, params: &GrepParams) -> ToolResult<GrepResult> {
+    grep_cancellable(engine, params, &CancelToken::none())
+}
+
+/// As [`grep`], but stops scheduling and searching promptly when `cancel` is
+/// latched. Every worker is joined before this returns, so no search thread
+/// outlives the call.
+pub fn grep_cancellable(
+    engine: &Engine,
+    params: &GrepParams,
+    cancel: &CancelToken,
+) -> ToolResult<GrepResult> {
     profile!("tool.grep", {
+        cancel.check()?;
         // Compiled regex + glob sets are cached on the engine, so a repeated
         // pattern is never recompiled.
         let cache = engine.extension::<MatcherCache>();
@@ -33,11 +48,14 @@ pub fn grep(engine: &Engine, params: &GrepParams) -> ToolResult<GrepResult> {
         let root = resolve_path(engine, &params.path);
         let meta = std::fs::metadata(&root)
             .map_err(|_| ToolError::not_found(root.display().to_string()))?;
+        let root_is_dir = meta.is_dir();
 
         // Resolve the target set as a shared slice + the indices passing the
         // glob filter — no per-file PathBuf clones (the walk's Arc is reused).
+        // The walk cache returns a path-sorted list, so index order *is* path
+        // order, which is what makes the global limit deterministic.
         let (all_files, indices, walk_hit): (Arc<Vec<PathBuf>>, Vec<usize>, bool) =
-            if meta.is_file() {
+            if !root_is_dir {
                 (Arc::new(vec![root.clone()]), vec![0], false)
             } else {
                 let key = WalkKey {
@@ -56,11 +74,12 @@ pub fn grep(engine: &Engine, params: &GrepParams) -> ToolResult<GrepResult> {
         // If a healthy watcher covers this root and trust_watch is on, warm
         // hits skip the per-file freshness stat.
         let trust = engine.stat_free(&root);
-        let files_searched = indices.len() as u64;
+        let limiter = params.max_total_count.map(|limit| Limiter::new(indices.len(), limit));
+        let searched = AtomicU64::new(0);
         let threads = engine.config().walk_threads.min(indices.len().max(1));
-        let (tx, rx) = crossbeam_channel::unbounded::<usize>();
-        for i in &indices {
-            let _ = tx.send(*i);
+        let (tx, rx) = crossbeam_channel::unbounded::<(usize, usize)>();
+        for (slot, &i) in indices.iter().enumerate() {
+            let _ = tx.send((slot, i));
         }
         drop(tx);
 
@@ -72,21 +91,38 @@ pub fn grep(engine: &Engine, params: &GrepParams) -> ToolResult<GrepResult> {
                     let rx = rx.clone();
                     let matcher = Arc::clone(&matcher);
                     let all_files = Arc::clone(&all_files);
+                    let limiter = limiter.as_ref();
+                    let searched = &searched;
                     let params = &params;
                     let engine_ref = engine;
                     scope.spawn(move || {
                         let mut searcher = build_searcher(params);
                         let mut local: Vec<FileMatches> = Vec::new();
-                        while let Ok(i) = rx.recv() {
-                            if let Some(fm) = search_one(
+                        while let Ok((slot, i)) = rx.recv() {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            // Stop once every file that could sort *before* an
+                            // unstarted one has already produced enough matches.
+                            if limiter.is_some_and(|l| l.should_stop()) {
+                                break;
+                            }
+                            searched.fetch_add(1, Ordering::Relaxed);
+                            let found = search_one(
                                 &mut searcher,
                                 &matcher,
                                 engine_ref,
                                 &all_files[i],
                                 params,
                                 trust,
-                            ) {
+                                cancel,
+                            );
+                            let count = found.as_ref().map(|f| f.match_count).unwrap_or(0);
+                            if let Some(fm) = found {
                                 local.push(fm);
+                            }
+                            if let Some(l) = limiter {
+                                l.complete(slot, count);
                             }
                         }
                         local
@@ -102,14 +138,133 @@ pub fn grep(engine: &Engine, params: &GrepParams) -> ToolResult<GrepResult> {
             merged
         });
 
+        // Every worker has been joined by here, so cancellation can be reported
+        // with the guarantee that nothing is still searching.
+        cancel.check()?;
+
         files.sort_by(|a, b| a.path.cmp(&b.path));
+        let limit_reached = match params.max_total_count {
+            Some(limit) => apply_total_limit(&mut files, limit, params.after_context as u64),
+            None => false,
+        };
         let total_matches: u64 = files.iter().map(|f| f.match_count).sum();
+        let files_searched = searched.load(Ordering::Relaxed);
 
         hearth_core::profiler::count("tool.grep.files_searched", files_searched);
         hearth_core::profiler::count("tool.grep.matches", total_matches);
 
-        Ok(GrepResult { files, total_matches, files_searched, walk_cache_hit: walk_hit })
+        Ok(GrepResult {
+            files,
+            total_matches,
+            files_searched,
+            walk_cache_hit: walk_hit,
+            limit_reached,
+            root: root.display().to_string(),
+            root_is_dir,
+        })
     })
+}
+
+/// Keep only the first `limit` matches in path order, reporting whether the cap
+/// was hit.
+///
+/// Truncation runs after the merge and after sorting, so which matches survive
+/// never depends on how the parallel search interleaved. A partially kept file
+/// retains the context lines that follow its last kept match, but not the
+/// leading context of the first dropped one.
+fn apply_total_limit(files: &mut Vec<FileMatches>, limit: u64, after_context: u64) -> bool {
+    let mut remaining = limit;
+    let mut keep = 0usize;
+    for file in files.iter_mut() {
+        if remaining == 0 {
+            break;
+        }
+        if file.match_count > remaining {
+            if !file.lines.is_empty() {
+                let mut seen = 0u64;
+                let mut cut = file.lines.len();
+                let mut last_match_line = 0u64;
+                for (i, line) in file.lines.iter().enumerate() {
+                    if line.is_match {
+                        if seen == remaining {
+                            cut = i;
+                            break;
+                        }
+                        seen += 1;
+                        last_match_line = line.line_number;
+                    }
+                }
+                file.lines.truncate(cut);
+                // The rows just before a dropped match are *its* leading
+                // context, not the kept match's trailing context.
+                let keep_through = last_match_line + after_context;
+                while file.lines.last().is_some_and(|l| l.line_number > keep_through) {
+                    file.lines.pop();
+                }
+            }
+            file.match_count = remaining;
+        }
+        remaining -= file.match_count;
+        keep += 1;
+    }
+    let dropped_files = files.len() > keep;
+    files.truncate(keep);
+    let kept: u64 = files.iter().map(|f| f.match_count).sum();
+    dropped_files || kept >= limit
+}
+
+/// Deterministic early stop for a globally limited search.
+///
+/// Tracks the contiguous prefix of *completed* files in path order. Once that
+/// prefix alone holds enough matches, no file that has not started yet can
+/// contribute to the first `limit` matches, so workers can stop pulling work.
+/// Files that complete out of order are still accounted, they just cannot
+/// trigger the stop until the gap ahead of them fills in.
+struct Limiter {
+    inner: Mutex<LimiterInner>,
+    stop: AtomicBool,
+    limit: u64,
+}
+
+struct LimiterInner {
+    counts: Vec<Option<u64>>,
+    next: usize,
+    prefix_matches: u64,
+}
+
+impl Limiter {
+    fn new(slots: usize, limit: u64) -> Self {
+        Self {
+            inner: Mutex::new(LimiterInner {
+                counts: vec![None; slots],
+                next: 0,
+                prefix_matches: 0,
+            }),
+            stop: AtomicBool::new(false),
+            limit,
+        }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn complete(&self, slot: usize, matches: u64) {
+        let mut inner = self.inner.lock();
+        inner.counts[slot] = Some(matches);
+        while inner.next < inner.counts.len() {
+            match inner.counts[inner.next] {
+                Some(n) => {
+                    inner.prefix_matches = inner.prefix_matches.saturating_add(n);
+                    inner.next += 1;
+                }
+                None => break,
+            }
+        }
+        if inner.prefix_matches >= self.limit {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The compiled-matcher cache — a per-engine extension keyed by pattern + flags
@@ -168,8 +323,7 @@ fn build_matcher(params: &GrepParams) -> ToolResult<RegexMatcher> {
     if params.multiline {
         b.multi_line(true).dot_matches_new_line(true);
     }
-    b.build(&pattern)
-        .map_err(|e| ToolError::invalid(format!("invalid pattern: {e}")))
+    b.build(&pattern).map_err(|e| ToolError::invalid(format!("invalid pattern: {e}")))
 }
 
 fn build_searcher(params: &GrepParams) -> Searcher {
@@ -187,6 +341,7 @@ fn build_searcher(params: &GrepParams) -> Searcher {
 /// tree never floods the warm cache.
 const MAX_GREP_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 
+#[allow(clippy::too_many_arguments)]
 fn search_one(
     searcher: &mut Searcher,
     matcher: &RegexMatcher,
@@ -194,6 +349,7 @@ fn search_one(
     path: &Path,
     params: &GrepParams,
     trust: bool,
+    cancel: &CancelToken,
 ) -> Option<FileMatches> {
     let mut sink = CollectSink {
         mode: params.mode,
@@ -202,6 +358,7 @@ fn search_one(
         blob: Vec::new(),
         spans: Vec::new(),
         found: false,
+        cancel,
     };
     // Fast path: search the cached bytes directly (no open()/read() syscalls on
     // a warm file, and no freshness stat when `trust` is set). Oversize or
@@ -234,16 +391,17 @@ struct LineSpan {
 /// single growing byte buffer (`blob`, an arena) and referenced by `spans`; the
 /// owned `Vec<GrepLine>` is materialized once, after the search, in
 /// [`materialize`](Self::materialize).
-struct CollectSink {
+struct CollectSink<'a> {
     mode: GrepMode,
     max_count: Option<u64>,
     match_count: u64,
     blob: Vec<u8>,
     spans: Vec<LineSpan>,
     found: bool,
+    cancel: &'a CancelToken,
 }
 
-impl CollectSink {
+impl CollectSink<'_> {
     #[inline]
     fn push_line(&mut self, line_number: u64, bytes: &[u8], is_match: bool) {
         let text = trim_eol(bytes);
@@ -268,10 +426,14 @@ impl CollectSink {
     }
 }
 
-impl Sink for CollectSink {
+impl Sink for CollectSink<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _s: &Searcher, mat: &SinkMatch<'_>) -> std::io::Result<bool> {
+        // Abandon a single huge file promptly instead of only between files.
+        if self.cancel.is_cancelled() {
+            return Ok(false);
+        }
         self.found = true;
         // In FilesWithMatches mode a single hit is enough.
         if self.mode == GrepMode::FilesWithMatches {
@@ -283,10 +445,9 @@ impl Sink for CollectSink {
             let line_number = mat.line_number().unwrap_or(0);
             self.push_line(line_number, mat.bytes(), true);
         }
-        if let Some(mc) = self.max_count {
-            if self.match_count >= mc {
-                return Ok(false);
-            }
+        if let Some(mc) = self.max_count
+            && self.match_count >= mc {
+            return Ok(false);
         }
         Ok(true)
     }
@@ -334,8 +495,8 @@ impl GlobFilter {
             return true;
         }
         let name = path.file_name().map(Path::new);
-        self.sets.iter().any(|m| {
-            m.is_match(path) || name.map(|n| m.is_match(n)).unwrap_or(false)
-        })
+        self.sets
+            .iter()
+            .any(|m| m.is_match(path) || name.map(|n| m.is_match(n)).unwrap_or(false))
     }
 }

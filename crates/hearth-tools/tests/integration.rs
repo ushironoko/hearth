@@ -1,17 +1,13 @@
-use hearth_core::{Engine, EngineConfig};
+//! End-to-end coverage of the five tools against one engine.
+
+mod common;
+
+use common::{abs, engine, trusting_engine, warm_engine};
 use hearth_proto::*;
 use hearth_tools::{bash, edit, grep, read, write};
 
-fn engine(cwd: &std::path::Path) -> Engine {
-    let mut cfg = EngineConfig::default();
-    cfg.default_cwd = cwd.to_path_buf();
-    cfg.enable_optimizer = false;
-    cfg.enable_watch = false;
-    Engine::new(cfg)
-}
-
-fn abs(dir: &std::path::Path, name: &str) -> String {
-    dir.join(name).display().to_string()
+fn run(eng: &hearth_core::Engine, command: &str, timeout_ms: Option<u64>) -> BashResult {
+    bash(eng, &BashParams { timeout_ms, ..BashParams::new(command) }).unwrap()
 }
 
 #[test]
@@ -20,15 +16,15 @@ fn write_read_roundtrip() {
     let eng = engine(dir.path());
     let path = abs(dir.path(), "a.txt");
 
-    let w = write(&eng, &WriteParams { path: path.clone(), content: "hello\nworld\n".into(), create_dirs: true }).unwrap();
+    let w = write(&eng, &WriteParams::new(path.clone(), "hello\nworld\n")).unwrap();
     assert_eq!(w.bytes_written, 12);
     assert!(!w.existed);
 
-    let r = read(&eng, &ReadParams { path: path.clone(), offset: None, limit: None, line_numbers: false }).unwrap();
+    let r = read(&eng, &ReadParams::new(path.clone())).unwrap();
     assert_eq!(r.content, "hello\nworld\n");
     assert_eq!(r.total_lines, 2);
     // Second read is a warm cache hit.
-    let r2 = read(&eng, &ReadParams { path: path.clone(), offset: None, limit: None, line_numbers: false }).unwrap();
+    let r2 = read(&eng, &ReadParams::new(path.clone())).unwrap();
     assert!(r2.cache_hit, "second read should hit the warm cache");
 }
 
@@ -37,9 +33,13 @@ fn read_window_and_line_numbers() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
     let path = abs(dir.path(), "n.txt");
-    write(&eng, &WriteParams { path: path.clone(), content: "l1\nl2\nl3\nl4\nl5\n".into(), create_dirs: true }).unwrap();
+    write(&eng, &WriteParams::new(path.clone(), "l1\nl2\nl3\nl4\nl5\n")).unwrap();
 
-    let r = read(&eng, &ReadParams { path: path.clone(), offset: Some(2), limit: Some(2), line_numbers: true }).unwrap();
+    let r = read(
+        &eng,
+        &ReadParams { offset: Some(2), limit: Some(2), line_numbers: true, ..ReadParams::new(&path) },
+    )
+    .unwrap();
     assert!(r.truncated);
     assert_eq!(r.returned_lines, 2);
     assert!(r.content.contains("     2\tl2"));
@@ -52,16 +52,34 @@ fn edit_unique_and_replace_all() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
     let path = abs(dir.path(), "e.txt");
-    write(&eng, &WriteParams { path: path.clone(), content: "foo bar foo\n".into(), create_dirs: true }).unwrap();
+    write(&eng, &WriteParams::new(path.clone(), "foo bar foo\n")).unwrap();
 
     // Non-unique without replace_all → error.
-    let err = edit(&eng, &EditParams { path: path.clone(), old_string: "foo".into(), new_string: "baz".into(), replace_all: false }).unwrap_err();
+    let err = edit(
+        &eng,
+        &EditParams {
+            path: path.clone(),
+            old_string: "foo".into(),
+            new_string: "baz".into(),
+            replace_all: false,
+        },
+    )
+    .unwrap_err();
     assert_eq!(err.kind, ErrorKind::MultipleMatches);
 
-    let ok = edit(&eng, &EditParams { path: path.clone(), old_string: "foo".into(), new_string: "baz".into(), replace_all: true }).unwrap();
+    let ok = edit(
+        &eng,
+        &EditParams {
+            path: path.clone(),
+            old_string: "foo".into(),
+            new_string: "baz".into(),
+            replace_all: true,
+        },
+    )
+    .unwrap();
     assert_eq!(ok.replacements, 2);
 
-    let r = read(&eng, &ReadParams { path: path.clone(), offset: None, limit: None, line_numbers: false }).unwrap();
+    let r = read(&eng, &ReadParams::new(path.clone())).unwrap();
     assert_eq!(r.content, "baz bar baz\n");
 }
 
@@ -69,33 +87,22 @@ fn edit_unique_and_replace_all() {
 fn grep_content_and_files() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    write(&eng, &WriteParams { path: abs(dir.path(), "x.rs"), content: "fn main() {}\nlet x = 1;\n".into(), create_dirs: true }).unwrap();
-    write(&eng, &WriteParams { path: abs(dir.path(), "y.rs"), content: "fn helper() {}\n".into(), create_dirs: true }).unwrap();
-    write(&eng, &WriteParams { path: abs(dir.path(), "z.txt"), content: "no functions here\n".into(), create_dirs: true }).unwrap();
+    write(&eng, &WriteParams::new(abs(dir.path(), "x.rs"), "fn main() {}\nlet x = 1;\n")).unwrap();
+    write(&eng, &WriteParams::new(abs(dir.path(), "y.rs"), "fn helper() {}\n")).unwrap();
+    write(&eng, &WriteParams::new(abs(dir.path(), "z.txt"), "no functions here\n")).unwrap();
 
-    // Content mode: find `fn`.
-    let g = grep(&eng, &GrepParams {
-        pattern: "fn ".into(),
-        path: dir.path().display().to_string(),
-        mode: GrepMode::Content,
+    let base = GrepParams {
         globs: vec!["*.rs".into()],
-        case_insensitive: false, smart_case: false, fixed_strings: false, multiline: false,
-        before_context: 0, after_context: 0, max_count: None, hidden: false,
-        respect_gitignore: true, follow_symlinks: false,
-    }).unwrap();
+        ..GrepParams::new("fn ", dir.path().display().to_string())
+    };
+
+    let g = grep(&eng, &GrepParams { mode: GrepMode::Content, ..base.clone() }).unwrap();
     assert_eq!(g.total_matches, 2);
     assert_eq!(g.files.len(), 2);
+    assert!(g.root_is_dir);
 
     // Second grep over the same tree → warm walk cache hit.
-    let g2 = grep(&eng, &GrepParams {
-        pattern: "fn ".into(),
-        path: dir.path().display().to_string(),
-        mode: GrepMode::FilesWithMatches,
-        globs: vec!["*.rs".into()],
-        case_insensitive: false, smart_case: false, fixed_strings: false, multiline: false,
-        before_context: 0, after_context: 0, max_count: None, hidden: false,
-        respect_gitignore: true, follow_symlinks: false,
-    }).unwrap();
+    let g2 = grep(&eng, &GrepParams { mode: GrepMode::FilesWithMatches, ..base }).unwrap();
     assert!(g2.walk_cache_hit, "second grep should reuse the walk cache");
     assert_eq!(g2.files.len(), 2);
 }
@@ -105,40 +112,36 @@ fn trust_cache_stays_coherent_for_self_writes() {
     // In trust_cache mode warm hits skip the freshness stat; writes/edits through
     // Hearth must still be observed because they refresh the cache in place.
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = EngineConfig::default();
-    cfg.default_cwd = dir.path().to_path_buf();
-    cfg.enable_optimizer = false;
-    cfg.enable_watch = false;
-    cfg.trust_cache = true;
-    let eng = Engine::new(cfg);
+    let eng = trusting_engine(dir.path());
     let path = abs(dir.path(), "t.txt");
 
-    write(&eng, &WriteParams { path: path.clone(), content: "one\n".into(), create_dirs: true }).unwrap();
-    let r1 = read(&eng, &ReadParams { path: path.clone(), offset: None, limit: None, line_numbers: false }).unwrap();
+    write(&eng, &WriteParams::new(path.clone(), "one\n")).unwrap();
+    let r1 = read(&eng, &ReadParams::new(path.clone())).unwrap();
     assert_eq!(r1.content, "one\n");
 
     // Edit through Hearth → cache refreshed → trust read sees the new content.
-    edit(&eng, &EditParams { path: path.clone(), old_string: "one".into(), new_string: "two".into(), replace_all: false }).unwrap();
-    let r2 = read(&eng, &ReadParams { path: path.clone(), offset: None, limit: None, line_numbers: false }).unwrap();
+    edit(
+        &eng,
+        &EditParams {
+            path: path.clone(),
+            old_string: "one".into(),
+            new_string: "two".into(),
+            replace_all: false,
+        },
+    )
+    .unwrap();
+    let r2 = read(&eng, &ReadParams::new(path.clone())).unwrap();
     assert_eq!(r2.content, "two\n");
     assert!(r2.cache_hit);
 
     // Overwrite through Hearth → still coherent.
-    write(&eng, &WriteParams { path: path.clone(), content: "three\n".into(), create_dirs: false }).unwrap();
-    let r3 = read(&eng, &ReadParams { path: path.clone(), offset: None, limit: None, line_numbers: false }).unwrap();
+    write(
+        &eng,
+        &WriteParams { create_dirs: false, ..WriteParams::new(path.clone(), "three\n") },
+    )
+    .unwrap();
+    let r3 = read(&eng, &ReadParams::new(path.clone())).unwrap();
     assert_eq!(r3.content, "three\n");
-}
-
-fn warm_engine(cwd: &std::path::Path) -> Engine {
-    let mut cfg = EngineConfig::default();
-    cfg.default_cwd = cwd.to_path_buf();
-    cfg.enable_optimizer = false;
-    cfg.warm_shell = true;
-    Engine::new(cfg)
-}
-
-fn run(eng: &Engine, command: &str, timeout_ms: Option<u64>) -> BashResult {
-    bash(eng, &BashParams { command: command.into(), cwd: None, timeout_ms, env: vec![] }).unwrap()
 }
 
 #[test]
@@ -212,12 +215,12 @@ fn bash_runs_and_times_out() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
 
-    let ok = bash(&eng, &BashParams { command: "printf 'hi'; printf 'err' 1>&2; exit 3".into(), cwd: None, timeout_ms: None, env: vec![] }).unwrap();
+    let ok = run(&eng, "printf 'hi'; printf 'err' 1>&2; exit 3", None);
     assert_eq!(ok.stdout, "hi");
     assert_eq!(ok.stderr, "err");
     assert_eq!(ok.exit_code, 3);
     assert!(!ok.timed_out);
 
-    let to = bash(&eng, &BashParams { command: "sleep 5".into(), cwd: None, timeout_ms: Some(150), env: vec![] }).unwrap();
+    let to = run(&eng, "sleep 5", Some(150));
     assert!(to.timed_out);
 }

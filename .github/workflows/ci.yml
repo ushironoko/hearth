@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml, so the pinned version and its
+      # components install themselves on first use.
+      - name: Show toolchain
+        run: rustc --version && cargo --version && cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+  napi:
+    name: napi (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [22, 24]
+    defaults:
+      run:
+        working-directory: crates/hearth-napi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: .
+
+      - name: Build addon
+        run: pnpm run build:debug
+
+      # The loader and .d.ts are committed, so a change to the Rust surface that
+      # was not regenerated must fail here rather than surprise a consumer.
+      - name: Generated bindings are up to date
+        run: git diff --exit-code -- index.js index.d.ts
+        working-directory: .
+
+      - name: Contract suite (node)
+        run: pnpm test
+
+      - name: Smoke (node)
+        run: pnpm run smoke
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Contract suite (bun)
+        run: bun __test__/contract.mjs
+
+      - name: Smoke (bun)
+        run: bun smoke.mjs
+
+  tarball:
+    name: packed tarball (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build addon (release)
+        run: pnpm run build
+        working-directory: crates/hearth-napi
+
+      # Install what would actually be published, in a directory that shares
+      # nothing with the workspace, and run the suites against *that* copy.
+      - name: Pack and install into a clean directory
+        run: bash scripts/verify-tarball.sh
+
+      - name: Smoke the installed package (node)
+        run: node crates/hearth-napi/smoke.mjs
+        env:
+          HEARTH_ENTRY: ${{ github.workspace }}/../hearth-tarball-check/node_modules/@hearth/napi/index.js
+
+      - name: Smoke the installed package (bun)
+        run: bun crates/hearth-napi/smoke.mjs
+        env:
+          HEARTH_ENTRY: ${{ github.workspace }}/../hearth-tarball-check/node_modules/@hearth/napi/index.js
+
+      - name: Contract suite against the installed package (node)
+        run: node crates/hearth-napi/__test__/contract.mjs
+        env:
+          HEARTH_ENTRY: ${{ github.workspace }}/../hearth-tarball-check/node_modules/@hearth/napi/index.js
+
+      - name: Contract suite against the installed package (bun)
+        run: bun crates/hearth-napi/__test__/contract.mjs
+        env:
+          HEARTH_ENTRY: ${{ github.workspace }}/../hearth-tarball-check/node_modules/@hearth/napi/index.js
