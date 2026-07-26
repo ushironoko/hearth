@@ -1,4 +1,4 @@
-// Smoke test for a packed/installed @hearth/napi: does the addon load, and is
+// Smoke test for a packed/installed @hearthdev/napi: does the addon load, and is
 // every tool reachable through the published entry point?
 //
 // The contract suite covers behaviour; this covers *packaging*, which is why it

@@ -1,4 +1,4 @@
-# Releasing `@hearth/napi`
+# Releasing `@hearthdev/napi`
 
 The npm package ships **prebuilt** native addons: a consumer installs it and
 gets a working binary without a Rust toolchain. That means a release is a
@@ -7,17 +7,17 @@ all driven by one tag.
 
 ## Layout
 
-`@hearth/napi` is the package a consumer depends on. It contains the generated
+`@hearthdev/napi` is the package a consumer depends on. It contains the generated
 loader (`index.js`), the type declarations (`index.d.ts`), and nothing native.
 The binaries live in one package per platform, listed as optional dependencies
 so npm installs only the one that matches:
 
 | Rust target                 | npm package                    |
 | --------------------------- | ------------------------------ |
-| `aarch64-apple-darwin`      | `@hearth/napi-darwin-arm64`    |
-| `x86_64-apple-darwin`       | `@hearth/napi-darwin-x64`      |
-| `x86_64-unknown-linux-gnu`  | `@hearth/napi-linux-x64-gnu`   |
-| `aarch64-unknown-linux-gnu` | `@hearth/napi-linux-arm64-gnu` |
+| `aarch64-apple-darwin`      | `@hearthdev/napi-darwin-arm64`    |
+| `x86_64-apple-darwin`       | `@hearthdev/napi-darwin-x64`      |
+| `x86_64-unknown-linux-gnu`  | `@hearthdev/napi-linux-x64-gnu`   |
+| `aarch64-unknown-linux-gnu` | `@hearthdev/napi-linux-arm64-gnu` |
 
 The target list lives in `crates/hearth-napi/package.json` under `napi.targets`.
 Adding a target means adding it there, adding a matching runner to
@@ -52,7 +52,7 @@ released independently; they are not published to crates.io today.
 1. Make sure `main` is green, and that the bindings are current:
 
    ```bash
-   pnpm --filter @hearth/napi run build
+   pnpm --filter @hearthdev/napi run build
    git diff --exit-code -- crates/hearth-napi/index.js crates/hearth-napi/index.d.ts
    ```
 
@@ -63,7 +63,7 @@ released independently; they are not published to crates.io today.
    git push origin napi-v0.2.0
    ```
 
-3. The `Release @hearth/napi` workflow then runs three jobs:
+3. The `Release @hearthdev/napi` workflow then runs three jobs:
 
    **build** — every target on a native runner, smoke-testing each fresh binary.
 
@@ -137,8 +137,8 @@ Then bind each package to this repository and workflow — either through
 npm 11.15.0+:
 
 ```bash
-for pkg in @hearth/napi @hearth/napi-darwin-arm64 @hearth/napi-darwin-x64 \
-           @hearth/napi-linux-x64-gnu @hearth/napi-linux-arm64-gnu; do
+for pkg in @hearthdev/napi @hearthdev/napi-darwin-arm64 @hearthdev/napi-darwin-x64 \
+           @hearthdev/napi-linux-x64-gnu @hearthdev/napi-linux-arm64-gnu; do
   npm trust github "$pkg" \
     --repository ushironoko/hearth \
     --workflow release.yml \
@@ -213,7 +213,7 @@ way to check what a release *would* ship.
 To do the same locally for the current platform only:
 
 ```bash
-pnpm --filter @hearth/napi run build
+pnpm --filter @hearthdev/napi run build
 bash scripts/verify-tarball.sh
 ```
 

@@ -1,4 +1,4 @@
-// The @hearth/napi contract suite. Runs unmodified on Node 22+ and on Bun.
+// The @hearthdev/napi contract suite. Runs unmodified on Node 22+ and on Bun.
 //
 // `HEARTH_ENTRY` points the suite at whatever build is under test — the local
 // `index.js` by default, or an installed tarball in CI.
@@ -406,4 +406,4 @@ test("invalidateRoot covers what a shell command did", async () => {
   assert.ok(cleared.walksInvalidated >= 1);
 });
 
-await run(`@hearth/napi contract (${typeof Bun !== "undefined" ? "bun" : "node"})`);
+await run(`@hearthdev/napi contract (${typeof Bun !== "undefined" ? "bun" : "node"})`);

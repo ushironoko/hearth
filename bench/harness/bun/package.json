@@ -1,5 +1,5 @@
 {
-  "name": "@hearth/bun-bench",
+  "name": "hearth-bun-bench",
   "version": "0.1.0",
   "private": true,
   "description": "Fair Bun-vs-Hearth fs benchmark",

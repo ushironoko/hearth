@@ -1,4 +1,4 @@
-name: Release @hearth/napi
+name: Release @hearthdev/napi
 
 # Tag-driven. `napi version` writes the version into every platform package, so
 # the tag is the single source of truth for what gets published.

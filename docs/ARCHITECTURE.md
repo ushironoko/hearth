@@ -14,7 +14,7 @@ transport-agnostic **core + tools** from the three **surfaces** that expose them
 | `hearth-tools` | The five tools as plain `fn(&Engine, &Params) -> Result<Result>`, each with a `*_cancellable` twin. Plus `dispatch()` and the msgpack `transport`. |
 | `hearth-daemon` | `hearthd`: one `Engine`, a Unix-socket server, thread-per-connection. |
 | `hearth-cli` | `hearth`: thin client; connects to the daemon or runs inline (cold) as a fallback. |
-| `hearth-napi` | `@hearth/napi`: a `#[napi]` `HearthEngine` object; typed sync methods + cancellable `*Async` (libuv worker) twins + `bashStream`. |
+| `hearth-napi` | `@hearthdev/napi`: a `#[napi]` `HearthEngine` object; typed sync methods + cancellable `*Async` (libuv worker) twins + `bashStream`. |
 | `hearth-bench` | Deterministic corpus generator + criterion benches. |
 
 ## The Engine

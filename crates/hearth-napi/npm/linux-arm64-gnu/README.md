@@ -1,3 +1,3 @@
-# `@hearth/napi-linux-arm64-gnu`
+# `@hearthdev/napi-linux-arm64-gnu`
 
-This is the **aarch64-unknown-linux-gnu** binary for `@hearth/napi`
+This is the **aarch64-unknown-linux-gnu** binary for `@hearthdev/napi`

@@ -1,5 +1,5 @@
 {
-  "name": "@hearth/napi-darwin-arm64",
+  "name": "@hearthdev/napi-darwin-arm64",
   "version": "0.1.0",
   "cpu": [
     "arm64"

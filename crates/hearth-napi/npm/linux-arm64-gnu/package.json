@@ -1,5 +1,5 @@
 {
-  "name": "@hearth/napi-linux-arm64-gnu",
+  "name": "@hearthdev/napi-linux-arm64-gnu",
   "version": "0.1.0",
   "cpu": [
     "arm64"

@@ -1,4 +1,4 @@
-# `@hearth/napi`
+# `@hearthdev/napi`
 
 Node.js bindings for [Hearth](https://github.com/ushironoko/hearth) — one
 resident engine serving `read`, `write`, `edit`, `bash`, and `grep` from shared
@@ -8,13 +8,13 @@ Prebuilt binaries ship for macOS (arm64, x64) and Linux (x64, arm64 glibc); no
 Rust toolchain is needed to install.
 
 ```bash
-npm install @hearth/napi
+npm install @hearthdev/napi
 ```
 
 ## Usage
 
 ```ts
-import { HearthEngine } from "@hearth/napi";
+import { HearthEngine } from "@hearthdev/napi";
 
 // Construct one per process and keep it: the caches only pay off while it lives.
 const engine = new HearthEngine({ cwd: process.cwd(), warmShell: true });

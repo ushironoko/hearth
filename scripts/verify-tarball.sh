@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pack @hearth/napi and install it into a scratch directory outside the
+# Pack @hearthdev/napi and install it into a scratch directory outside the
 # workspace, so the smoke and contract suites can run against the bytes that
 # would actually be published rather than against the build tree.
 #
@@ -35,9 +35,9 @@ JSON
 
 npm install --no-audit --no-fund --install-strategy=nested "./$tarball"
 
-entry="$check_dir/node_modules/@hearth/napi/index.js"
+entry="$check_dir/node_modules/@hearthdev/napi/index.js"
 test -f "$entry" || { echo "error: installed package has no index.js" >&2; exit 1; }
-test -f "$check_dir/node_modules/@hearth/napi/index.d.ts" ||
+test -f "$check_dir/node_modules/@hearthdev/napi/index.d.ts" ||
   { echo "error: installed package ships no type declarations" >&2; exit 1; }
 
 echo "installed to $check_dir"

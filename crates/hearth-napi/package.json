@@ -1,5 +1,5 @@
 {
-  "name": "@hearth/napi",
+  "name": "@hearthdev/napi",
   "version": "0.1.0",
   "description": "Node.js bindings for the Hearth tool orchestrator: cancellable, streaming read/write/edit/bash/grep on one resident engine",
   "keywords": [

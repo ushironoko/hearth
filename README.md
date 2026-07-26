@@ -29,7 +29,7 @@ at its next safe point, with nothing left running once the promise settles.
 Three surfaces, one core:
 
 - **Native Rust** — `hearth_tools::{read,write,edit,bash,grep}(&Engine, &params)`.
-- **Node.js** — `@hearth/napi`'s `HearthEngine` class (typed sync + cancellable
+- **Node.js** — `@hearthdev/napi`'s `HearthEngine` class (typed sync + cancellable
   async methods, streaming `bash`).
 - **Daemon + CLI** — `hearthd` (a resident server) and the thin `hearth` client,
   talking length-prefixed msgpack over a Unix socket.
@@ -146,9 +146,9 @@ call.
 # Rust workspace (CLI + daemon + core)
 cargo build --release
 
-# Node addon (@hearth/napi): generates index.js/.d.ts + the native .node
+# Node addon (@hearthdev/napi): generates index.js/.d.ts + the native .node
 pnpm install
-pnpm --filter @hearth/napi build          # or: build:debug
+pnpm --filter @hearthdev/napi build          # or: build:debug
 ```
 
 ### Test
@@ -158,9 +158,9 @@ cargo test --workspace --all-targets       # unit + contract suites
 cargo clippy --workspace --all-targets -- -D warnings
 
 # After building the addon (these all run on Bun too):
-pnpm --filter @hearth/napi test            # the JS contract suite
-pnpm --filter @hearth/napi run smoke       # packaging smoke test
-pnpm --filter @hearth/napi run test:pi     # differential test vs pi's own edit
+pnpm --filter @hearthdev/napi test            # the JS contract suite
+pnpm --filter @hearthdev/napi run smoke       # packaging smoke test
+pnpm --filter @hearthdev/napi run test:pi     # differential test vs pi's own edit
                                            # implementation; skips if pi is absent
 bash scripts/verify-tarball.sh             # pack + install + run against that copy
 ```
@@ -189,7 +189,7 @@ The CLI falls back to an in-process (cold) engine when no daemon is reachable.
 **Node.js** (where read/grep/edit win in-process):
 
 ```js
-import { HearthEngine } from "@hearth/napi";
+import { HearthEngine } from "@hearthdev/napi";
 const eng = new HearthEngine({ cwd: process.cwd(), trustCache: true });
 const r  = eng.read({ path: "src/main.rs" });               // { content, totalLines, cacheHit }
 const b  = eng.readBytes({ path: "assets/logo.png" });      // binary-safe Buffer
@@ -239,7 +239,7 @@ let hits = grep(&engine, &GrepParams {
 | `hearth-tools` | The five tools + msgpack transport, built on the engine. |
 | `hearth-daemon`| `hearthd` — the Unix-socket server. |
 | `hearth-cli`   | `hearth` — the thin client (daemon or inline). |
-| `hearth-napi`  | `@hearth/napi` — the Node addon. |
+| `hearth-napi`  | `@hearthdev/napi` — the Node addon. |
 | `bench`        | Corpus generator + criterion benches + CLI/Node/Bun harnesses. |
 
 ### Notes for contributors
@@ -253,5 +253,5 @@ let hits = grep(&engine, &GrepParams {
 - `crates/hearth-napi/index.js` and `index.d.ts` are generated but **committed**:
   they are the package's public API surface, so a change to them belongs in a
   diff. CI fails if they drift from the Rust source.
-- Publishing `@hearth/napi` is tag-driven; see [`docs/RELEASE.md`](docs/RELEASE.md).
+- Publishing `@hearthdev/napi` is tag-driven; see [`docs/RELEASE.md`](docs/RELEASE.md).
 - Rust edition 2024, functional-leaning style, no hidden global state.
