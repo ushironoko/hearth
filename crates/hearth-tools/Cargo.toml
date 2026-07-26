@@ -25,6 +25,10 @@ ignore = { workspace = true }
 globset = { workspace = true }
 regex = { workspace = true }
 
+# pi-compatible edit matching + diff hunks
+unicode-normalization = { workspace = true }
+similar = { workspace = true }
+
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 crossbeam-channel = { workspace = true }

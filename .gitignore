@@ -3,10 +3,11 @@
 Cargo.lock.bak
 
 # Node / napi
+# The generated loader and .d.ts ARE tracked: they are the package's public
+# API surface, so a change to them should show up in review rather than only
+# in a published tarball. Compiled addons are not.
 node_modules
 *.node
-crates/hearth-napi/index.js
-crates/hearth-napi/index.d.ts
 crates/hearth-napi/npm/**/*.node
 
 # bench artifacts

@@ -73,28 +73,46 @@ impl WalkCache {
         let sink = Mutex::new(Vec::new());
         builder.build_parallel().run(|| {
             Box::new(|result| {
-                if let Ok(entry) = result {
-                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                        sink.lock().push(entry.into_path());
-                    }
+                if let Ok(entry) = result
+                    && entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    sink.lock().push(entry.into_path());
                 }
                 WalkState::Continue
             })
         });
-        sink.into_inner()
+        // The parallel walk finishes in thread-completion order. Sorting here
+        // once makes every consumer deterministic — and lets `grep` treat the
+        // index order as path order when it applies a global match limit.
+        let mut files = sink.into_inner();
+        files.sort_unstable();
+        files
     }
 
-    /// Invalidate every cached walk whose root contains (or equals) `path`.
-    /// Called when the fs-watcher sees a structural change (create/remove/rename).
-    pub fn invalidate_under(&self, path: &Path) {
+    /// Invalidate every cached walk that overlaps `path` — both walks rooted at
+    /// an ancestor of `path` (whose file list may now be wrong) and walks rooted
+    /// beneath it (which `path` may have just replaced wholesale). Returns the
+    /// number of entries dropped.
+    ///
+    /// Called by the fs-watcher on a structural change, and directly by
+    /// `write`/`edit` when they create a path or touch an ignore file.
+    pub fn invalidate_under(&self, path: &Path) -> usize {
+        let before = self.map.len();
         self.map.retain(|k, _| !path.starts_with(&k.root) && !k.root.starts_with(path));
+        before.saturating_sub(self.map.len())
     }
 
-    pub fn clear(&self) {
+    /// Drop every cached walk. Returns the number of entries removed.
+    pub fn clear(&self) -> usize {
+        let n = self.map.len();
         self.map.clear();
+        n
     }
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }

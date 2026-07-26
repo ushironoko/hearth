@@ -1,0 +1,42 @@
+{
+  "name": "@hearth/napi-linux-x64-gnu",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "hearth.linux-x64-gnu.node",
+  "files": [
+    "hearth.linux-x64-gnu.node"
+  ],
+  "description": "Node.js bindings for the Hearth tool orchestrator: cancellable, streaming read/write/edit/bash/grep on one resident engine",
+  "keywords": [
+    "napi-rs",
+    "agent-tools",
+    "grep",
+    "ripgrep",
+    "file-cache"
+  ],
+  "homepage": "https://github.com/ushironoko/hearth#readme",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ushironoko/hearth.git",
+    "directory": "crates/hearth-napi"
+  },
+  "bugs": {
+    "url": "https://github.com/ushironoko/hearth/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

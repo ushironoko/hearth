@@ -127,6 +127,7 @@ per-file `std::fs::metadata` freshness check is ~70% of default warm grep
 cargo bench -p hearth-bench --bench read_bench
 cargo bench -p hearth-bench --bench grep_bench
 cargo bench -p hearth-bench --bench edit_bench
+cargo bench -p hearth-bench --bench bash_bench
 CORPUS=/tmp/hearth-corpus NUM_FILES=3000 bash bench/harness/compare.sh
 ```
 
@@ -213,21 +214,66 @@ caller, serving wrong bytes on later reads. Safety won; `readBytes` copies once.
 standalone Hearth tool; they appear only as components of the search comparison,
 where the composite decisively favours Hearth.
 
+## What the correctness guarantees cost
+
+Cancellation, streaming, global limiting and atomic batch editing are not free.
+These are the measured prices, so the trade can be judged rather than assumed.
+
+Measured on the same hardware with a release napi build, against a 1000-file
+tree (120 lines each, ~2100 matches) and a 2000-line file for the edit rows.
+Each figure is the mean of 30 iterations after warm-up; anything inside ±2 % is
+noise on this machine.
+
+| guarantee | measurement | cost |
+|---|---|---|
+| `grep` global limit, never reached | `maxTotalCount: 100000` vs no limit | **~1 %** (one mutex op per *file*, not per match) |
+| `grep` global limit, reached early | `maxTotalCount: 100` vs no limit | **−97 %** — the early stop is the point |
+| `grep` cancellation polling | live `AbortSignal` vs none | **~0 %** (one relaxed atomic load per file and per match) |
+| `bash` streaming | `bashStream` + callback vs `bashAsync` | **~0 %** — the pipes were already drained on reader threads; the callback rides along |
+| `bash` without collection | `collectOutput: false` | **~5 % faster**, and it drops the second copy of the output |
+| `editBatch` vs single `edit`, no diff | `skipDiff: true` | **+52 %** |
+| `editBatch` vs single `edit`, with diff | default (4 lines of context) | **+193 %** |
+
+The `editBatch` overhead is what pi-compatible matching costs: LF normalization,
+one normalized view of the file for ambiguity checking, and the line-span scan
+that keeps untouched lines byte-exact. It is bounded to *one* normalization per
+call regardless of how many edits it carries, and the common case — an ASCII
+file with no trailing whitespace — borrows rather than copies. The remaining
++141 % between the two rows is the diff itself, which `skipDiff` turns off for a
+caller that does not render one.
+
+In absolute terms all of these are sub-millisecond on a 2000-line file
+(`edit` 0.17 ms, `editBatch` 0.26 ms without a diff, 0.49 ms with one), against
+a `bash` call that costs milliseconds and a `grep` over a real tree that costs
+more.
+
+### Warm shell, after the at-most-once rework
+
+`cargo bench -p hearth-bench --bench bash_bench`, trivial command (`true`):
+
+| | time |
+|---|---|
+| warm pool | 563 µs |
+| spawn per command | 2.04 ms |
+
+**3.62× faster than spawning**, down from 3.8× before the rework. The ~5 % of
+the advantage that was given up buys the control pipe, `set -m` job isolation,
+the post-command process-group kill, and the pre-dispatch drain — i.e. the
+at-most-once guarantee and the output isolation. Correctness was the better
+trade here: the previous pool would silently re-run a command after an ambiguous
+protocol failure.
+
 ## Known gaps
 
-The suite still lacks some benchmarks needed to fully substantiate an
-*orchestrator* claim. Not yet implemented:
+Read every number above as scoped to *this* synthetic corpus and *this* access
+pattern. Still not measured:
 
-* **Ablation** of the four warm-grep effects (walk-only vs content-only vs both).
-* **Cold-start including daemon spawn** (the current cold row is `--no-daemon`,
-  i.e. in-process; it does not measure `hearthd` startup latency).
-* **End-to-end multi-op agent sequences** (read → grep → edit over one warm
-  tree — the workload the daemon is actually built to amortize).
-* **Post-change re-warm** (invalidation + re-read cost after an edit).
-* **Concurrent throughput**, **steady-state RSS + eviction**, and runs against
-  **multiple real repositories**.
-* A **break-even curve** over N repeated calls (how many reuses pay back the
-  daemon's startup + memory).
-
-Until those land, read every number above as scoped to *this* synthetic corpus
-and *this* access pattern.
+* **Post-change re-warm** — invalidation plus re-read cost after an edit, and
+  what `invalidateRoot` costs on a large warm cache.
+* **Multiple real repositories**, rather than one generated corpus.
+* **Sustained streaming throughput** — the `bash` streaming rows use a command
+  that finishes in milliseconds; a long-running build's chunk rate is not
+  characterised.
+* **Cancellation latency** — the contract suite proves cancellation *happens*
+  and that nothing outlives it, but not how quickly it lands under load.
+* **Windows** — not a supported target, so not measured.

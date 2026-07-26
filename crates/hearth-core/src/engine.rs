@@ -4,8 +4,10 @@
 //! one `Engine` for their whole lifetime; tools borrow it per call.
 
 use crate::cache::{FileCache, WalkCache};
+use crate::pathlock::{mutation_key, PathGuard, PathLocks};
 use crate::watch::WatchHandle;
 use dashmap::DashMap;
+use hearth_proto::{CacheScope, InvalidateResult, ShellSpec};
 use parking_lot::Mutex;
 use std::any::{Any, TypeId};
 use std::path::{Path, PathBuf};
@@ -21,6 +23,9 @@ pub struct EngineConfig {
     pub default_cwd: PathBuf,
     /// Default hard timeout for `bash` commands (ms).
     pub bash_timeout_ms: u64,
+    /// Default shell for `bash`. `None` means `/bin/sh -c`. A per-call
+    /// `BashParams::shell` overrides this.
+    pub shell: Option<ShellSpec>,
     /// Use the pooled warm-shell fast path for `bash` (opt-in). Default false:
     /// each command spawns a fresh `/bin/sh -c` (always correct). The warm pool
     /// avoids the per-command spawn but falls back to a fresh spawn on any
@@ -55,6 +60,7 @@ impl Default for EngineConfig {
         Self {
             default_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             bash_timeout_ms: 120_000,
+            shell: None,
             warm_shell: false,
             walk_threads: threads,
             enable_watch: false,
@@ -236,6 +242,81 @@ impl Engine {
         self.inner.config.trust_cache
     }
 
+    // -- mutation serialization ------------------------------------------
+
+    /// Take the exclusive mutation lock for `path`.
+    ///
+    /// Every tool that rewrites a file holds this for the whole
+    /// read-modify-write **and** the cache refresh, so a concurrent mutation of
+    /// the same file (or of a symlink alias of it) cannot interleave and lose
+    /// an update. The guard releases on drop, including on unwind.
+    pub fn lock_path(&self, path: &Path) -> PathGuard {
+        self.extension::<PathLocks>().lock(mutation_key(path))
+    }
+
+    // -- explicit cache invalidation --------------------------------------
+
+    /// Drop `path` from the file cache, and any cached walk that could have
+    /// enumerated it. Use after a mutation Hearth did not perform itself.
+    pub fn invalidate_path(&self, path: &Path) -> InvalidateResult {
+        let files = u64::from(self.inner.files.invalidate(path));
+        let walks = self.inner.walks.invalidate_under(path) as u64;
+        InvalidateResult { files_invalidated: files, walks_invalidated: walks }
+    }
+
+    /// Drop everything cached at or beneath `root`.
+    ///
+    /// This is the conservative hammer an adapter reaches for after a shell
+    /// command: an arbitrary command can create, delete, rename, or rewrite
+    /// anything under its cwd, and no cheaper invalidation is sound.
+    pub fn invalidate_root(&self, root: &Path) -> InvalidateResult {
+        InvalidateResult {
+            files_invalidated: self.inner.files.invalidate_prefix(root) as u64,
+            walks_invalidated: self.inner.walks.invalidate_under(root) as u64,
+        }
+    }
+
+    /// The scoped/recursive form the protocol exposes.
+    pub fn invalidate(&self, path: &Path, recursive: bool, scope: CacheScope) -> InvalidateResult {
+        let files = matches!(scope, CacheScope::Files | CacheScope::All);
+        let walks = matches!(scope, CacheScope::Walks | CacheScope::All);
+        InvalidateResult {
+            files_invalidated: if !files {
+                0
+            } else if recursive {
+                self.inner.files.invalidate_prefix(path) as u64
+            } else {
+                u64::from(self.inner.files.invalidate(path))
+            },
+            walks_invalidated: if walks {
+                self.inner.walks.invalidate_under(path) as u64
+            } else {
+                0
+            },
+        }
+    }
+
+    /// Drop every cached file and walk.
+    pub fn clear_caches(&self) -> InvalidateResult {
+        InvalidateResult {
+            files_invalidated: self.inner.files.clear() as u64,
+            walks_invalidated: self.inner.walks.clear() as u64,
+        }
+    }
+
+    /// Keep the walk cache coherent after Hearth itself mutated `path`.
+    ///
+    /// A walk caches *which files exist* under a root, so it only goes stale
+    /// when a mutation changes the answer: creating a path adds an entry, and
+    /// rewriting a file that drives traversal (`.gitignore` and friends) can
+    /// add or remove many. Overwriting an ordinary existing file changes
+    /// nothing a walk recorded, so the common case costs one boolean test.
+    pub fn note_mutation(&self, path: &Path, created: bool) {
+        if created || is_ignore_file(path) {
+            self.inner.walks.invalidate_under(path);
+        }
+    }
+
     /// Render the profiler report, prefixed with live cache/optimizer state.
     pub fn profiler_report(&self) -> String {
         format!("{}\n{}", self.cache_report(), crate::profiler::report())
@@ -256,6 +337,21 @@ impl Engine {
             total,
             self.inner.walks.len(),
         )
+    }
+}
+
+/// Whether writing this file can change which files a directory walk yields.
+///
+/// These are the files the `ignore` crate consults while traversing, so a
+/// change to any of them invalidates a cached file list even though no file was
+/// created or removed.
+fn is_ignore_file(path: &Path) -> bool {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(".gitignore" | ".ignore" | ".rgignore" | ".git-blame-ignore-revs") => true,
+        // `.git/info/exclude` is the repo-local ignore file.
+        Some("exclude") => path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+            == Some("info"),
+        _ => false,
     }
 }
 

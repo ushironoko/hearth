@@ -42,6 +42,14 @@ impl LineIndex {
         }
     }
 
+    /// Number of elements `split('\n')` would produce: one more than the number
+    /// of newlines, so a trailing newline *does* contribute a final empty
+    /// element. This is the count JS callers see, and it differs from
+    /// [`line_count`](Self::line_count) by exactly that phantom line.
+    pub fn split_count(&self) -> u64 {
+        self.line_starts.len() as u64
+    }
+
     /// Map a byte offset to a **1-based** `(line, column)`, column in bytes.
     pub fn line_col(&self, offset: usize) -> (u64, u64) {
         let offset = (offset.min(self.len as usize)) as u32;

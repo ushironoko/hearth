@@ -212,13 +212,12 @@ impl FileCache {
         max_bytes: u64,
         trust: bool,
     ) -> Result<Option<(Arc<FileEntry>, bool)>, ToolError> {
-        if trust {
-            if let Some(entry) = self.map.get(path) {
-                crate::profiler::count("cache.file.hit_trusted", 1);
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                self.touch(entry.value());
-                return Ok(Some((Arc::clone(entry.value()), true)));
-            }
+        if trust
+            && let Some(entry) = self.map.get(path) {
+            crate::profiler::count("cache.file.hit_trusted", 1);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.touch(entry.value());
+            return Ok(Some((Arc::clone(entry.value()), true)));
         }
         let meta = std::fs::metadata(path).map_err(|e| map_io(e, path))?;
         if !meta.is_file() {
@@ -228,13 +227,12 @@ impl FileCache {
         let size = meta.len();
         let mtime_ns = mtime_nanos(&meta);
 
-        if let Some(entry) = self.map.get(path) {
-            if entry.size == size && entry.mtime_ns == mtime_ns {
-                crate::profiler::count("cache.file.hit", 1);
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                self.touch(entry.value());
-                return Ok(Some((Arc::clone(entry.value()), true)));
-            }
+        if let Some(entry) = self.map.get(path)
+            && entry.size == size && entry.mtime_ns == mtime_ns {
+            crate::profiler::count("cache.file.hit", 1);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.touch(entry.value());
+            return Ok(Some((Arc::clone(entry.value()), true)));
         }
 
         if size > max_bytes {
@@ -342,17 +340,41 @@ impl FileCache {
         dropped
     }
 
-    /// Drop a single path (called by fs-watch invalidation).
-    pub fn invalidate(&self, path: &Path) {
-        if let Some((_, entry)) = self.map.remove(path) {
-            self.sub_bytes(entry.size);
+    /// Drop a single path (called by fs-watch invalidation). Returns whether an
+    /// entry was actually removed.
+    pub fn invalidate(&self, path: &Path) -> bool {
+        match self.map.remove(path) {
+            Some((_, entry)) => {
+                self.sub_bytes(entry.size);
+                true
+            }
+            None => false,
         }
     }
 
-    /// Drop everything.
-    pub fn clear(&self) {
+    /// Drop `root` and every entry beneath it. Returns the number removed.
+    ///
+    /// Cost is proportional to the number of *cached* entries, not to the size
+    /// of the tree on disk, so this stays bounded by the cache's own entry cap
+    /// even when pointed at a huge directory.
+    pub fn invalidate_prefix(&self, root: &Path) -> usize {
+        let mut removed = 0;
+        let victims: Vec<PathBuf> =
+            self.map.iter().map(|e| e.key().clone()).filter(|p| p.starts_with(root)).collect();
+        for path in victims {
+            if self.invalidate(&path) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Drop everything. Returns the number of entries removed.
+    pub fn clear(&self) -> usize {
+        let n = self.map.len();
         self.map.clear();
         self.total_bytes.store(0, Ordering::Relaxed);
+        n
     }
 }
 

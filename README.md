@@ -17,16 +17,20 @@ The five tools an agent leans on most, behind one engine:
 
 | Tool | What it does |
 |------|--------------|
-| `read` | Windowed file reads served from the warm cache (line offset/limit, line numbers, binary-safe bytes). |
-| `write` | Atomic full-file writes (temp + rename) that refresh the cache in place. |
-| `edit` | Exact string replace / replace-all on the cached buffer, persisted atomically. |
-| `bash` | Shell commands with timeout + process-group kill; opt-in **warm-shell pool**. |
-| `grep` | ripgrep-grade search (`grep-searcher` + `grep-regex`) over a **cached walk** and **cached file bytes**. |
+| `read` | Windowed file reads served from the warm cache (line offset/limit, line numbers, binary-safe bytes, two line-window conventions). |
+| `write` | Crash-safe atomic writes, or `fs.writeFile`-compatible in-place ones; symlinks are written *through*, not replaced. |
+| `edit` | One exact replacement, or a batch of disjoint ones applied atomically — matched against the original file, preserving BOM and CRLF, with diff hunks in the result. |
+| `bash` | Shell commands with ordered output streaming, configurable shell, timeout + process-group kill, and an opt-in **warm-shell pool** with at-most-once semantics. |
+| `grep` | ripgrep-grade search (`grep-searcher` + `grep-regex`) over a **cached walk** and **cached file bytes**, with a deterministic global match limit. |
+
+Every operation is cancellable: pass an `AbortSignal` and the native work stops
+at its next safe point, with nothing left running once the promise settles.
 
 Three surfaces, one core:
 
 - **Native Rust** — `hearth_tools::{read,write,edit,bash,grep}(&Engine, &params)`.
-- **Node.js** — `@hearth/napi`'s `HearthEngine` class (sync + async methods).
+- **Node.js** — `@hearth/napi`'s `HearthEngine` class (typed sync + cancellable
+  async methods, streaming `bash`).
 - **Daemon + CLI** — `hearthd` (a resident server) and the thin `hearth` client,
   talking length-prefixed msgpack over a Unix socket.
 
@@ -51,8 +55,9 @@ What that buys, **measured** (Apple Silicon, `--release`; see
   engine level (native/napi) it is **9–31×** the ripgrep engine.
 - **`read` and `grep` beat Node.js and Bun `fs`** under a *fair, sync-vs-sync*
   comparison: `read` 1.1–7.2×, a `readdir`+`readFile`+regex search 1.3–27×.
-- **`bash` gets a resident advantage too**: the opt-in warm-shell pool is **3.8×**
-  faster than spawning a shell per command.
+- **`bash` gets a resident advantage too**: the opt-in warm-shell pool is **3.6×**
+  faster than spawning a shell per command, while guaranteeing at-most-once
+  execution.
 - **`edit`** is ~2× a naive disk read-replace-write for large files.
 
 ### Limits
@@ -119,9 +124,11 @@ call.
 
 - **Daemon/CLI**: length-prefixed msgpack over a Unix socket, one thread per
   connection, engine shared by `Arc` clone.
-- **napi**: JSON at the boundary; sync methods plus `*Async` twins that offload
-  to a libuv worker via `AsyncTask` (no embedded tokio). The engine is an explicit
-  object the caller constructs — no hidden global singleton.
+- **napi**: concrete generated TypeScript types at the boundary — no `any` on any
+  tool method. Sync methods plus `*Async` twins that offload to a libuv worker via
+  `AsyncTask` (no embedded tokio) and take an optional `AbortSignal`, and a
+  `bashStream` that delivers ordered output chunks while a command runs. The
+  engine is an explicit object the caller constructs — no hidden global singleton.
 
 ---
 
@@ -147,8 +154,15 @@ pnpm --filter @hearth/napi build          # or: build:debug
 ### Test
 
 ```bash
-cargo test --workspace                     # unit + integration (incl. warm-shell)
-node crates/hearth-napi/smoke.mjs          # napi smoke (after building the addon)
+cargo test --workspace --all-targets       # unit + contract suites
+cargo clippy --workspace --all-targets -- -D warnings
+
+# After building the addon (these all run on Bun too):
+pnpm --filter @hearth/napi test            # the JS contract suite
+pnpm --filter @hearth/napi run smoke       # packaging smoke test
+pnpm --filter @hearth/napi run test:pi     # differential test vs pi's own edit
+                                           # implementation; skips if pi is absent
+bash scripts/verify-tarball.sh             # pack + install + run against that copy
 ```
 
 ### Benchmark
@@ -179,7 +193,27 @@ import { HearthEngine } from "@hearth/napi";
 const eng = new HearthEngine({ cwd: process.cwd(), trustCache: true });
 const r  = eng.read({ path: "src/main.rs" });               // { content, totalLines, cacheHit }
 const b  = eng.readBytes({ path: "assets/logo.png" });      // binary-safe Buffer
-const g  = JSON.parse(await eng.grepAsync({ pattern: "fn ", path: "src", globs: ["*.rs"] }));
+
+const controller = new AbortController();
+const g = await eng.grepAsync(
+  { pattern: "fn ", path: "src", globs: ["*.rs"], maxTotalCount: 100 },
+  controller.signal,
+);
+
+// Several disjoint edits, applied atomically against the original file.
+await eng.editBatchAsync({
+  path: "src/main.rs",
+  edits: [
+    { oldText: "fn old_name", newText: "fn new_name" },
+    { oldText: "old_name()", newText: "new_name()" },
+  ],
+});
+
+// Output streams while the command runs; a timeout or abort still resolves,
+// with the partial output intact.
+await eng.bashStream({ command: "cargo build" }, (chunk) =>
+  process.stdout.write(chunk.text),
+);
 ```
 
 **Native Rust:**
@@ -213,5 +247,11 @@ let hits = grep(&engine, &GrepParams {
 - The default is always correct; the fast paths (`--trust-cache`, `--warm-shell`)
   are opt-in and documented with their trade-offs.
 - Benchmarks are held to a fair standard (sync-vs-sync, path-set equality,
-  atomicity caveats) — see `docs/BENCHMARKS.md` before quoting a number.
+  atomicity caveats) — see `docs/BENCHMARKS.md` before quoting a number, and
+  `docs/BENCHMARKS.md#what-the-correctness-guarantees-cost` for what cancellation,
+  streaming and atomic batch editing actually cost.
+- `crates/hearth-napi/index.js` and `index.d.ts` are generated but **committed**:
+  they are the package's public API surface, so a change to them belongs in a
+  diff. CI fails if they drift from the Rust source.
+- Publishing `@hearth/napi` is tag-driven; see [`docs/RELEASE.md`](docs/RELEASE.md).
 - Rust edition 2024, functional-leaning style, no hidden global state.

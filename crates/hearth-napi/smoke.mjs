@@ -1,53 +1,85 @@
-// Node smoke test for the Hearth napi binding.
-import { HearthEngine } from "./index.js";
+// Smoke test for a packed/installed @hearth/napi: does the addon load, and is
+// every tool reachable through the published entry point?
+//
+// The contract suite covers behaviour; this covers *packaging*, which is why it
+// touches every method once and asserts nothing subtle. `HEARTH_ENTRY` points
+// it at an installed copy; it defaults to the local build.
+
+import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import assert from "node:assert";
 
-const dir = mkdtempSync(join(tmpdir(), "hearth-napi-"));
+const entry = process.env.HEARTH_ENTRY ?? new URL("./index.js", import.meta.url).href;
+const { HearthEngine } = await import(entry);
+
+const runtime = typeof Bun !== "undefined" ? `bun ${Bun.version}` : `node ${process.version}`;
+const dir = mkdtempSync(join(tmpdir(), "hearth-smoke-"));
 writeFileSync(join(dir, "a.rs"), "fn main() {}\nlet answer = 42;\n");
 writeFileSync(join(dir, "b.txt"), "no code here\n");
 
-const eng = new HearthEngine({ cwd: dir, enableOptimizer: false });
+const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
 
-// write
-const w = eng.write({ path: join(dir, "c.rs"), content: "fn helper() {}\n" });
-assert.equal(w.bytesWritten, 15);
+// write / writeFast / writeAsync
+assert.equal(engine.write({ path: join(dir, "c.rs"), content: "fn helper() {}\n" }).bytesWritten, 15);
+assert.equal(engine.writeFast(join(dir, "d.txt"), "fast\ncontent\n").bytesWritten, 13);
+assert.equal((await engine.writeAsync({ path: join(dir, "e.txt"), content: "async\n" })).bytesWritten, 6);
 
-// read (warm on 2nd)
-const r1 = eng.read({ path: join(dir, "a.rs") });
-assert.equal(r1.totalLines, 2);
-const r2 = eng.read({ path: join(dir, "a.rs") });
-assert.equal(r2.cacheHit, true);
+// read / readBytes, cold then warm
+assert.equal(engine.read({ path: join(dir, "a.rs") }).totalLines, 2);
+assert.equal(engine.read({ path: join(dir, "a.rs") }).cacheHit, true);
+assert.equal((await engine.readAsync({ path: join(dir, "a.rs") })).totalLines, 2);
+assert.equal(engine.readBytes({ path: join(dir, "d.txt") }).toString(), "fast\ncontent\n");
+assert.equal((await engine.readBytesAsync({ path: join(dir, "d.txt") })).toString(), "fast\ncontent\n");
 
-// edit
-const e = eng.edit({ path: join(dir, "a.rs"), oldString: "42", newString: "43", replaceAll: false });
-assert.equal(e.replacements, 1);
+// edit and editBatch
+assert.equal(
+  engine.edit({ path: join(dir, "a.rs"), oldString: "42", newString: "43" }).replacements,
+  1,
+);
+const batch = await engine.editBatchAsync({
+  path: join(dir, "a.rs"),
+  edits: [
+    { oldText: "fn main", newText: "fn entry" },
+    { oldText: "43", newText: "44" },
+  ],
+});
+assert.equal(batch.replacements, 2);
+assert.ok(batch.hunks.length >= 1, "a batch edit reports at least one diff hunk");
 
-// writeFast (moves content) + readBytes (binary-safe Buffer)
-const wf = eng.writeFast(join(dir, "d.txt"), "fast\ncontent\n");
-assert.equal(wf.bytesWritten, 13);
-const rb = eng.readBytes({ path: join(dir, "d.txt") });
-assert.ok(Buffer.isBuffer(rb) && rb.toString("utf8") === "fast\ncontent\n", "readBytes byte-exact");
+// grep, sync and async
+assert.equal(
+  engine.grep({ pattern: "fn ", path: dir, mode: "content", globs: ["*.rs"] }).totalMatches,
+  2,
+);
+const grepped = await engine.grepAsync({
+  pattern: "fn ",
+  path: dir,
+  mode: "filesWithMatches",
+  globs: ["*.rs"],
+});
+assert.equal(grepped.files.length, 2);
 
-// grep sync
-const g = eng.grep({ pattern: "fn ", path: dir, mode: "content", globs: ["*.rs"] });
-assert.equal(g.totalMatches, 2);
+// bash, sync / async / streaming
+assert.equal(engine.bash({ command: "printf sync" }).stdout, "sync");
+assert.equal((await engine.bashAsync({ command: "printf async" })).stdout, "async");
+const chunks = [];
+const streamed = await engine.bashStream({ command: "printf streamed" }, (c) => chunks.push(c));
+assert.equal(streamed.stdout, "streamed");
+assert.equal(chunks.map((c) => c.text).join(""), "streamed");
 
-// grep async (returns JSON string)
-const gaStr = await eng.grepAsync({ pattern: "fn ", path: dir, mode: "filesWithMatches", globs: ["*.rs"] });
-const ga = JSON.parse(gaStr);
-assert.equal(ga.files.length, 2);
-assert.equal(ga.walkCacheHit, true, "async grep should reuse warm walk cache");
+// cancellation reaches the native side
+const controller = new AbortController();
+controller.abort();
+await assert.rejects(() => engine.readAsync({ path: join(dir, "a.rs") }, controller.signal));
 
-// bash async
-const baStr = await eng.bashAsync({ command: "echo hi from node" });
-const ba = JSON.parse(baStr);
-assert.equal(ba.stdout, "hi from node\n");
-assert.equal(ba.exitCode, 0);
+// cache invalidation
+assert.ok(engine.invalidatePath(join(dir, "a.rs")).filesInvalidated >= 0);
+assert.ok(engine.invalidateRoot(dir).walksInvalidated >= 0);
+assert.ok(engine.clearCaches().filesInvalidated >= 0);
 
-console.log("napi smoke test: ALL PASS");
-console.log("  read.totalLines =", r1.totalLines, " cacheHit(2nd) =", r2.cacheHit);
-console.log("  grep.totalMatches =", g.totalMatches);
-console.log("  bash.stdout =", JSON.stringify(ba.stdout));
+// profiler surface
+engine.enableProfiler();
+assert.ok(engine.stats().includes("cache"));
+
+console.log(`hearth napi smoke: OK (${runtime})`);

@@ -17,8 +17,7 @@ hearth-proto = { workspace = true }
 
 napi = { workspace = true }
 napi-derive = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+libc = { workspace = true }
 mimalloc = { workspace = true }
 
 [build-dependencies]

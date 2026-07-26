@@ -15,12 +15,7 @@ fn bench_agent_multiop(c: &mut Criterion) {
     gen_corpus(root, 2000, 32, 200);
 
     let target = root.join("d000").join("f00000.rs").display().to_string();
-    let read_params = ReadParams {
-        path: target.clone(),
-        offset: None,
-        limit: None,
-        line_numbers: false,
-    };
+    let read_params = ReadParams { offset: None, limit: None, line_numbers: false, ..ReadParams::new(target.clone()) };
     let grep_params = GrepParams {
         pattern: "TODO_MATCH".into(),
         path: root.display().to_string(),
