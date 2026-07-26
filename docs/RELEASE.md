@@ -19,6 +19,13 @@ so npm installs only the one that matches:
 | `x86_64-unknown-linux-gnu`  | `@hearthdev/napi-linux-x64-gnu`   |
 | `aarch64-unknown-linux-gnu` | `@hearthdev/napi-linux-arm64-gnu` |
 
+**`x86_64-apple-darwin` has an end date.** Apple dropped the architecture, and
+GitHub removes Intel macOS runners when the macOS 15 image retires in autumn
+2027. Before then this target has to be dropped or moved to a cross-compile.
+(The `macos-13` image it originally used was already retired in December 2025 —
+a job pointed at a retired label does not fail, it queues forever, so a stuck
+build job is worth checking against the runner-images deprecation notices.)
+
 The target list lives in `crates/hearth-napi/package.json` under `napi.targets`.
 Adding a target means adding it there, adding a matching runner to
 `.github/workflows/release.yml`, extending the map in

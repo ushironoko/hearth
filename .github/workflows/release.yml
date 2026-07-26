@@ -40,8 +40,13 @@ jobs:
           # the binary is exercised on the platform it ships to.
           - target: aarch64-apple-darwin
             runner: macos-14
+          # macos-13 was retired in December 2025; macos-15-intel is the
+          # free-tier x86_64 macOS image that replaced it. Apple has dropped
+          # x86_64, so GitHub removes this architecture entirely when the
+          # macOS 15 image retires in autumn 2027 — at which point this target
+          # has to go, or move to a cross-compile.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
           # An older glibc than the newest runner's, so the artifact keeps
           # working on distributions that have not caught up.
           - target: x86_64-unknown-linux-gnu
