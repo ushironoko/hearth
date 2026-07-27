@@ -199,10 +199,16 @@ jobs:
         with:
           persist-credentials: false
 
+      # Deliberately no `registry-url`: it makes setup-node write
+      # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into a scratch
+      # .npmrc. Trusted publishing has no token to fill that in, but npm still
+      # reads the line as "this registry is already authenticated", skips the
+      # OIDC exchange, and publishes anonymously — which the registry answers
+      # with 404 on the PUT, not 401. The registry to publish to comes from
+      # each package's own `publishConfig` instead.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
       # Node's bundled npm rather than a fresh `npm install -g`: the binary then
@@ -219,6 +225,28 @@ jobs:
             exit 1
           fi
           echo "npm $actual (>= $MIN_NPM_VERSION)"
+
+      # The two preconditions npm needs to actually take the OIDC path. Neither
+      # produces a useful error on its own: a configured token makes npm skip
+      # the exchange and publish anonymously, and a missing OIDC endpoint makes
+      # it do the same — both surfacing as a 404 partway through the publish
+      # loop, after earlier packages are already public. Check them first.
+      - name: Check the publish path is tokenless
+        run: |
+          set -euo pipefail
+          token="$(npm config get //registry.npmjs.org/:_authToken)"
+          case "$token" in
+            "" | undefined | null) ;;
+            *)
+              echo "a registry auth token is configured, so npm will skip the OIDC exchange" >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "no OIDC token endpoint in the environment — is 'id-token: write' still set?" >&2
+            exit 1
+          fi
+          echo "no registry token configured, OIDC token endpoint present"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

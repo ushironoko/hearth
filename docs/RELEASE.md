@@ -106,8 +106,16 @@ Requirements, all already in the workflow:
   `npm install -g npm@…` would be — and asserts the version rather than
   assuming it.
 - Node 22.14 or later.
-- No `NODE_AUTH_TOKEN`. `registry-url` is still set, because that is what points
-  npm at the public registry.
+- No token configured for the registry — not even an empty one. `setup-node`'s
+  `registry-url` is deliberately **not** set on the publish job, because it
+  writes `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into a scratch
+  `.npmrc`. With no token to substitute, npm still reads that line as "already
+  authenticated", skips the OIDC exchange entirely, and publishes as an
+  anonymous user. The registry rejects that with **404 on the PUT** rather than
+  401, so the symptom reads like a missing package rather than a failed login.
+  Each package's `publishConfig.registry` points npm at the public registry
+  instead. A step asserts both preconditions — no configured token, and an OIDC
+  endpoint in the environment — before the first publish.
 
 **Provenance is automatic.** npm generates and publishes attestations for every
 trusted-publishing release, so `--provenance` is neither passed nor needed.
