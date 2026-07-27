@@ -135,7 +135,9 @@ pnpm run build                      # produces the local platform's addon
 pnpm exec napi pre-publish -t npm --skip-optional-publish
 
 npm login                           # with 2FA
-for dir in npm/*/; do npm publish "$dir" --access public; done
+# `./` is required: npm reads a bare `a/b` as the GitHub shorthand `owner/repo`
+# and tries to clone it, so `npm publish npm/darwin-arm64` fails with a git error.
+for dir in npm/*/; do npm publish "./$dir" --access public; done
 npm publish --access public
 ```
 

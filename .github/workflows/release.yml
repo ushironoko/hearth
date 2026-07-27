@@ -237,7 +237,12 @@ jobs:
           set -euo pipefail
           names=()
           for dir in npm/*/; do
-            npm publish "$dir" --access public
+            # `./` is load-bearing: npm reads a bare `a/b` as the GitHub
+            # shorthand `owner/repo` and tries to clone it. The glob's trailing
+            # slash happens to avoid that today, but this path runs once, during
+            # a publish, after other packages are already public — not a place
+            # to depend on a side effect of how the loop is written.
+            npm publish "./$dir" --access public
             names+=("$(node -p "require('./${dir}package.json').name")")
           done
           echo "names=${names[*]}" >> "$GITHUB_OUTPUT"
