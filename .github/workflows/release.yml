@@ -12,6 +12,10 @@ on:
         description: "Build and verify, but do not publish"
         type: boolean
         default: true
+      diagnose_oidc:
+        description: "Only probe the npm OIDC token exchange, skipping the build"
+        type: boolean
+        default: false
 
 concurrency:
   group: release-${{ github.ref }}
@@ -26,8 +30,68 @@ env:
   MIN_NPM_VERSION: 11.5.1
 
 jobs:
+  # Asks the registry, per package, whether it will exchange this workflow's
+  # OIDC token for a publish token — and prints the reason when it will not.
+  #
+  # `npm publish` cannot answer that question: `oidc()` logs the registry's
+  # refusal at verbose level, returns undefined, and lets publishing fall
+  # through to a plain ENEEDAUTH, which says nothing about why. This probe runs
+  # the same exchange with logging turned up, and publishes nothing.
+  #
+  # It has to live in this file: npm matches the token's claims against a
+  # configured workflow *filename*, so a probe in any other workflow would fail
+  # for a reason the real publish never hits.
+  diagnose-oidc:
+    name: probe the OIDC token exchange
+    if: ${{ inputs.diagnose_oidc }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Same environment as the publish job, so the `environment` claim the
+    # registry sees is the one a real publish would present.
+    environment: npm-publish
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Probe each package
+        run: |
+          set -uo pipefail
+          status=0
+          for pkg in @hearthdev/napi @hearthdev/napi-darwin-arm64 @hearthdev/napi-darwin-x64 \
+                     @hearthdev/napi-linux-x64-gnu @hearthdev/napi-linux-arm64-gnu; do
+            dir="$(mktemp -d)"
+            # The exchange is keyed on the package name alone, so a stub
+            # manifest is enough — no build artifacts, no real version.
+            PKG="$pkg" DIR="$dir" node -e '
+              require("fs").writeFileSync(process.env.DIR + "/package.json", JSON.stringify({
+                name: process.env.PKG,
+                version: "0.0.0-probe",
+                publishConfig: { registry: "https://registry.npmjs.org/", access: "public" },
+              }))
+            '
+            echo "::group::$pkg"
+            # --dry-run uploads nothing but still runs the exchange, which
+            # happens before the credentials check. --tag keeps the stub
+            # version from tripping the prerelease and version-ordering rules,
+            # which would abort ahead of it. Neither the id token nor an
+            # exchanged token is ever printed at this log level.
+            out="$(cd "$dir" && npm publish --dry-run --access public --tag probe --loglevel verbose 2>&1)"
+            echo "$out" | grep -E "oidc|need auth|Publishing to" || echo "$out" | tail -20
+            echo "$out" | grep -q "Successfully retrieved and set token" || status=1
+            echo "::endgroup::"
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "at least one package would not authenticate — see the groups above" >&2
+          fi
+          exit "$status"
+
   build:
     name: build ${{ matrix.target }}
+    if: ${{ !inputs.diagnose_oidc }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
