@@ -234,14 +234,15 @@ jobs:
       - name: Check the publish path is tokenless
         run: |
           set -euo pipefail
-          token="$(npm config get //registry.npmjs.org/:_authToken)"
-          case "$token" in
-            "" | undefined | null) ;;
-            *)
-              echo "a registry auth token is configured, so npm will skip the OIDC exchange" >&2
-              exit 1
-              ;;
-          esac
+          # Ask whether the key is configured, not what it holds: `npm config
+          # get` refuses to return auth values at all. `npm config list` prints
+          # a configured token as `(protected)`, and omits the line entirely
+          # when none is set.
+          if npm config list 2>/dev/null | grep -q ':_authToken'; then
+            echo "a registry auth token is configured, so npm will skip the OIDC exchange:" >&2
+            npm config list 2>/dev/null | grep ':_authToken' >&2
+            exit 1
+          fi
           if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
             echo "no OIDC token endpoint in the environment — is 'id-token: write' still set?" >&2
             exit 1
