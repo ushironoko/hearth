@@ -253,5 +253,6 @@ let hits = grep(&engine, &GrepParams {
 - `crates/hearth-napi/index.js` and `index.d.ts` are generated but **committed**:
   they are the package's public API surface, so a change to them belongs in a
   diff. CI fails if they drift from the Rust source.
-- Publishing `@hearthdev/napi` is tag-driven; see [`docs/RELEASE.md`](docs/RELEASE.md).
+- Publishing `@hearthdev/napi` is tag-driven; the procedure and the reasoning
+  behind it live in [`.claude/skills/release-napi/`](.claude/skills/release-napi/SKILL.md).
 - Rust edition 2024, functional-leaning style, no hidden global state.

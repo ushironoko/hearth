@@ -1,19 +1,23 @@
-# Releasing `@hearthdev/napi`
+# Why the release pipeline is shaped this way
+
+Background for `release-napi`. Read this when changing the pipeline, adding a
+target, or deciding whether a failure is a bug or a designed refusal. For the
+procedure itself, see `../SKILL.md`.
 
 The npm package ships **prebuilt** native addons: a consumer installs it and
-gets a working binary without a Rust toolchain. That means a release is a
-fan-out build across every declared target, an assembly step, and a publish —
-all driven by one tag.
+gets a working binary without a Rust toolchain. So a release is a fan-out build
+across every declared target, an assembly step, and a publish — all driven by
+one tag.
 
 ## Layout
 
-`@hearthdev/napi` is the package a consumer depends on. It contains the generated
-loader (`index.js`), the type declarations (`index.d.ts`), and nothing native.
-The binaries live in one package per platform, listed as optional dependencies
-so npm installs only the one that matches:
+`@hearthdev/napi` is the package a consumer depends on. It contains the
+generated loader (`index.js`), the type declarations (`index.d.ts`), and nothing
+native. The binaries live in one package per platform, listed as optional
+dependencies so npm installs only the one that matches:
 
-| Rust target                 | npm package                    |
-| --------------------------- | ------------------------------ |
+| Rust target                 | npm package                       |
+| --------------------------- | --------------------------------- |
 | `aarch64-apple-darwin`      | `@hearthdev/napi-darwin-arm64`    |
 | `x86_64-apple-darwin`       | `@hearthdev/napi-darwin-x64`      |
 | `x86_64-unknown-linux-gnu`  | `@hearthdev/napi-linux-x64-gnu`   |
@@ -54,40 +58,27 @@ longer the single source of truth).
 The Rust crates carry their own `version` in the workspace `Cargo.toml` and are
 released independently; they are not published to crates.io today.
 
-## Cutting a release
+## The jobs
 
-1. Make sure `main` is green, and that the bindings are current:
+**build** — every target on a native runner, smoke-testing each fresh binary.
 
-   ```bash
-   pnpm --filter @hearthdev/napi run build
-   git diff --exit-code -- crates/hearth-napi/index.js crates/hearth-napi/index.d.ts
-   ```
+**verify** — downloads the artifacts, lays them out into `npm/*`
+(`napi artifacts`), applies the tag's version everywhere, writes the root
+package's `optionalDependencies` (`napi pre-publish`), asserts every declared
+target has a binary (`scripts/verify-release-artifacts.sh`), then packs the
+tarball, installs it into a scratch directory, and runs the smoke and contract
+suites against the *installed* copy on Node and Bun. It uploads the verified
+tree.
 
-2. Tag and push:
+**publish** — gated on the `npm-publish` environment, and the only job with
+`id-token: write`. It publishes the tree the previous job verified, rather than
+rebuilding, so what ships is what was tested. Platform packages go first, then
+it waits for them to be resolvable before publishing the root. A fourth job
+creates the GitHub release with generated notes.
 
-   ```bash
-   git tag napi-v0.2.0
-   git push origin napi-v0.2.0
-   ```
-
-3. The `Release @hearthdev/napi` workflow then runs three jobs:
-
-   **build** — every target on a native runner, smoke-testing each fresh binary.
-
-   **verify** — downloads the artifacts, lays them out into `npm/*`
-   (`napi artifacts`), applies the tag's version everywhere, writes the root
-   package's `optionalDependencies` (`napi pre-publish`), asserts every declared
-   target has a binary (`scripts/verify-release-artifacts.sh`), then packs the
-   tarball, installs it into a scratch directory, and runs the smoke and
-   contract suites against the *installed* copy on Node and Bun. It uploads the
-   verified tree.
-
-   **publish** — gated on the `npm-publish` environment, and the only job with
-   `id-token: write`. It publishes the tree the previous job verified, rather
-   than rebuilding, so what ships is what was tested. Platform packages go
-   first, then it **waits for them to be resolvable** before publishing the
-   root — see below. Finally a fourth job creates the GitHub release with
-   generated notes.
+**diagnose-oidc** — a `workflow_dispatch`-only probe that skips the build and
+reports, per package, whether the registry will exchange this workflow's OIDC
+token. It exists because `npm publish` cannot say why authentication failed.
 
 ## Authentication: no tokens
 
@@ -119,23 +110,20 @@ Requirements, all already in the workflow:
 
 **Provenance is automatic.** npm generates and publishes attestations for every
 trusted-publishing release, so `--provenance` is neither passed nor needed.
-Consumers verify with:
+Consumers verify with `npm audit signatures`.
 
-```bash
-npm audit signatures
-```
-
-The publish job also runs in a GitHub **environment** (`npm-publish`). That is
-worth configuring with required reviewers in *Settings → Environments*: it means
-a human approves before the OIDC token is minted, and it narrows the identity
-npm will accept.
+The publish job runs in a GitHub **environment** (`npm-publish`) with required
+reviewers, and its deployment policy permits only `napi-v*` tags. A human
+approves before the OIDC token is minted, and the environment narrows the
+identity npm will accept. That policy is also why the diagnostic probe cannot be
+dispatched from `main`.
 
 ### One-time setup per package
 
 npm requires a package to **already exist** before a trusted publisher can be
 configured for it — unlike PyPI, there is no "pending publisher" for a name that
-has never been published. So each of the five packages needs one bootstrap
-publish, done once, by a human:
+has never been published. So each package needs one bootstrap publish, done
+once, by a human:
 
 ```bash
 cd crates/hearth-napi
@@ -149,7 +137,14 @@ for dir in npm/*/; do npm publish "./$dir" --access public; done
 npm publish --access public
 ```
 
-Then bind each package to this repository and workflow — either through
+With 2FA set to `auth-and-writes`, each publish prompts for its own OTP; the
+codes rotate every 30 seconds, so they cannot be reused across the five.
+
+npm forces `latest` onto a package's **first** version regardless of `--tag`, so
+the placeholder is briefly what `npm install` resolves to. The next real release
+moves `latest`.
+
+Then bind each package to this repository and workflow — through
 *npmjs.com → package → Settings → Trusted publisher*, or from the CLI with
 npm 11.15.0+:
 
@@ -163,11 +158,18 @@ for pkg in @hearthdev/napi @hearthdev/napi-darwin-arm64 @hearthdev/napi-darwin-x
 done
 ```
 
-Check it took with `npm trust list <pkg>`. After that every release is
-tokenless; the bootstrap is never repeated, including for new versions.
+Leave *Environment name* set to `npm-publish`. Blank means "any environment in
+that workflow", which discards the approval gate as a constraint on who can
+publish.
 
-Adding a *new platform package* later repeats only the bootstrap for that one
-package.
+**npm does not validate the configuration when it is saved.** A package can look
+configured in the UI and still refuse the exchange, and a five-package setup can
+silently end up applied to only some of them — this is what broke the first
+0.1.0 release. Verify with `npm trust list <pkg>`, or with the diagnostic probe.
+
+After that every release is tokenless; the bootstrap is never repeated,
+including for new versions. Adding a *new platform package* later repeats only
+the bootstrap for that one package.
 
 > Trusted publisher configurations created after 20 May 2026 must explicitly
 > select which actions they allow. `npm publish` is the only one this pipeline
@@ -176,8 +178,10 @@ package.
 ## Why the publish order matters
 
 The root package's `optionalDependencies` name the platform packages, so they
-must exist first. But "published" and "resolvable" are not the same moment: npm's
-publish endpoint returns before the new version is visible on every replica.
+must exist first. But "published" and "resolvable" are not the same moment:
+npm's publish endpoint returns before the new version is visible on every
+replica. A brand-new package name took about three and a half minutes to become
+readable during the 0.0.1 bootstrap.
 
 Publishing the root package into that window produces a release that installs
 *sometimes*. Worse, npm skips an optional dependency it cannot resolve **without
@@ -187,8 +191,8 @@ against a replica that had not caught up.
 
 `scripts/await-npm-availability.sh` closes that window: after publishing the
 platform packages it polls `npm view <pkg>@<version>` until each one answers,
-and only then is the root package published. It gives up after five minutes
-rather than hanging a release forever.
+and only then is the root package published. It gives up after five minutes per
+package rather than hanging a release forever.
 
 `scripts/verify-release-artifacts.sh` guards the related failure one step
 earlier. It is not enough for the addon to be on disk in `npm/<platform>/`: a
@@ -219,27 +223,6 @@ would add an always-on external service into every job, and the higher-value
 controls here — SHA pinning, OIDC, least privilege, and the approval gate — do
 not depend on it. That is a judgement call, not an oversight; revisit it if this
 repository starts handling anything more sensitive than a public build.
-
-## Dry runs
-
-`workflow_dispatch` with `dry_run: true` (the default) builds every target,
-assembles the packages, and runs all verification, but publishes nothing. It
-writes the `npm pack` contents listing to the run summary, which is the fastest
-way to check what a release *would* ship.
-
-To do the same locally for the current platform only:
-
-```bash
-pnpm --filter @hearthdev/napi run build
-bash scripts/verify-tarball.sh
-```
-
-That prints a `HEARTH_ENTRY=` line; point the suites at it:
-
-```bash
-HEARTH_ENTRY=… node crates/hearth-napi/__test__/contract.mjs
-HEARTH_ENTRY=… bun  crates/hearth-napi/__test__/contract.mjs
-```
 
 ## Runtime support
 

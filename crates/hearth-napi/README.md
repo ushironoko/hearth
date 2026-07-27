@@ -96,6 +96,6 @@ directory.
 
 - [Architecture](https://github.com/ushironoko/hearth/blob/main/docs/ARCHITECTURE.md)
 - [Benchmarks](https://github.com/ushironoko/hearth/blob/main/docs/BENCHMARKS.md)
-- [Release process](https://github.com/ushironoko/hearth/blob/main/docs/RELEASE.md)
+- [Release process](https://github.com/ushironoko/hearth/blob/main/.claude/skills/release-napi/SKILL.md)
 
 MIT licensed.
