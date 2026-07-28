@@ -13,3 +13,7 @@ serde_bytes = { workspace = true }
 compact_str = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }

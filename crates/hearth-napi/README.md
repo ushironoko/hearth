@@ -64,12 +64,18 @@ it already rendered.
 
 ## Errors
 
-Every rejection's `message` starts with `"<kind>: "`, one of:
+Every failure — a synchronous throw or a promise rejection — is a JS `Error`
+carrying the structured fields to branch on:
 
-`notFound`, `permission`, `noMatch`, `multipleMatches`, `overlap`, `noChange`,
-`invalidInput`, `timeout`, `cancelled`, `indeterminate`, `io`, `internal`.
+- `code`: the stable kind tag, one of `notFound`, `permission`, `noMatch`,
+  `multipleMatches`, `overlap`, `noChange`, `invalidInput`, `timeout`,
+  `cancelled`, `indeterminate`, `io`, `internal`
+- `editIndex`: the 0-based index of the failing replacement, when one
+  `editBatch` edit is at fault
+- `path`: the file involved, when one is
 
-Synchronous methods additionally set the kind as `Error.code`.
+The `message` still leads with `"<kind>: "`, but that is presentation — the
+properties are the contract. Never parse the message.
 
 `indeterminate` is the one that needs care: it means a mutating command reached
 a warm shell and the shell then died before reporting a result. Hearth

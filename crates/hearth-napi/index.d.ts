@@ -179,6 +179,13 @@ export interface EditBatchParams {
   skipDiff?: boolean
   /** Also return the full post-edit content. */
   returnContent?: boolean
+  /**
+   * Also return the exact pre-edit text (BOM and line endings intact),
+   * captured while the mutation lock is held.
+   */
+  returnOriginalContent?: boolean
+  /** How a whitespace-only `oldText` is treated. Defaults to `reject`. */
+  whitespaceOnlyTargetPolicy?: WhitespaceOnlyTargetPolicy
   /** Defaults to `atomic`. */
   mode?: WriteMode
   /** Edit a symlink's target instead of replacing the link. Defaults to true. */
@@ -208,6 +215,13 @@ export interface EditBatchResult {
   hunks: Array<DiffHunk>
   /** Present only when `returnContent` was set. */
   content?: string
+  /**
+   * Present only when `returnOriginalContent` was set: the exact pre-edit
+   * text, BOM and line endings intact, captured under the same mutation
+   * lock as the write. Only writers going through this engine are
+   * serialized by that lock.
+   */
+  originalContent?: string
 }
 
 export interface EditParams {
@@ -389,6 +403,21 @@ export declare const enum ShellTransport {
   Arg = 'arg',
   /** Written to the shell's stdin, e.g. `bash -s`. */
   Stdin = 'stdin'
+}
+
+/**
+ * How `editBatch` treats a whitespace-only `oldText` — one whose
+ * fuzzy-normalized form is empty while the text itself is not.
+ */
+export declare const enum WhitespaceOnlyTargetPolicy {
+  /** Reject the edit as invalid input (the default). */
+  Reject = 'reject',
+  /**
+   * Allow it only when the LF-normalized `oldText` equals the entire
+   * BOM-stripped, LF-normalized file content; matching is exact, never
+   * normalized. Empty `oldText` stays invalid regardless.
+   */
+  ExactFile = 'exactFile'
 }
 
 /** How `write` puts bytes on disk. */

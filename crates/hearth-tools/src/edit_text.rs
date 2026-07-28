@@ -23,6 +23,7 @@
 
 use hearth_proto::{
     DiffHunk, DiffOp, DiffRow, EditReplacement, ErrorKind, ToolError, ToolResult,
+    WhitespaceOnlyTargetPolicy,
 };
 use similar::{ChangeTag, TextDiff};
 use std::borrow::Cow;
@@ -312,6 +313,22 @@ pub struct AppliedEdits {
 /// LF-normalized), atomically: any failure leaves `content` untouched because
 /// nothing is written until all edits resolve.
 pub fn apply_edits(content: &str, edits: &[EditReplacement]) -> ToolResult<AppliedEdits> {
+    apply_edits_opts(content, edits, WhitespaceOnlyTargetPolicy::default())
+}
+
+/// As [`apply_edits`], with an explicit whitespace-only target policy.
+///
+/// Under [`WhitespaceOnlyTargetPolicy::ExactFile`], a target whose normalized
+/// form is empty is resolved by one rule only — its LF-normalized text must
+/// equal the entire `content` — because such a target has no coordinates in
+/// normalized matching space: occurrence counting cannot see it, and a batch
+/// that switches to the fallback would resolve it as a zero-width match at
+/// offset 0. Whole-file equality is the one case with nothing left to guess.
+pub fn apply_edits_opts(
+    content: &str,
+    edits: &[EditReplacement],
+    whitespace_policy: WhitespaceOnlyTargetPolicy,
+) -> ToolResult<AppliedEdits> {
     if edits.is_empty() {
         return Err(ToolError::invalid("edits must contain at least one replacement"));
     }
@@ -325,19 +342,34 @@ pub fn apply_edits(content: &str, edits: &[EditReplacement]) -> ToolResult<Appli
     // coordinate system: with no fallback it is `normalize(content)`, and with
     // one it *is* the matching base, whose re-normalization is itself.
     let mut normalized_olds = Vec::with_capacity(normalized.len());
+    let mut has_whitespace_only = false;
     for (i, (old, _)) in normalized.iter().enumerate() {
         if old.is_empty() {
             return Err(ToolError::invalid("oldText must not be empty").with_edit_index(i));
         }
         let normalized_old = normalize_for_fuzzy_match(old);
         // A target that normalizes away entirely (e.g. only trailing spaces)
-        // can never be uniquely located, so reject it up front rather than
-        // matching at an arbitrary offset.
+        // has no place in normalized matching space; without the opt-in it is
+        // rejected up front rather than matched at an arbitrary offset.
         if normalized_old.is_empty() {
-            return Err(ToolError::invalid(
-                "oldText contains only whitespace that normalization removes",
-            )
-            .with_edit_index(i));
+            match whitespace_policy {
+                WhitespaceOnlyTargetPolicy::Reject => {
+                    return Err(ToolError::invalid(
+                        "oldText contains only whitespace that normalization removes",
+                    )
+                    .with_edit_index(i));
+                }
+                WhitespaceOnlyTargetPolicy::ExactFile => {
+                    if old.as_ref() != content {
+                        return Err(ToolError::new(
+                            ErrorKind::NoMatch,
+                            "a whitespace-only oldText must match the entire file exactly",
+                        )
+                        .with_edit_index(i));
+                    }
+                    has_whitespace_only = true;
+                }
+            }
         }
         normalized_olds.push(normalized_old);
     }
@@ -351,6 +383,20 @@ pub fn apply_edits(content: &str, edits: &[EditReplacement]) -> ToolResult<Appli
             Some(m) if m.used_fallback
         )
     });
+
+    // A whitespace-only span vanishes in normalized space, where an empty
+    // pattern would "match" at offset 0 and turn the replacement into an
+    // insertion. Defensive: with whole-file equality required this cannot
+    // currently fire (an all-whitespace file normalizes to an empty matching
+    // base, so no companion edit can resolve, let alone through the fallback),
+    // but the invariant must hold even if normalization rules evolve.
+    if used_fallback && has_whitespace_only {
+        let index = normalized_olds.iter().position(String::is_empty).unwrap_or(0);
+        return Err(ToolError::invalid(
+            "a whitespace-only oldText cannot be combined with edits that need the normalized fallback",
+        )
+        .with_edit_index(index));
+    }
     let base_for_matching: &str = if used_fallback { &normalized_content } else { content };
 
     let mut resolved: Vec<Resolved> = Vec::with_capacity(normalized.len());
@@ -546,6 +592,57 @@ mod tests {
             apply_edits("a   \n", &[edit("   ", "x")]).unwrap_err().kind,
             ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn exact_file_policy_allows_a_whole_file_whitespace_target() {
+        // The issue's motivating case: a file containing exactly three spaces.
+        let out = apply_edits_opts("   ", &[edit("   ", "x")], WhitespaceOnlyTargetPolicy::ExactFile)
+            .unwrap();
+        assert_eq!(out.new_content, "x");
+        assert!(!out.used_fallback);
+
+        // Any is_js_whitespace mix works, as long as it equals the whole file.
+        let out =
+            apply_edits_opts("\t \u{00A0}", &[edit("\t \u{00A0}", "y")], WhitespaceOnlyTargetPolicy::ExactFile)
+                .unwrap();
+        assert_eq!(out.new_content, "y");
+    }
+
+    #[test]
+    fn exact_file_policy_keeps_empty_invalid_and_partial_whitespace_no_match() {
+        // Empty oldText stays invalid regardless of policy.
+        let err = apply_edits_opts("a\n", &[edit("", "x")], WhitespaceOnlyTargetPolicy::ExactFile)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidInput);
+
+        // A whitespace target that is not the whole file is NoMatch — never a
+        // positional guess inside the file.
+        let err = apply_edits_opts("a   b\n", &[edit("   ", "x")], WhitespaceOnlyTargetPolicy::ExactFile)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NoMatch);
+        assert_eq!(err.edit_index, Some(0));
+
+        // Identical replacement of the whole file is still NoChange.
+        let err = apply_edits_opts("   ", &[edit("   ", "   ")], WhitespaceOnlyTargetPolicy::ExactFile)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NoChange);
+    }
+
+    #[test]
+    fn exact_file_whitespace_edit_cannot_share_a_batch() {
+        // The whole-file span overlaps everything, so the existing
+        // disjointness rule keeps multi-edit batches out without a bespoke
+        // check. (A fuzzy-fallback companion is impossible outright: a
+        // whitespace-only file normalizes to an empty matching base, so no
+        // other target can resolve at all.)
+        let err = apply_edits_opts(
+            "   ",
+            &[edit("   ", "x"), edit("   ", "y")],
+            WhitespaceOnlyTargetPolicy::ExactFile,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Overlap);
     }
 
     #[test]

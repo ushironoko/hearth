@@ -138,6 +138,25 @@ produce both a line-numbered display diff and a unified patch without a second
 read that could observe a *different* file. `returnContent` adds the full
 post-edit text for a caller that wants it.
 
+Two opt-ins serve adapters that render with their frontend's own diff
+generators instead of the hunks:
+
+* `returnOriginalContent` adds the exact pre-edit text — BOM and line endings
+  intact, unlike the normalized `content` — snapshotted while the same
+  mutation lock as the write is held, so the snapshot and the commit are one
+  transaction. That guarantee spans writers going through the same engine; the
+  lock is in-process, so external writers are not serialized by it. The
+  persisted bytes need no third field: they are always
+  `(hadBom ? BOM : "") + (crlf ? content with CRLF restored : content)`.
+* `whitespaceOnlyTargetPolicy: "exactFile"` permits an `oldText` whose fuzzy
+  normalization is empty — spaces and tabs with no newline — in exactly one
+  situation: its LF-normalized text equals the entire file. Such a target has
+  no coordinates in normalized matching space (occurrence counting cannot see
+  it, and the fallback would resolve it as a zero-width match at offset 0), so
+  whole-file equality is the one case with nothing left to guess. Empty
+  `oldText` stays invalid under every policy, and the default (`"reject"`)
+  keeps Hearth 0.1.0 behavior.
+
 ## Write semantics
 
 Hearth's default write is **not** `fs.writeFile`, and the difference is visible:

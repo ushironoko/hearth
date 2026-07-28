@@ -79,8 +79,9 @@ test("a missing file reports the notFound kind", () => {
   const dir = tempDir();
   const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
   const error = throws(() => engine.read({ path: join(dir, "nope.txt") }));
-  assert.equal(errorKind(error), "notFound");
-  assert.equal(error.code, "notFound", "sync errors also carry the kind as Error.code");
+  assert.equal(error.code, "notFound");
+  assert.equal(error.path, join(dir, "nope.txt"), "the failing path is a property");
+  assert.match(error.message, /^notFound: /, "the message still leads with the kind");
 });
 
 // ---------------------------------------------------------------------------
@@ -284,6 +285,7 @@ test("rejects duplicate and overlapping targets without touching the file", () =
 
   const duplicate = throws(() => engine.editBatch({ path, edits: [{ oldText: "x", newText: "y" }] }));
   assert.equal(errorKind(duplicate), "multipleMatches");
+  assert.equal(duplicate.editIndex, 0, "the ambiguous edit is identified by index");
 
   const overlap = throws(() =>
     engine.editBatch({
@@ -295,7 +297,116 @@ test("rejects duplicate and overlapping targets without touching the file", () =
     }),
   );
   assert.equal(errorKind(overlap), "overlap");
+  assert.equal(overlap.editIndex, 1, "the later of the overlapping pair is reported");
   assert.equal(readFileSync(path, "utf8"), "x\nx\n");
+});
+
+test("sync and async failures carry identical structured fields", async () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  const path = seed(dir, "structured.txt", "alpha\nbeta\n");
+  const params = {
+    path,
+    edits: [
+      { oldText: "alpha", newText: "ALPHA" },
+      { oldText: "missing", newText: "x" },
+    ],
+  };
+
+  const syncError = throws(() => engine.editBatch(params));
+  const asyncError = await rejects(() => engine.editBatchAsync(params));
+  for (const error of [syncError, asyncError]) {
+    assert.ok(error instanceof Error);
+    assert.equal(error.code, "noMatch");
+    assert.equal(error.editIndex, 1, "the failing edit is identified by index");
+    assert.equal(error.path, path);
+    assert.match(error.message, /^noMatch: /);
+  }
+  assert.equal(readFileSync(path, "utf8"), "alpha\nbeta\n", "all-or-nothing: file untouched");
+});
+
+test("returnOriginalContent hands back the raw pre-edit text, sync and async alike", async () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  // BOM + CRLF: exactly the representations the normalized `content` field
+  // strips, and what `originalContent` must preserve.
+  const raw = "﻿one\r\ntwo\r\n";
+  const params = (path) => ({
+    path,
+    edits: [{ oldText: "two", newText: "TWO" }],
+    returnContent: true,
+    returnOriginalContent: true,
+  });
+
+  const syncPath = seed(dir, "raw-sync.txt", raw);
+  const syncResult = engine.editBatch(params(syncPath));
+  const asyncPath = seed(dir, "raw-async.txt", raw);
+  const asyncResult = await engine.editBatchAsync(params(asyncPath));
+  for (const result of [syncResult, asyncResult]) {
+    assert.equal(result.originalContent, raw);
+    assert.equal(result.content, "one\nTWO\n", "content stays normalized");
+    assert.equal(result.hadBom, true);
+    assert.equal(result.crlf, true);
+  }
+  // The reconstruction identity the adapter relies on: persisted bytes are
+  // derivable from content + hadBom + crlf.
+  const persisted =
+    (syncResult.hadBom ? "﻿" : "") +
+    (syncResult.crlf ? syncResult.content.replaceAll("\n", "\r\n") : syncResult.content);
+  assert.equal(readFileSync(syncPath, "utf8"), persisted);
+
+  // Off by default.
+  const quiet = seed(dir, "raw-quiet.txt", "a\n");
+  const result = engine.editBatch({ path: quiet, edits: [{ oldText: "a", newText: "A" }] });
+  assert.equal(result.originalContent, undefined);
+});
+
+test("whitespaceOnlyTargetPolicy exactFile allows exactly the whole-file case", async () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+
+  // Default keeps the rejection, with structured fields.
+  const rejected = seed(dir, "ws-default.txt", "   ");
+  const error = throws(() =>
+    engine.editBatch({ path: rejected, edits: [{ oldText: "   ", newText: "x" }] }),
+  );
+  assert.equal(error.code, "invalidInput");
+  assert.equal(error.editIndex, 0);
+  assert.equal(readFileSync(rejected, "utf8"), "   ");
+
+  // Opted in: the issue's motivating case — a file of exactly three spaces.
+  const allowed = seed(dir, "ws-exact.txt", "   ");
+  const result = await engine.editBatchAsync({
+    path: allowed,
+    edits: [{ oldText: "   ", newText: "x" }],
+    whitespaceOnlyTargetPolicy: "exactFile",
+    returnOriginalContent: true,
+  });
+  assert.equal(result.originalContent, "   ");
+  assert.equal(readFileSync(allowed, "utf8"), "x");
+
+  // A partial whitespace target stays unmatched — never a positional guess.
+  const partial = seed(dir, "ws-partial.txt", "a   b\n");
+  const noMatch = await rejects(() =>
+    engine.editBatchAsync({
+      path: partial,
+      edits: [{ oldText: "   ", newText: "x" }],
+      whitespaceOnlyTargetPolicy: "exactFile",
+    }),
+  );
+  assert.equal(noMatch.code, "noMatch");
+  assert.equal(noMatch.editIndex, 0);
+
+  // Empty oldText stays invalid even with the policy on.
+  const empty = seed(dir, "ws-empty.txt", "a\n");
+  const invalid = throws(() =>
+    engine.editBatch({
+      path: empty,
+      edits: [{ oldText: "", newText: "x" }],
+      whitespaceOnlyTargetPolicy: "exactFile",
+    }),
+  );
+  assert.equal(invalid.code, "invalidInput");
 });
 
 test("preserves BOM and CRLF", () => {

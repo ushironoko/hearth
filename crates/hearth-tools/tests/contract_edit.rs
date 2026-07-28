@@ -296,6 +296,77 @@ fn empty_edit_list_is_rejected() {
 }
 
 #[test]
+fn original_content_is_the_raw_pre_edit_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    // BOM + CRLF: the two representations `content` deliberately normalizes
+    // away, and exactly what `originalContent` must preserve.
+    let path = seed(dir.path(), "raw.txt", "\u{FEFF}one\r\ntwo\r\n");
+
+    let r = edit_batch(
+        &eng,
+        &EditBatchParams {
+            return_content: true,
+            return_original_content: true,
+            ..EditBatchParams::new(path.clone(), one("two", "TWO"))
+        },
+    )
+    .unwrap();
+
+    assert_eq!(r.original_content.as_deref(), Some("\u{FEFF}one\r\ntwo\r\n"));
+    assert_eq!(r.content.as_deref(), Some("one\nTWO\n"), "content stays normalized");
+    assert_eq!(on_disk(&path), "\u{FEFF}one\r\nTWO\r\n");
+
+    // Lone CR is collapsed on persistence, but the snapshot keeps it.
+    let cr = seed(dir.path(), "cr.txt", "a\rb\r");
+    let r = edit_batch(
+        &eng,
+        &EditBatchParams {
+            return_original_content: true,
+            ..EditBatchParams::new(cr.clone(), one("b", "B"))
+        },
+    )
+    .unwrap();
+    assert_eq!(r.original_content.as_deref(), Some("a\rb\r"));
+    assert_eq!(on_disk(&cr), "a\nB\n");
+}
+
+#[test]
+fn original_content_is_absent_unless_requested() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let path = seed(dir.path(), "quiet-raw.txt", "a\n");
+    let r = edit_batch(&eng, &EditBatchParams::new(path, one("a", "A"))).unwrap();
+    assert!(r.original_content.is_none(), "the pre-edit file must not ship unless asked for");
+}
+
+#[test]
+fn whitespace_only_policy_flows_through_the_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+
+    // Default keeps the Hearth 0.1.0 rejection.
+    let path = seed(dir.path(), "ws.txt", "   ");
+    let err = edit_batch(&eng, &EditBatchParams::new(path.clone(), one("   ", "x"))).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::InvalidInput);
+    assert_eq!(on_disk(&path), "   ", "a rejected edit must leave the file untouched");
+
+    // Opting in permits exactly the whole-file case, atomically with the
+    // original snapshot.
+    let r = edit_batch(
+        &eng,
+        &EditBatchParams {
+            whitespace_only_target_policy: WhitespaceOnlyTargetPolicy::ExactFile,
+            return_original_content: true,
+            ..EditBatchParams::new(path.clone(), one("   ", "x"))
+        },
+    )
+    .unwrap();
+    assert_eq!(r.original_content.as_deref(), Some("   "));
+    assert_eq!(on_disk(&path), "x");
+}
+
+#[test]
 fn cache_is_coherent_after_a_batch_edit_under_trust_cache() {
     let dir = tempfile::tempdir().unwrap();
     let eng = trusting_engine(dir.path());

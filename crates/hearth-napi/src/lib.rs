@@ -17,12 +17,14 @@
 //! surfaces as its own error kind, distinct from `timeout` and from ordinary
 //! I/O failure.
 //!
-//! **Errors.** Every rejection's `message` starts with `"<kind>: "` — one of
-//! `notFound`, `permission`, `noMatch`, `multipleMatches`, `overlap`,
-//! `noChange`, `invalidInput`, `timeout`, `cancelled`, `indeterminate`, `io`,
-//! `internal`. Synchronous methods additionally set that kind as the JS
-//! `Error.code`; the async ones cannot, because napi fixes a worker task's
-//! error type, which is why the message prefix is the format to branch on.
+//! **Errors.** Every failed call — synchronous throw or promise rejection —
+//! surfaces a JS `Error` carrying the structured fields callers branch on:
+//! `code` is the stable kind tag (`notFound`, `permission`, `noMatch`,
+//! `multipleMatches`, `overlap`, `noChange`, `invalidInput`, `timeout`,
+//! `cancelled`, `indeterminate`, `io`, `internal`), `editIndex` is the 0-based
+//! index of the failing replacement when one `editBatch` edit is at fault, and
+//! `path` is the file involved when one is. The message still leads with
+//! `"<kind>: "`, but that is presentation — the properties are the contract.
 
 use hearth_core::{CancelToken, Engine, EngineConfig};
 use hearth_proto as proto;
@@ -45,10 +47,45 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static GLOBAL: hearth_core::profiler::ProfilingAllocator<mimalloc::MiMalloc> =
     hearth_core::profiler::ProfilingAllocator::from_allocator(mimalloc::MiMalloc);
 
-/// Turn a tool error into a JS `Error` whose `code` is the stable error kind,
-/// so a caller branches on `err.code === "cancelled"` rather than on prose.
-fn tool_err(e: proto::ToolError) -> Error<String> {
-    Error::new(e.kind.as_str().to_string(), format!("{}: {}", e.kind.as_str(), e.message))
+/// The plain `"<kind>: <message>"` error, for contexts with no JS-thread
+/// access (a worker thread mid-`compute`) and as the fallback when building
+/// the structured object itself fails.
+fn plain_err(e: &proto::ToolError) -> Error {
+    Error::new(Status::GenericFailure, format!("{}: {}", e.kind.as_str(), e.message))
+}
+
+/// Keep the tool error for `reject` — which runs on the JS thread and can
+/// build the structured object — and hand `compute` the placeholder it must
+/// return meanwhile.
+fn stash(slot: &mut Option<proto::ToolError>, e: proto::ToolError) -> Error {
+    let placeholder = plain_err(&e);
+    *slot = Some(e);
+    placeholder
+}
+
+/// Turn a tool error into a JS `Error` carrying the structured fields a caller
+/// branches on — `code` (the stable error kind), `editIndex` (which `edits[]`
+/// entry failed), `path` — so no caller ever parses prose.
+///
+/// The fields are set on a real JS error object; wrapping that object back
+/// into [`Error`] keeps a reference to it, so a synchronous throw and a
+/// promise rejection both surface this exact object, properties intact.
+fn structured_err(env: &Env, e: proto::ToolError) -> Error {
+    build_structured(env, &e).unwrap_or_else(|_| plain_err(&e))
+}
+
+fn build_structured(env: &Env, e: &proto::ToolError) -> Result<Error> {
+    let mut error = env.create_error(plain_err(e))?;
+    // `napi_create_error` filled `code` with the napi status; overwrite it
+    // with the kind tag, which is the value callers actually branch on.
+    error.set_named_property("code", e.kind.as_str())?;
+    if let Some(index) = e.edit_index {
+        error.set_named_property("editIndex", index)?;
+    }
+    if let Some(path) = &e.path {
+        error.set_named_property("path", path.as_str())?;
+    }
+    Ok(Error::from(error.to_unknown()))
 }
 
 /// A JS `AbortSignal` bound to a native [`CancelToken`].
@@ -259,8 +296,10 @@ impl HearthEngine {
     // -- read ------------------------------------------------------------
 
     #[napi]
-    pub fn read(&self, params: ReadParams) -> Result<ReadResult, String> {
-        hearth_tools::read(&self.engine, &params.into()).map(Into::into).map_err(tool_err)
+    pub fn read(&self, env: Env, params: ReadParams) -> Result<ReadResult> {
+        hearth_tools::read(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
     }
 
     #[napi(
@@ -274,7 +313,7 @@ impl HearthEngine {
     ) -> AsyncTask<ReadTask> {
         let (cancel, signal) = split(signal);
         AsyncTask::with_optional_signal(
-            ReadTask { engine: self.engine.clone(), params: params.into(), cancel },
+            ReadTask { engine: self.engine.clone(), params: params.into(), cancel, failure: None },
             signal,
         )
     }
@@ -282,10 +321,10 @@ impl HearthEngine {
     /// Read a file's raw bytes as a Node `Buffer` — binary-safe, and it skips
     /// the UTF-8 string construction `read` does.
     #[napi]
-    pub fn read_bytes(&self, params: ReadParams) -> Result<Buffer, String> {
+    pub fn read_bytes(&self, env: Env, params: ReadParams) -> Result<Buffer> {
         hearth_tools::read_bytes(&self.engine, &params.into())
             .map(Buffer::from)
-            .map_err(tool_err)
+            .map_err(|e| structured_err(&env, e))
     }
 
     #[napi(
@@ -299,7 +338,12 @@ impl HearthEngine {
     ) -> AsyncTask<ReadBytesTask> {
         let (cancel, signal) = split(signal);
         AsyncTask::with_optional_signal(
-            ReadBytesTask { engine: self.engine.clone(), params: params.into(), cancel },
+            ReadBytesTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
             signal,
         )
     }
@@ -307,17 +351,19 @@ impl HearthEngine {
     // -- write -----------------------------------------------------------
 
     #[napi]
-    pub fn write(&self, params: WriteParams) -> Result<WriteResult, String> {
-        hearth_tools::write(&self.engine, &params.into()).map(Into::into).map_err(tool_err)
+    pub fn write(&self, env: Env, params: WriteParams) -> Result<WriteResult> {
+        hearth_tools::write(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
     }
 
     /// Fast write: `path` and `content` are passed directly, so the string is
     /// **moved** into the cache — one fewer full-content copy than `write`.
     #[napi]
-    pub fn write_fast(&self, path: String, content: String) -> Result<WriteResult, String> {
+    pub fn write_fast(&self, env: Env, path: String, content: String) -> Result<WriteResult> {
         hearth_tools::write_owned(&self.engine, &path, content, true)
             .map(Into::into)
-            .map_err(tool_err)
+            .map_err(|e| structured_err(&env, e))
     }
 
     #[napi(
@@ -331,7 +377,7 @@ impl HearthEngine {
     ) -> AsyncTask<WriteTask> {
         let (cancel, signal) = split(signal);
         AsyncTask::with_optional_signal(
-            WriteTask { engine: self.engine.clone(), params: params.into(), cancel },
+            WriteTask { engine: self.engine.clone(), params: params.into(), cancel, failure: None },
             signal,
         )
     }
@@ -339,16 +385,20 @@ impl HearthEngine {
     // -- edit ------------------------------------------------------------
 
     #[napi]
-    pub fn edit(&self, params: EditParams) -> Result<EditResult, String> {
-        hearth_tools::edit(&self.engine, &params.into()).map(Into::into).map_err(tool_err)
+    pub fn edit(&self, env: Env, params: EditParams) -> Result<EditResult> {
+        hearth_tools::edit(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
     }
 
     /// Apply several disjoint replacements to one file in one atomic commit.
     /// Each `oldText` is matched against the original file, not against the
     /// result of an earlier edit in the same call.
     #[napi]
-    pub fn edit_batch(&self, params: EditBatchParams) -> Result<EditBatchResult, String> {
-        hearth_tools::edit_batch(&self.engine, &params.into()).map(Into::into).map_err(tool_err)
+    pub fn edit_batch(&self, env: Env, params: EditBatchParams) -> Result<EditBatchResult> {
+        hearth_tools::edit_batch(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
     }
 
     #[napi(
@@ -362,7 +412,12 @@ impl HearthEngine {
     ) -> AsyncTask<EditBatchTask> {
         let (cancel, signal) = split(signal);
         AsyncTask::with_optional_signal(
-            EditBatchTask { engine: self.engine.clone(), params: params.into(), cancel },
+            EditBatchTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
             signal,
         )
     }
@@ -371,8 +426,10 @@ impl HearthEngine {
 
     /// Synchronous grep. Prefer `grepAsync` for large trees.
     #[napi]
-    pub fn grep(&self, params: GrepParams) -> Result<GrepResult, String> {
-        hearth_tools::grep(&self.engine, &params.into()).map(Into::into).map_err(tool_err)
+    pub fn grep(&self, env: Env, params: GrepParams) -> Result<GrepResult> {
+        hearth_tools::grep(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
     }
 
     #[napi(
@@ -386,7 +443,7 @@ impl HearthEngine {
     ) -> AsyncTask<GrepTask> {
         let (cancel, signal) = split(signal);
         AsyncTask::with_optional_signal(
-            GrepTask { engine: self.engine.clone(), params: params.into(), cancel },
+            GrepTask { engine: self.engine.clone(), params: params.into(), cancel, failure: None },
             signal,
         )
     }
@@ -396,8 +453,10 @@ impl HearthEngine {
     /// Synchronous bash. Blocks the event loop for the command's whole
     /// duration; prefer `bashAsync` or `bashStream`.
     #[napi]
-    pub fn bash(&self, params: BashParams) -> Result<BashResult, String> {
-        hearth_tools::bash(&self.engine, &params.into()).map(Into::into).map_err(tool_err)
+    pub fn bash(&self, env: Env, params: BashParams) -> Result<BashResult> {
+        hearth_tools::bash(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
     }
 
     #[napi(
@@ -411,7 +470,13 @@ impl HearthEngine {
     ) -> AsyncTask<BashTask> {
         let (cancel, signal) = split(signal);
         AsyncTask::with_optional_signal(
-            BashTask { engine: self.engine.clone(), params: params.into(), cancel, on_chunk: None },
+            BashTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                on_chunk: None,
+                failure: None,
+            },
             signal,
         )
     }
@@ -436,6 +501,7 @@ impl HearthEngine {
                 params: params.into(),
                 cancel,
                 on_chunk: Some(ChunkStream::new(on_chunk)),
+                failure: None,
             },
             signal,
         )
@@ -496,6 +562,8 @@ macro_rules! tool_task {
             engine: Engine,
             params: $params,
             cancel: CancelToken,
+            /// The structured failure, kept for `reject` on the JS thread.
+            failure: Option<proto::ToolError>,
         }
 
         #[napi]
@@ -504,11 +572,19 @@ macro_rules! tool_task {
             type JsValue = $js;
 
             fn compute(&mut self) -> Result<Self::Output> {
-                $call(&self.engine, &self.params, &self.cancel).map_err(task_err)
+                $call(&self.engine, &self.params, &self.cancel)
+                    .map_err(|e| stash(&mut self.failure, e))
             }
 
             fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
                 Ok(output.into())
+            }
+
+            fn reject(&mut self, env: Env, err: Error) -> Result<Self::JsValue> {
+                match self.failure.take() {
+                    Some(e) => Err(structured_err(&env, e)),
+                    None => Err(err),
+                }
             }
         }
     };
@@ -549,6 +625,8 @@ pub struct ReadBytesTask {
     engine: Engine,
     params: proto::ReadParams,
     cancel: CancelToken,
+    /// The structured failure, kept for `reject` on the JS thread.
+    failure: Option<proto::ToolError>,
 }
 
 #[napi]
@@ -558,11 +636,18 @@ impl Task for ReadBytesTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         hearth_tools::read_bytes_cancellable(&self.engine, &self.params, &self.cancel)
-            .map_err(task_err)
+            .map_err(|e| stash(&mut self.failure, e))
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
         Ok(Buffer::from(output))
+    }
+
+    fn reject(&mut self, env: Env, err: Error) -> Result<Self::JsValue> {
+        match self.failure.take() {
+            Some(e) => Err(structured_err(&env, e)),
+            None => Err(err),
+        }
     }
 }
 
@@ -572,6 +657,8 @@ pub struct BashTask {
     params: proto::BashParams,
     cancel: CancelToken,
     on_chunk: Option<ChunkStream>,
+    /// The structured failure, kept for `reject` on the JS thread.
+    failure: Option<proto::ToolError>,
 }
 
 #[napi]
@@ -580,7 +667,7 @@ impl Task for BashTask {
     type JsValue = BashResult;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        match &self.on_chunk {
+        let result = match &self.on_chunk {
             Some(stream) => {
                 let result = hearth_tools::bash_stream(
                     &self.engine,
@@ -592,32 +679,26 @@ impl Task for BashTask {
                 // describes. `result` is held first so a command failure is
                 // still reported even if the consumer then stalls.
                 if !stream.drain() && result.is_ok() {
-                    return Err(Error::new(
-                        Status::GenericFailure,
-                        format!(
-                            "{}: the chunk callback stopped accepting output",
-                            proto::ErrorKind::Internal.as_str()
-                        ),
-                    ));
+                    Err(proto::ToolError::internal(
+                        "the chunk callback stopped accepting output",
+                    ))
+                } else {
+                    result
                 }
-                result
             }
             None => hearth_tools::bash_cancellable(&self.engine, &self.params, &self.cancel),
-        }
-        .map_err(task_err)
+        };
+        result.map_err(|e| stash(&mut self.failure, e))
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
         Ok(output.into())
     }
-}
 
-/// A worker-thread error.
-///
-/// `Task` pins the error type to `Error<Status>`, so unlike the synchronous
-/// methods an async rejection cannot put the kind in `Error.code`. Both paths
-/// therefore also lead the message with `"<kind>: "`, which is the one format a
-/// caller has to know.
-fn task_err(e: proto::ToolError) -> Error {
-    Error::new(Status::GenericFailure, format!("{}: {}", e.kind.as_str(), e.message))
+    fn reject(&mut self, env: Env, err: Error) -> Result<Self::JsValue> {
+        match self.failure.take() {
+            Some(e) => Err(structured_err(&env, e)),
+            None => Err(err),
+        }
+    }
 }

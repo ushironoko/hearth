@@ -657,8 +657,10 @@ name = "hearth-proto"
 version = "0.1.0"
 dependencies = [
  "compact_str",
+ "rmp-serde",
  "serde",
  "serde_bytes",
+ "serde_json",
  "smallvec",
  "thiserror",
 ]
