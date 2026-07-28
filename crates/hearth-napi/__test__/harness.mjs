@@ -52,10 +52,13 @@ export function throws(fn, message = "expected a throw") {
   throw new Error(message);
 }
 
-/** The `kind` prefix every Hearth error message leads with. */
+/**
+ * The stable kind tag every Hearth error carries as `Error.code`, on the
+ * synchronous and the async path alike. The message also leads with
+ * `"<kind>: "`, but that is presentation — the property is the contract.
+ */
 export function errorKind(error) {
-  const match = /^([a-zA-Z]+):/.exec(error?.message ?? "");
-  return match ? match[1] : undefined;
+  return error?.code;
 }
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
