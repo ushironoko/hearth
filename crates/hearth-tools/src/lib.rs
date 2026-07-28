@@ -29,8 +29,8 @@ pub use write::{write, write_cancellable, write_owned, write_owned_cancellable};
 /// The pi-compatible text machinery behind `edit_batch`, exposed so a contract
 /// suite can exercise the matching rules directly.
 pub use edit_text::{
-    apply_edits, detect_crlf, diff_hunks, normalize_for_fuzzy_match, normalize_to_lf,
-    restore_line_endings, split_line_count, strip_bom, AppliedEdits,
+    apply_edits, apply_edits_opts, detect_crlf, diff_hunks, normalize_for_fuzzy_match,
+    normalize_to_lf, restore_line_endings, split_line_count, strip_bom, AppliedEdits,
 };
 
 pub use hearth_core::{CancelToken, Engine};

@@ -203,6 +203,25 @@ pub struct EditReplacement {
     pub new_text: String,
 }
 
+/// How the batch `edit` tool treats a whitespace-only `oldText` — one whose
+/// fuzzy-normalized form is empty while the text itself is not.
+///
+/// Such a target has no coordinates in normalized matching space, so anything
+/// broader than exact whole-file replacement would silently weaken the
+/// unique-target contract (occurrence counting cannot see it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WhitespaceOnlyTargetPolicy {
+    /// Reject the edit as invalid input — Hearth 0.1.0 behavior.
+    #[default]
+    Reject,
+    /// Allow it only when the LF-normalized `oldText` equals the entire
+    /// BOM-stripped, LF-normalized file content. Matching is exact, never
+    /// normalized; a batch that also needs the normalized fallback is
+    /// rejected; empty `oldText` stays invalid regardless.
+    ExactFile,
+}
+
 /// Parameters for the batch `edit` tool: several disjoint replacements applied
 /// atomically, each matched against the *original* file rather than
 /// incrementally.
@@ -224,6 +243,14 @@ pub struct EditBatchParams {
     /// case does not ship a second copy of the file across the boundary.
     #[serde(default)]
     pub return_content: bool,
+    /// Also return the exact pre-edit text (BOM and line endings intact),
+    /// captured while the mutation lock is held. Off by default for the same
+    /// reason as `return_content`.
+    #[serde(default)]
+    pub return_original_content: bool,
+    /// How a whitespace-only `oldText` is treated. Defaults to rejection.
+    #[serde(default)]
+    pub whitespace_only_target_policy: WhitespaceOnlyTargetPolicy,
     /// How the bytes reach the disk. See [`WriteMode`].
     #[serde(default)]
     pub mode: WriteMode,
@@ -241,6 +268,8 @@ impl EditBatchParams {
             diff_context: default_diff_context(),
             skip_diff: false,
             return_content: false,
+            return_original_content: false,
+            whitespace_only_target_policy: WhitespaceOnlyTargetPolicy::default(),
             mode: WriteMode::default(),
             follow_symlinks: true,
         }
@@ -327,6 +356,13 @@ pub struct EditBatchResult {
     /// Full post-edit content, only when `returnContent` was set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Exact pre-edit text (BOM and line endings intact), only when
+    /// `returnOriginalContent` was set. Captured under the same mutation lock
+    /// as the write, so no writer going through this engine can have touched
+    /// the file between this snapshot and the commit — writers outside the
+    /// engine are not serialized by that lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_content: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

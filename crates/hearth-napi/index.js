@@ -594,4 +594,5 @@ module.exports.DiffOp = nativeBinding.DiffOp
 module.exports.GrepMode = nativeBinding.GrepMode
 module.exports.LineWindowMode = nativeBinding.LineWindowMode
 module.exports.ShellTransport = nativeBinding.ShellTransport
+module.exports.WhitespaceOnlyTargetPolicy = nativeBinding.WhitespaceOnlyTargetPolicy
 module.exports.WriteMode = nativeBinding.WriteMode

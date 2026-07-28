@@ -50,6 +50,19 @@ pub enum WriteMode {
     InPlace,
 }
 
+/// How `editBatch` treats a whitespace-only `oldText` — one whose
+/// fuzzy-normalized form is empty while the text itself is not.
+#[napi(string_enum = "camelCase")]
+#[derive(Clone, Copy)]
+pub enum WhitespaceOnlyTargetPolicy {
+    /// Reject the edit as invalid input (the default).
+    Reject,
+    /// Allow it only when the LF-normalized `oldText` equals the entire
+    /// BOM-stripped, LF-normalized file content; matching is exact, never
+    /// normalized. Empty `oldText` stays invalid regardless.
+    ExactFile,
+}
+
 /// Output shape for `grep`.
 #[napi(string_enum = "camelCase")]
 #[derive(Clone, Copy)]
@@ -109,6 +122,15 @@ impl From<WriteMode> for proto::WriteMode {
         match v {
             WriteMode::Atomic => proto::WriteMode::Atomic,
             WriteMode::InPlace => proto::WriteMode::InPlace,
+        }
+    }
+}
+
+impl From<WhitespaceOnlyTargetPolicy> for proto::WhitespaceOnlyTargetPolicy {
+    fn from(v: WhitespaceOnlyTargetPolicy) -> Self {
+        match v {
+            WhitespaceOnlyTargetPolicy::Reject => proto::WhitespaceOnlyTargetPolicy::Reject,
+            WhitespaceOnlyTargetPolicy::ExactFile => proto::WhitespaceOnlyTargetPolicy::ExactFile,
         }
     }
 }
@@ -363,6 +385,11 @@ pub struct EditBatchParams {
     pub skip_diff: Option<bool>,
     /// Also return the full post-edit content.
     pub return_content: Option<bool>,
+    /// Also return the exact pre-edit text (BOM and line endings intact),
+    /// captured while the mutation lock is held.
+    pub return_original_content: Option<bool>,
+    /// How a whitespace-only `oldText` is treated. Defaults to `reject`.
+    pub whitespace_only_target_policy: Option<WhitespaceOnlyTargetPolicy>,
     /// Defaults to `atomic`.
     pub mode: Option<WriteMode>,
     /// Edit a symlink's target instead of replacing the link. Defaults to true.
@@ -378,6 +405,11 @@ impl From<EditBatchParams> for proto::EditBatchParams {
             diff_context: p.diff_context.unwrap_or(defaults.diff_context),
             skip_diff: p.skip_diff.unwrap_or(false),
             return_content: p.return_content.unwrap_or(false),
+            return_original_content: p.return_original_content.unwrap_or(false),
+            whitespace_only_target_policy: p
+                .whitespace_only_target_policy
+                .map(Into::into)
+                .unwrap_or_default(),
             mode: p.mode.map(Into::into).unwrap_or_default(),
             follow_symlinks: p.follow_symlinks.unwrap_or(true),
         }
@@ -451,6 +483,11 @@ pub struct EditBatchResult {
     pub hunks: Vec<DiffHunk>,
     /// Present only when `returnContent` was set.
     pub content: Option<String>,
+    /// Present only when `returnOriginalContent` was set: the exact pre-edit
+    /// text, BOM and line endings intact, captured under the same mutation
+    /// lock as the write. Only writers going through this engine are
+    /// serialized by that lock.
+    pub original_content: Option<String>,
 }
 
 impl From<proto::EditBatchResult> for EditBatchResult {
@@ -467,6 +504,7 @@ impl From<proto::EditBatchResult> for EditBatchResult {
             first_changed_line: r.first_changed_line.map(as_i64),
             hunks: r.hunks.into_iter().map(Into::into).collect(),
             content: r.content,
+            original_content: r.original_content,
         }
     }
 }

@@ -108,6 +108,12 @@ pub fn edit_batch_cancellable(
                 .with_path(params.path.clone())
         })?;
 
+        // The raw pre-edit text, BOM and line endings intact, snapshotted here
+        // — while the mutation lock is held — so it and the commit below are
+        // one transaction. Normalized `content` must not stand in for it: the
+        // deletion and trailing-newline edge cases exist only in the raw form.
+        let original_content = params.return_original_content.then(|| raw.to_string());
+
         let (had_bom, without_bom) = edit_text::strip_bom(raw);
         let crlf = edit_text::detect_crlf(without_bom);
         // Borrows the cached bytes when there is no CRLF to collapse, so the
@@ -116,8 +122,9 @@ pub fn edit_batch_cancellable(
         let content = edit_text::normalize_to_lf(without_bom);
 
         cancel.check()?;
-        let applied = edit_text::apply_edits(&content, &params.edits)
-            .map_err(|e| annotate(e, &params.path))?;
+        let applied =
+            edit_text::apply_edits_opts(&content, &params.edits, params.whitespace_only_target_policy)
+                .map_err(|e| annotate(e, &params.path))?;
 
         let (hunks, first_changed_line) = if params.skip_diff {
             (Vec::new(), None)
@@ -154,6 +161,7 @@ pub fn edit_batch_cancellable(
             first_changed_line,
             hunks,
             content: params.return_content.then_some(applied.new_content),
+            original_content,
         })
     })
 }
