@@ -46,3 +46,7 @@ harness = false
 [[bench]]
 name = "bash_bench"
 harness = false
+
+[[bench]]
+name = "graph_rdeps_bench"
+harness = false

@@ -13,6 +13,7 @@
 pub mod cache;
 pub mod cancel;
 pub mod engine;
+pub mod invalidation;
 pub mod line_index;
 pub mod pathlock;
 pub mod profiler;
@@ -21,8 +22,9 @@ pub mod watch;
 
 pub use cancel::CancelToken;
 pub use engine::{Engine, EngineConfig, Tuning};
+pub use invalidation::{InvalidationDelta, InvalidationLog};
 pub use line_index::LineIndex;
-pub use pathlock::{mutation_key, PathGuard, PathLocks};
+pub use pathlock::{PathGuard, PathLocks, mutation_key};
 
 // Re-export the protocol types so downstream crates can depend on just core.
 pub use hearth_proto as proto;

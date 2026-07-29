@@ -592,7 +592,11 @@ impl Default for GrepParams {
 impl GrepParams {
     /// A default-configuration search for `pattern` under `path`.
     pub fn new(pattern: impl Into<String>, path: impl Into<String>) -> Self {
-        Self { pattern: pattern.into(), path: path.into(), ..Default::default() }
+        Self {
+            pattern: pattern.into(),
+            path: path.into(),
+            ..Default::default()
+        }
     }
 }
 
@@ -639,6 +643,483 @@ pub struct GrepResult {
     pub root: String,
     /// Whether `root` is a directory (a file root searches only that file).
     pub root_is_dir: bool,
+}
+
+// ---------------------------------------------------------------------------
+// graph
+// ---------------------------------------------------------------------------
+
+/// Parameters for a code-graph query rooted at a file or directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphParams {
+    /// Absolute root path to query.
+    pub root: String,
+    /// Graph operation to perform.
+    pub op: GraphOp,
+    /// Include hidden files when walking the root.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Honor `.gitignore`/`.ignore` rules (default true).
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
+    /// Follow symbolic links while walking.
+    #[serde(default)]
+    pub follow_symlinks: bool,
+    /// Caller-supplied universe (view filter). Empty means a walk-derived
+    /// universe.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// Reuse window for the revalidation sweep, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stale_ms: Option<u64>,
+    /// Include [`GraphCoverage::basis`] entries. Off by default because the
+    /// basis is unbounded on the wire.
+    #[serde(default)]
+    pub include_basis: bool,
+}
+
+impl GraphParams {
+    /// A default-configuration graph operation under `root`.
+    pub fn new(root: impl Into<String>, op: GraphOp) -> Self {
+        Self {
+            root: root.into(),
+            op,
+            hidden: false,
+            respect_gitignore: true,
+            follow_symlinks: false,
+            files: Vec::new(),
+            max_stale_ms: None,
+            include_basis: false,
+        }
+    }
+}
+
+/// One of the eight operations exposed by the `graph` protocol surface.
+///
+/// This enum is externally tagged. In particular, [`GraphOp::Status`] travels
+/// as the JSON string `"status"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GraphOp {
+    /// List symbols extracted from one file.
+    Symbols {
+        /// Path of the file to inspect.
+        path: String,
+    },
+    /// Return the nested symbol outline for one file.
+    Outline {
+        /// Path of the file to inspect.
+        path: String,
+    },
+    /// Search indexed symbols by name.
+    Search {
+        /// Symbol search query.
+        query: String,
+        /// Maximum number of symbols to return.
+        #[serde(default = "default_search_limit")]
+        limit: u64,
+    },
+    /// Find definitions with an exact name.
+    Definitions {
+        /// Symbol name to find.
+        name: String,
+        /// Maximum number of definitions to return.
+        #[serde(default = "default_search_limit")]
+        limit: u64,
+    },
+    /// Traverse dependencies from one file.
+    Deps {
+        /// Path of the file to start from.
+        path: String,
+        /// Maximum traversal depth.
+        #[serde(default = "default_graph_depth")]
+        depth: u32,
+    },
+    /// Traverse reverse dependencies from one file.
+    Rdeps {
+        /// Path of the file to start from.
+        path: String,
+        /// Maximum traversal depth.
+        #[serde(default = "default_graph_depth")]
+        depth: u32,
+        /// Verify reverse dependencies against the source universe.
+        #[serde(default = "default_true")]
+        verify: bool,
+    },
+    /// Traverse dependencies and reverse dependencies around one file.
+    Neighborhood {
+        /// Path of the file at the center.
+        path: String,
+        /// Maximum traversal depth.
+        #[serde(default = "default_graph_depth")]
+        depth: u32,
+    },
+    /// Return graph build and coverage status.
+    Status,
+}
+
+/// Accuracy guarantee attached to graph answers and dependency edges.
+///
+/// Symbol kinds, edge kinds, and language identifiers deliberately remain
+/// plain strings so future additions do not break old clients; only this
+/// guarantee is a closed enum on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GraphGuarantee {
+    /// Exact with respect to the verified snapshot identified by
+    /// `basis`/`sweepAgeMs`. Reuse inside an explicitly accepted `maxStaleMs`
+    /// window remains exact.
+    Exact,
+    /// Some part of the answer could not be established exactly.
+    Approximate,
+}
+
+/// Metadata shared by every graph result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphMeta {
+    /// Weakest guarantee across the whole answer.
+    pub guarantee: GraphGuarantee,
+    /// Absolute root used to build the graph universe.
+    pub root: String,
+    /// Number of files in the query universe.
+    pub universe_files: u64,
+    /// Number of successfully indexed files.
+    pub indexed_files: u64,
+    /// Number of files with unsupported languages.
+    pub unsupported_files: u64,
+    /// Number of files rejected for exceeding the size limit.
+    pub oversize_files: u64,
+    /// Number of files checked during this revalidation.
+    pub revalidated_files: u64,
+    /// Number of files reindexed during this revalidation.
+    pub reindexed_files: u64,
+    /// Whether this answer performed a revalidation sweep.
+    pub swept: bool,
+    /// Age of the verified sweep snapshot in milliseconds.
+    pub sweep_age_ms: u64,
+    /// Whether the universe walk came from the walk cache.
+    pub walk_cache_hit: bool,
+    /// Whether the rdeps repair pass stopped at its per-query cap, leaving
+    /// grep hits unexamined.
+    #[serde(default)]
+    pub repair_truncated: bool,
+}
+
+/// One symbol extracted from a source file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSymbol {
+    /// Symbol name as written in the source.
+    pub name: String,
+    /// Frozen lowercase kind vocabulary: `function`, `method`, `class`,
+    /// `interface`, `module`, `macro`, `constant`, `type`, `field`,
+    /// `property`, or `heading`. Kinds travel as plain strings so future
+    /// additions do not break old clients.
+    pub kind: String,
+    /// Absolute path of the containing file.
+    pub path: String,
+    /// Stable node identifier in the form
+    /// `"{root-relative path}@{xxh3 16-digit lowercase hex}"`. The relative
+    /// path may itself contain `@`, so clients must split on the last `@`
+    /// (`rsplit`).
+    pub node_id: String,
+    /// 1-based source line.
+    pub line: u64,
+    /// 0-based character column.
+    pub column: u64,
+    /// Optional 1-based final source line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u64>,
+    /// Optional 0-based final character column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<u64>,
+    /// Optional 0-based first byte of the definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<u64>,
+    /// Optional exclusive final byte of the definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<u64>,
+    /// Nesting depth within the file outline.
+    pub depth: u32,
+}
+
+/// One file node in the module graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNode {
+    /// Absolute path of the file.
+    pub path: String,
+    /// Stable node identifier in the form
+    /// `"{root-relative path}@{xxh3 16-digit lowercase hex}"`. The relative
+    /// path may itself contain `@`, so clients must split on the last `@`
+    /// (`rsplit`).
+    pub node_id: String,
+    /// Frozen lowercase language vocabulary: `rust`, `typescript`, `tsx`,
+    /// `javascript`, `jsx`, `go`, `python`, `ruby`, `c`, `cpp`, `java`,
+    /// `csharp`, `zig`, `bash`, `haskell`, `lua`, `php`, `swift`, or
+    /// `markdown`. Languages travel as plain strings so future additions do
+    /// not break old clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Whether the file has been indexed rather than represented by a stub.
+    pub indexed: bool,
+}
+
+/// One resolved dependency edge in the module graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphDepEdge {
+    /// Source node identifier.
+    pub from: String,
+    /// Destination node identifier.
+    pub to: String,
+    /// Import specifier exactly as written in the source.
+    pub specifier: String,
+    /// Frozen lowercase edge vocabulary: `import`, `reexport`, `dynamic`,
+    /// `require`, `tsrequire`, `use`, or `mod`. Edge kinds travel as plain
+    /// strings so future additions do not break old clients.
+    pub kind: String,
+    /// 1-based source line containing the dependency.
+    pub line: u64,
+    /// Accuracy guarantee for this edge.
+    pub guarantee: GraphGuarantee,
+}
+
+/// One import that could not be resolved to a graph node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphUnresolvedImport {
+    /// Import specifier exactly as written in the source.
+    pub specifier: String,
+    /// 1-based source line containing the import.
+    pub line: u64,
+    /// Human-readable reason resolution failed.
+    pub reason: String,
+}
+
+/// One reverse-dependency entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphRdepEntry {
+    /// Importing file node.
+    pub node: GraphNode,
+    /// Import specifier when one is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specifier: Option<String>,
+    /// 1-based source line containing the import.
+    pub line: u64,
+    /// Accuracy guarantee for this reverse dependency.
+    pub guarantee: GraphGuarantee,
+}
+
+/// Wire form of one basis entry. contentHashHex is the u64 xxh3 hash as
+/// EXACTLY 16 lowercase zero-padded hex digits (never a number: i64 casts turn
+/// high-bit hashes negative and break comparison with node-id hex on the JS side).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphBasisEntry {
+    /// Absolute path of the verified file.
+    pub path: String,
+    /// The file's u64 xxh3 content hash as exactly 16 lowercase, zero-padded
+    /// hexadecimal digits.
+    pub content_hash_hex: String,
+}
+
+/// Coverage of files used to produce a graph answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphCoverage {
+    /// Number of analyzed files.
+    pub analyzed: u64,
+    /// Number of unresolved stub nodes.
+    pub stubs: u64,
+    /// Verified file/hash pairs, included only when requested.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub basis: Vec<GraphBasisEntry>,
+}
+
+/// Result of a [`GraphOp::Symbols`] query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSymbolsResult {
+    /// Absolute path of the inspected file.
+    pub path: String,
+    /// Node identifier for the inspected file.
+    pub node_id: String,
+    /// Symbols extracted from the file.
+    pub symbols: Vec<GraphSymbol>,
+    /// Whether the per-file symbol cap truncated the result.
+    pub truncated: bool,
+}
+
+/// Result of a [`GraphOp::Outline`] query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphOutlineResult {
+    /// Absolute path of the inspected file.
+    pub path: String,
+    /// Node identifier for the inspected file.
+    pub node_id: String,
+    /// Symbols in source and nesting order.
+    pub symbols: Vec<GraphSymbol>,
+    /// Whether the per-file symbol cap truncated the result.
+    pub truncated: bool,
+}
+
+/// Result of a [`GraphOp::Search`] query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSearchResult {
+    /// Matching symbols in score order.
+    pub symbols: Vec<GraphSymbol>,
+    /// Whether more matching symbols exist beyond the requested limit.
+    pub limit_reached: bool,
+}
+
+/// Result of a [`GraphOp::Definitions`] query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphDefinitionsResult {
+    /// Matching definitions in jump-priority order.
+    pub symbols: Vec<GraphSymbol>,
+    /// Whether more definitions exist beyond the requested limit.
+    pub limit_reached: bool,
+}
+
+/// Result of a [`GraphOp::Deps`] query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphDepsResult {
+    /// Node whose dependencies were queried.
+    pub node: GraphNode,
+    /// Resolved dependency edges.
+    pub edges: Vec<GraphDepEdge>,
+    /// Imports that could not be resolved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<GraphUnresolvedImport>,
+    /// Coverage used to determine this result.
+    pub coverage: GraphCoverage,
+}
+
+/// Result of a [`GraphOp::Rdeps`] query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphRdepsResult {
+    /// Node whose reverse dependencies were queried.
+    pub node: GraphNode,
+    /// Files that import the queried node.
+    pub importers: Vec<GraphRdepEntry>,
+    /// Whether reverse dependencies were verified against the source universe.
+    pub verified: bool,
+    /// Coverage used to determine this result.
+    pub coverage: GraphCoverage,
+}
+
+/// Result of a [`GraphOp::Neighborhood`] query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNeighborhoodResult {
+    /// Node at the center of the neighborhood.
+    pub center: GraphNode,
+    /// Nodes reached within the requested depth.
+    pub nodes: Vec<GraphNode>,
+    /// Dependency edges between the returned nodes.
+    pub edges: Vec<GraphDepEdge>,
+    /// Coverage used to determine this result.
+    pub coverage: GraphCoverage,
+}
+
+/// Per-language counts in graph status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphLanguageStatus {
+    /// Plain-string language identifier from the frozen
+    /// [`GraphNode::language`] vocabulary.
+    pub language: String,
+    /// Number of files indexed for this language.
+    pub files: u64,
+    /// Number of symbols indexed for this language.
+    pub symbols: u64,
+}
+
+/// Result of a [`GraphOp::Status`] query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphStatusResult {
+    /// Whether the graph has completed its initial build.
+    pub built: bool,
+    /// Whether a build or sweep was in flight when this status was read, so
+    /// the counters below may lag the in-progress work.
+    #[serde(default)]
+    pub building: bool,
+    /// Number of files in the graph universe.
+    pub universe_files: u64,
+    /// Number of successfully indexed files.
+    pub indexed_files: u64,
+    /// Number of files with unsupported languages.
+    pub unsupported_files: u64,
+    /// Number of files rejected for exceeding the size limit.
+    pub oversize_files: u64,
+    /// Number of files waiting to be indexed.
+    pub pending_files: u64,
+    /// Number of indexed files known to be stale.
+    pub stale_files: u64,
+    /// Number of files that failed to index.
+    pub failed_files: u64,
+    /// Total number of indexed symbols.
+    pub symbols: u64,
+    /// Total number of dependency edges.
+    pub edges: u64,
+    /// Number of weakly connected components.
+    pub components: u64,
+    /// Per-language file and symbol counts.
+    pub languages: Vec<GraphLanguageStatus>,
+    /// Age of the last completed sweep in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sweep_ms_ago: Option<u64>,
+    /// Duration of the initial build in microseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_duration_us: Option<u64>,
+}
+
+/// Complete graph response with freshness metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphResult {
+    /// Freshness and coverage metadata for the answer.
+    pub meta: GraphMeta,
+    /// Operation-specific output.
+    pub output: GraphOutput,
+}
+
+/// Operation-specific payload returned by a graph query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GraphOutput {
+    /// Symbols extracted from one file.
+    Symbols(GraphSymbolsResult),
+    /// Nested symbol outline for one file.
+    Outline(GraphOutlineResult),
+    /// Symbol search matches.
+    Search(GraphSearchResult),
+    /// Exact-name definition matches.
+    Definitions(GraphDefinitionsResult),
+    /// Forward dependency traversal.
+    Deps(GraphDepsResult),
+    /// Reverse dependency traversal.
+    Rdeps(GraphRdepsResult),
+    /// Bidirectional neighborhood traversal.
+    Neighborhood(GraphNeighborhoodResult),
+    /// Graph build and coverage status.
+    Status(GraphStatusResult),
+}
+
+/// Formats a u64 content hash the way the wire contract requires:
+/// exactly 16 lowercase, zero-padded hex digits.
+pub fn content_hash_hex(hash: u64) -> String {
+    format!("{hash:016x}")
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +1190,8 @@ pub enum Request {
     Stats,
     /// Ask the daemon to shut down gracefully.
     Shutdown,
+    /// Run a code-graph query.
+    Graph(GraphParams),
 }
 
 /// A response returned by the resident daemon. Externally tagged (see [`Request`]).
@@ -729,6 +1212,8 @@ pub enum Response {
     /// (via SCM_RIGHTS), bypassing payload serialization. Carries only metadata.
     Streamed(StreamedResult),
     Error(ToolError),
+    /// Return a code-graph query result.
+    Graph(GraphResult),
 }
 
 /// Metadata for a zero-copy streamed response (content already written to the
@@ -742,6 +1227,14 @@ pub struct StreamedResult {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_search_limit() -> u64 {
+    200
+}
+
+fn default_graph_depth() -> u32 {
+    1
 }
 
 /// pi 0.80.7 renders both its display diff and its unified patch with four

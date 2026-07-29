@@ -4,15 +4,16 @@
 //! one `Engine` for their whole lifetime; tools borrow it per call.
 
 use crate::cache::{FileCache, WalkCache};
-use crate::pathlock::{mutation_key, PathGuard, PathLocks};
+use crate::invalidation::InvalidationLog;
+use crate::pathlock::{PathGuard, PathLocks, mutation_key};
 use crate::watch::WatchHandle;
 use dashmap::DashMap;
 use hearth_proto::{CacheScope, InvalidateResult, ShellSpec};
 use parking_lot::Mutex;
 use std::any::{Any, TypeId};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -96,6 +97,7 @@ struct EngineInner {
     config: EngineConfig,
     files: Arc<FileCache>,
     walks: Arc<WalkCache>,
+    invalidations: Arc<InvalidationLog>,
     tuning: Arc<Tuning>,
     watch: Mutex<Option<WatchHandle>>,
     /// Type-erased per-engine extensions, so tools can stash long-lived state
@@ -126,6 +128,7 @@ impl Engine {
     pub fn new(config: EngineConfig) -> Self {
         let files = Arc::new(FileCache::new());
         let walks = Arc::new(WalkCache::new(config.walk_threads));
+        let invalidations = Arc::new(InvalidationLog::new());
         let tuning = Arc::new(Tuning::default());
         // Normalize bounds so a misconfigured min>max can never panic `clamp`.
         let min_bytes = config.min_cache_bytes;
@@ -159,6 +162,7 @@ impl Engine {
                 config,
                 files,
                 walks,
+                invalidations,
                 tuning,
                 watch: Mutex::new(None),
                 extensions: DashMap::new(),
@@ -181,6 +185,12 @@ impl Engine {
     #[inline]
     pub fn walks(&self) -> &WalkCache {
         &self.inner.walks
+    }
+
+    /// Access the invalidation journal consumed by derived per-path state.
+    #[inline]
+    pub fn invalidations(&self) -> &InvalidationLog {
+        &self.inner.invalidations
     }
 
     #[inline]
@@ -223,6 +233,7 @@ impl Engine {
                 root,
                 Arc::clone(&self.inner.files),
                 Arc::clone(&self.inner.walks),
+                Arc::clone(&self.inner.invalidations),
             ) {
                 Ok(handle) => {
                     *guard = Some(handle);
@@ -261,7 +272,11 @@ impl Engine {
     pub fn invalidate_path(&self, path: &Path) -> InvalidateResult {
         let files = u64::from(self.inner.files.invalidate(path));
         let walks = self.inner.walks.invalidate_under(path) as u64;
-        InvalidateResult { files_invalidated: files, walks_invalidated: walks }
+        self.inner.invalidations.record(path);
+        InvalidateResult {
+            files_invalidated: files,
+            walks_invalidated: walks,
+        }
     }
 
     /// Drop everything cached at or beneath `root`.
@@ -270,17 +285,19 @@ impl Engine {
     /// command: an arbitrary command can create, delete, rename, or rewrite
     /// anything under its cwd, and no cheaper invalidation is sound.
     pub fn invalidate_root(&self, root: &Path) -> InvalidateResult {
-        InvalidateResult {
+        let result = InvalidateResult {
             files_invalidated: self.inner.files.invalidate_prefix(root) as u64,
             walks_invalidated: self.inner.walks.invalidate_under(root) as u64,
-        }
+        };
+        self.inner.invalidations.record_wipe();
+        result
     }
 
     /// The scoped/recursive form the protocol exposes.
     pub fn invalidate(&self, path: &Path, recursive: bool, scope: CacheScope) -> InvalidateResult {
         let files = matches!(scope, CacheScope::Files | CacheScope::All);
         let walks = matches!(scope, CacheScope::Walks | CacheScope::All);
-        InvalidateResult {
+        let result = InvalidateResult {
             files_invalidated: if !files {
                 0
             } else if recursive {
@@ -293,15 +310,23 @@ impl Engine {
             } else {
                 0
             },
+        };
+        if recursive {
+            self.inner.invalidations.record_wipe();
+        } else {
+            self.inner.invalidations.record(path);
         }
+        result
     }
 
     /// Drop every cached file and walk.
     pub fn clear_caches(&self) -> InvalidateResult {
-        InvalidateResult {
+        let result = InvalidateResult {
             files_invalidated: self.inner.files.clear() as u64,
             walks_invalidated: self.inner.walks.clear() as u64,
-        }
+        };
+        self.inner.invalidations.record_wipe();
+        result
     }
 
     /// Keep the walk cache coherent after Hearth itself mutated `path`.
@@ -315,6 +340,7 @@ impl Engine {
         if created || is_ignore_file(path) {
             self.inner.walks.invalidate_under(path);
         }
+        self.inner.invalidations.record(path);
     }
 
     /// Render the profiler report, prefixed with live cache/optimizer state.
@@ -326,7 +352,11 @@ impl Engine {
     pub fn cache_report(&self) -> String {
         let (hits, misses) = self.inner.files.cache_stats();
         let total = hits + misses;
-        let rate = if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 };
+        let rate = if total > 0 {
+            hits as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
         format!(
             "── cache/optimizer ──\nfiles={} bytes={} budget={} hit_rate={:.1}% ({}/{}) walks={}",
             self.inner.files.len(),
@@ -349,8 +379,12 @@ fn is_ignore_file(path: &Path) -> bool {
     match path.file_name().and_then(|n| n.to_str()) {
         Some(".gitignore" | ".ignore" | ".rgignore" | ".git-blame-ignore-revs") => true,
         // `.git/info/exclude` is the repo-local ignore file.
-        Some("exclude") => path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
-            == Some("info"),
+        Some("exclude") => {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                == Some("info")
+        }
         _ => false,
     }
 }
@@ -379,7 +413,12 @@ fn optimizer_loop(
     stop: Arc<AtomicBool>,
     params: OptimizerParams,
 ) {
-    let OptimizerParams { min_bytes, max_bytes, max_files, interval } = params;
+    let OptimizerParams {
+        min_bytes,
+        max_bytes,
+        max_files,
+        interval,
+    } = params;
     let (mut prev_hits, mut prev_misses) = files.cache_stats();
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(interval);
@@ -393,7 +432,11 @@ fn optimizer_loop(
         prev_hits = hits;
         prev_misses = misses;
         let window = dh + dm;
-        let hit_rate = if window > 0 { dh as f64 / window as f64 } else { 1.0 };
+        let hit_rate = if window > 0 {
+            dh as f64 / window as f64
+        } else {
+            1.0
+        };
 
         let cached = files.total_bytes();
         let mut budget = tuning.cache_byte_budget.load(Ordering::Relaxed);

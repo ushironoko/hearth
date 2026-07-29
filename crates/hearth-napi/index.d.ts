@@ -38,6 +38,38 @@ export declare class HearthEngine {
   /** Synchronous grep. Prefer `grepAsync` for large trees. */
   grep(params: GrepParams): GrepResult
   grepAsync(params: GrepParams, signal?: AbortSignal): Promise<GrepResult>
+  /** Synchronously list symbols extracted from one file. */
+  graphSymbols(params: GraphSymbolsParams): GraphResult
+  /** Synchronously return the nested symbol outline for one file. */
+  graphOutline(params: GraphOutlineParams): GraphResult
+  /** Synchronously search indexed symbols by name. */
+  graphSearch(params: GraphSearchParams): GraphResult
+  /** Synchronously find definitions with an exact name. */
+  graphDefinitions(params: GraphDefinitionsParams): GraphResult
+  /** Synchronously traverse dependencies from one file. */
+  graphDeps(params: GraphDepsParams): GraphResult
+  /** Synchronously traverse reverse dependencies from one file. */
+  graphRdeps(params: GraphRdepsParams): GraphResult
+  /** Synchronously traverse both directions around one file. */
+  graphNeighborhood(params: GraphNeighborhoodParams): GraphResult
+  /** Synchronously return graph build and coverage status. */
+  graphStatus(params: GraphStatusParams): GraphResult
+  /** Asynchronously list symbols extracted from one file. */
+  graphSymbolsAsync(params: GraphSymbolsParams, signal?: AbortSignal): Promise<GraphResult>
+  /** Asynchronously return the nested symbol outline for one file. */
+  graphOutlineAsync(params: GraphOutlineParams, signal?: AbortSignal): Promise<GraphResult>
+  /** Asynchronously search indexed symbols by name. */
+  graphSearchAsync(params: GraphSearchParams, signal?: AbortSignal): Promise<GraphResult>
+  /** Asynchronously find definitions with an exact name. */
+  graphDefinitionsAsync(params: GraphDefinitionsParams, signal?: AbortSignal): Promise<GraphResult>
+  /** Asynchronously traverse dependencies from one file. */
+  graphDepsAsync(params: GraphDepsParams, signal?: AbortSignal): Promise<GraphResult>
+  /** Asynchronously traverse reverse dependencies from one file. */
+  graphRdepsAsync(params: GraphRdepsParams, signal?: AbortSignal): Promise<GraphResult>
+  /** Asynchronously traverse both directions around one file. */
+  graphNeighborhoodAsync(params: GraphNeighborhoodParams, signal?: AbortSignal): Promise<GraphResult>
+  /** Asynchronously return graph build and coverage status. */
+  graphStatusAsync(params: GraphStatusParams, signal?: AbortSignal): Promise<GraphResult>
   /**
    * Synchronous bash. Blocks the event loop for the command's whole
    * duration; prefer `bashAsync` or `bashStream`.
@@ -276,6 +308,255 @@ export interface FileMatches {
   matchCount: number
   /** Matching and context lines; empty outside `content` mode. */
   lines: Array<GrepLine>
+}
+
+export interface GraphBasisEntry {
+  path: string
+  contentHashHex: string
+}
+
+export interface GraphCoverage {
+  analyzed: number
+  stubs: number
+  basis: Array<GraphBasisEntry>
+}
+
+export interface GraphDefinitionsParams {
+  root: string
+  name: string
+  limit?: number
+  hidden?: boolean
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  files?: Array<string>
+  maxStaleMs?: number
+  includeBasis?: boolean
+}
+
+export interface GraphDefinitionsResult {
+  symbols: Array<GraphSymbol>
+  limitReached: boolean
+}
+
+export interface GraphDepEdge {
+  from: string
+  to: string
+  specifier: string
+  kind: string
+  line: number
+  guarantee: GraphGuarantee
+}
+
+export interface GraphDepsParams {
+  root: string
+  path: string
+  depth?: number
+  hidden?: boolean
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  files?: Array<string>
+  maxStaleMs?: number
+  includeBasis?: boolean
+}
+
+export interface GraphDepsResult {
+  node: GraphNode
+  edges: Array<GraphDepEdge>
+  unresolved: Array<GraphUnresolvedImport>
+  coverage: GraphCoverage
+}
+
+export declare const enum GraphGuarantee {
+  Exact = 'exact',
+  Approximate = 'approximate'
+}
+
+export interface GraphLanguageStatus {
+  language: string
+  files: number
+  symbols: number
+}
+
+export interface GraphMeta {
+  guarantee: GraphGuarantee
+  root: string
+  universeFiles: number
+  indexedFiles: number
+  unsupportedFiles: number
+  oversizeFiles: number
+  revalidatedFiles: number
+  reindexedFiles: number
+  swept: boolean
+  sweepAgeMs: number
+  walkCacheHit: boolean
+  repairTruncated: boolean
+}
+
+export interface GraphNeighborhoodParams {
+  root: string
+  path: string
+  depth?: number
+  hidden?: boolean
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  files?: Array<string>
+  maxStaleMs?: number
+  includeBasis?: boolean
+}
+
+export interface GraphNeighborhoodResult {
+  center: GraphNode
+  nodes: Array<GraphNode>
+  edges: Array<GraphDepEdge>
+  coverage: GraphCoverage
+}
+
+export interface GraphNode {
+  path: string
+  nodeId: string
+  language?: string
+  indexed: boolean
+}
+
+export interface GraphOutlineParams {
+  root: string
+  path: string
+  hidden?: boolean
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  files?: Array<string>
+  maxStaleMs?: number
+  includeBasis?: boolean
+}
+
+export interface GraphOutlineResult {
+  path: string
+  nodeId: string
+  symbols: Array<GraphSymbol>
+  truncated: boolean
+}
+
+export interface GraphRdepEntry {
+  node: GraphNode
+  specifier?: string
+  line: number
+  guarantee: GraphGuarantee
+}
+
+export interface GraphRdepsParams {
+  root: string
+  path: string
+  depth?: number
+  verify?: boolean
+  hidden?: boolean
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  files?: Array<string>
+  maxStaleMs?: number
+  includeBasis?: boolean
+}
+
+export interface GraphRdepsResult {
+  node: GraphNode
+  importers: Array<GraphRdepEntry>
+  verified: boolean
+  coverage: GraphCoverage
+}
+
+/** Exactly one output field is set, matching the requested graph operation. */
+export interface GraphResult {
+  meta: GraphMeta
+  symbols?: GraphSymbolsResult
+  outline?: GraphOutlineResult
+  search?: GraphSearchResult
+  definitions?: GraphDefinitionsResult
+  deps?: GraphDepsResult
+  rdeps?: GraphRdepsResult
+  neighborhood?: GraphNeighborhoodResult
+  status?: GraphStatusResult
+}
+
+export interface GraphSearchParams {
+  root: string
+  query: string
+  limit?: number
+  hidden?: boolean
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  files?: Array<string>
+  maxStaleMs?: number
+  includeBasis?: boolean
+}
+
+export interface GraphSearchResult {
+  symbols: Array<GraphSymbol>
+  limitReached: boolean
+}
+
+export interface GraphStatusParams {
+  root: string
+  hidden?: boolean
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  files?: Array<string>
+  maxStaleMs?: number
+  includeBasis?: boolean
+}
+
+export interface GraphStatusResult {
+  built: boolean
+  building: boolean
+  universeFiles: number
+  indexedFiles: number
+  unsupportedFiles: number
+  oversizeFiles: number
+  pendingFiles: number
+  staleFiles: number
+  failedFiles: number
+  symbols: number
+  edges: number
+  components: number
+  languages: Array<GraphLanguageStatus>
+  lastSweepMsAgo?: number
+  buildDurationUs?: number
+}
+
+export interface GraphSymbol {
+  name: string
+  kind: string
+  path: string
+  nodeId: string
+  line: number
+  column: number
+  endLine?: number
+  endColumn?: number
+  startByte?: number
+  endByte?: number
+  depth: number
+}
+
+export interface GraphSymbolsParams {
+  root: string
+  path: string
+  hidden?: boolean
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  files?: Array<string>
+  maxStaleMs?: number
+  includeBasis?: boolean
+}
+
+export interface GraphSymbolsResult {
+  path: string
+  nodeId: string
+  symbols: Array<GraphSymbol>
+  truncated: boolean
+}
+
+export interface GraphUnresolvedImport {
+  specifier: string
+  line: number
+  reason: string
 }
 
 export interface GrepLine {

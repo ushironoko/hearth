@@ -11,7 +11,8 @@ transport-agnostic **core + tools** from the three **surfaces** that expose them
 |-------|------|
 | `hearth-proto` | The single contract: `ReadParams`/`ReadResult`/… and the `Request`/`Response` envelope. `serde`, `camelCase`, dependency-light. Shared by every surface so they never drift. |
 | `hearth-core` | The resident `Engine`: shared caches, cancellation, per-path mutation locks, profiler, self-optimizer, fs-watch. No tool logic. |
-| `hearth-tools` | The five tools as plain `fn(&Engine, &Params) -> Result<Result>`, each with a `*_cancellable` twin. Plus `dispatch()` and the msgpack `transport`. |
+| `hearth-graph` | The code-index and module-graph layer: language registry, symbol/import extraction, `SymbolIndex`, `ModuleGraph`, and resolver abstractions. |
+| `hearth-tools` | The six tools as plain `fn(&Engine, &Params) -> Result<Result>`, each with a `*_cancellable` twin. Plus `dispatch()` and the msgpack `transport`. |
 | `hearth-daemon` | `hearthd`: one `Engine`, a Unix-socket server, thread-per-connection. |
 | `hearth-cli` | `hearth`: thin client; connects to the daemon or runs inline (cold) as a fallback. |
 | `hearth-napi` | `@hearthdev/napi`: a `#[napi]` `HearthEngine` object; typed sync methods + cancellable `*Async` (libuv worker) twins + `bashStream`. |
@@ -100,6 +101,9 @@ signal blocks on its real deadline as before.
 * `grep` → `WalkCache` for the file set + `FileCache` (`get_bounded`) for the
   bytes, searched with `grep-searcher`/`grep-regex` across worker threads. Warm =
   no walk, no file opens.
+* `graph` → `WalkCache` for the universe + `FileCache` for bytes and hashes +
+  the `GraphState` engine extension + `InvalidationLog` for derived-state
+  coherence.
 * `bash` → a fresh shell per command in its own process group, or the opt-in
   warm pool. Both stream ordered chunks.
 
@@ -248,6 +252,105 @@ At that point no unstarted file can contribute to the first N, so stopping is
 sound. Files that finish out of order are still accounted; they just cannot
 trigger the stop until the gap ahead of them fills in.
 
+## Graph
+
+The graph tool has two layers. `hearth-graph` owns the index and module-graph
+semantics, while the cache-aware adapter in `hearth-tools` supplies the source
+universe, file bytes, freshness, and publication boundary. Stage A covers
+symbols, outlines, symbol search, definitions, and status; Stage B layers deps,
+rdeps, and neighborhood traversal on the same analyzed files. Cross-language
+import resolution is outside that stage's scope.
+
+`GraphState` is an `Engine` extension with one `RootGraph` per resolved
+absolute root. Roots are not canonicalized by the shared adapter, so two
+symlink spellings of the same directory build two independent indexes; the
+CLI canonicalizes existing roots before dispatch, native and napi callers get
+the spelling they pass.
+Each root moves through `Uninitialized`, `Building`, `Ready { generation }`, and
+`Failed`. Only `Ready` may answer from stale state after losing the sweep lock.
+During a cold build, competing queries wait at a cancellable barrier until the
+first complete generation is published; they never treat the initial empty
+index as an empty repository.
+
+Each query selects a `SweepKey`: either the `WalkKey` that defines a cached walk
+or the sorted caller-supplied file view. A revalidation sweep first consumes the
+root's `InvalidationLog` delta, then uses the `(mtime_ns, size)` stat record and
+the cached content hash as its reindex gate. Parsing and deletion detection
+happen outside the state write lock; the complete delta, counters, sweep time,
+and next generation are published together. `max_stale_ms` may reuse only a
+matching sweep key inside the caller's explicit window.
+
+`Exact` means exact for the verified snapshot identified by the result's basis
+and `sweep_age_ms`, scoped to supported languages; reuse explicitly allowed by
+`max_stale_ms` stays exact. A non-voluntary stale answer caused by sweep-lock
+contention is `Approximate`, and so is any answer from a root with known
+unindexable files (`failedFiles` or `oversizeFiles` above zero) — those files
+may hold symbols the answer cannot see. The stat gate shares grep's trust
+contract: an out-of-band edit that preserves both size and mtime stays
+invisible until an invalidation arrives. The result meta reports the weakest
+guarantee for the complete answer.
+
+The dependency layer extracts imports during the same parse that feeds the
+symbol index, then resolves JavaScript and TypeScript specifiers through
+`oxc_resolver`. Workspace paths become graph nodes (initially stubs when the
+target has not been analyzed), installed packages remain external targets, and
+failed lookups remain unresolved edges. `ModuleGraph` updates both outgoing
+edges and reverse memberships incrementally. A forward result is `Exact` only
+when its source was analyzed without opaque imports, had an import extractor
+and a live resolver, every outgoing resolution was complete, and it was
+resolved under the current resolver generation; reverse traversal additionally
+requires a complete universe in which every node satisfies those conditions.
+Edges and operation results carry their own `Exact` or `Approximate` labels.
+Multi-hop traversal composes them by taking the weakest guarantee, and
+`meta.guarantee` takes the weakest again across graph structure, sweep
+freshness, and unindexable files.
+
+Resolver configuration is part of that generation boundary. A root begins with
+a tracked optional stat record for `tsconfig.json`, including `None` when the
+file is missing. Resolution adds the selected config and every tracked
+`extends` dependency, including missing relative targets, and every sweep
+compares fresh optional `(mtime_ns, size)` records with the previous set. A
+change, including a missing-to-present transition, replaces the resolver,
+advances its generation, and re-resolves all analyzed imports before publishing
+the sweep, so callers do not observe edges from the old configuration.
+
+Verified rdeps has a source-text backstop for cases where structural exactness
+cannot be established. It greps the whole root for needles derived from the
+target stem, then skips a hit only when the file's current hash is present in
+both indexes and its module node is analyzed, opaque-free, import-extraction
+capable, backed by a live resolver, and resolved in the current generation.
+Hits that are already analyzed but structurally incomplete are reported as
+`Approximate` importer entries without re-analysis; stale or unknown candidates
+are re-analyzed so comment-only hits can be rejected and newly discovered
+imports can repair the graph. At most `MAX_RDEPS_REPAIR` such candidates are re-analyzed
+per query; stopping at that cap sets `repair_truncated`. Files that cannot be
+analyzed, including oversized files, and analyzed files with opaque imports
+remain `Approximate` importer entries rather than being silently discarded.
+Concurrent identical repairs collapse into a single flight keyed by the target,
+the graph and resolver generations, and the hidden/ignore/symlink parameters
+that affect the grep.
+
+Rust resolution v1 keeps best-effort filesystem edges for the standard `src/`
+layout and direct `src/bin/*.rs`, `examples/*.rs`, and `tests/*.rs` crate roots,
+but every Rust resolver outcome is `Partial`: Rust edges and any graph result
+containing them are always `Approximate`. `Exact` Rust resolution would require
+Cargo target metadata plus a declaration-tree model for inline modules,
+`#[path]`, `cfg`, macros, and `mod` ambiguity; that remains future work.
+
+Node IDs are `<root-relative-path>@<xxh3-hex>`. Because a path may contain `@`,
+clients must split on the last delimiter (`rsplit`), not the first. With no
+`files` list the cached walk is the universe and may drive deletion from the
+index. A supplied `files` list is only a query view and revalidation set; it
+never removes other files from the shared per-root index.
+
+All eight operations share one `Request::Graph(GraphParams)` wire variant.
+`GraphOp` is externally tagged and the transport carries no protocol version,
+so an unknown operation tag makes an older daemon fail the request decode and
+drop the connection; adding an operation therefore requires upgrading and
+restarting the daemon before new clients use it. Compatibility is asymmetric: an old CLI continues to send its known
+requests to a new daemon, while a newer CLI whose daemon exchange fails falls
+back to the existing cold inline path.
+
 ## Cache coherence
 
 `trustCache` skips the per-hit freshness `stat` — where most of the warm-read
@@ -282,6 +385,17 @@ tree on disk, so it stays bounded by the cache's own entry cap.
 
 With `trustCache` off (the default), every warm hit still stats, and none of this
 is needed for correctness — only for latency.
+
+`InvalidationLog` is the bounded, revisioned journal for derived graph state.
+Watcher events, `invalidatePath`, non-recursive `invalidate`, and Hearth
+mutations record exact paths; root/recursive invalidation, `clearCaches`, and
+an unexpandable watcher event record a conservative wipe. Ring overflow does
+not record anything itself — it advances the eviction boundary so lagging
+consumers behind it receive a conservative full-discard signal. A
+graph sweep consumes entries since its saved revision and drops the matching
+stat records. A wipe makes it discard every stat record and revalidate the
+whole selected universe, so missing history cannot leave a stale graph entry
+trusted.
 
 ## Surfaces
 

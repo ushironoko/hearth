@@ -17,6 +17,16 @@ pub fn engine(cwd: &Path) -> Engine {
     })
 }
 
+/// As [`engine`], with recursive filesystem watching enabled.
+pub fn watching_engine(cwd: &Path) -> Engine {
+    Engine::new(EngineConfig {
+        default_cwd: cwd.to_path_buf(),
+        enable_optimizer: false,
+        enable_watch: true,
+        ..EngineConfig::default()
+    })
+}
+
 /// As [`engine`], with the `trustCache` fast path on.
 pub fn trusting_engine(cwd: &Path) -> Engine {
     Engine::new(EngineConfig {

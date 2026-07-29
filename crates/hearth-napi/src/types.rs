@@ -355,7 +355,10 @@ pub struct EditResult {
 
 impl From<proto::EditResult> for EditResult {
     fn from(r: proto::EditResult) -> Self {
-        Self { replacements: as_i64(r.replacements), byte_len: as_i64(r.byte_len) }
+        Self {
+            replacements: as_i64(r.replacements),
+            byte_len: as_i64(r.byte_len),
+        }
     }
 }
 
@@ -369,7 +372,10 @@ pub struct EditReplacement {
 
 impl From<EditReplacement> for proto::EditReplacement {
     fn from(e: EditReplacement) -> Self {
-        Self { old_text: e.old_text, new_text: e.new_text }
+        Self {
+            old_text: e.old_text,
+            new_text: e.new_text,
+        }
     }
 }
 
@@ -581,7 +587,11 @@ pub struct BashChunk {
 
 impl From<proto::BashChunk> for BashChunk {
     fn from(c: proto::BashChunk) -> Self {
-        Self { seq: as_i64(c.seq), channel: c.channel.into(), text: c.text }
+        Self {
+            seq: as_i64(c.seq),
+            channel: c.channel.into(),
+            text: c.text,
+        }
     }
 }
 
@@ -688,7 +698,11 @@ pub struct GrepLine {
 
 impl From<proto::GrepLine> for GrepLine {
     fn from(l: proto::GrepLine) -> Self {
-        Self { line_number: as_i64(l.line_number), text: l.text, is_match: l.is_match }
+        Self {
+            line_number: as_i64(l.line_number),
+            text: l.text,
+            is_match: l.is_match,
+        }
     }
 }
 
@@ -734,6 +748,738 @@ impl From<proto::GrepResult> for GrepResult {
             limit_reached: r.limit_reached,
             root: r.root,
             root_is_dir: r.root_is_dir,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// graph
+// ---------------------------------------------------------------------------
+
+#[napi(object)]
+pub struct GraphSymbolsParams {
+    pub root: String,
+    pub path: String,
+    pub hidden: Option<bool>,
+    pub respect_gitignore: Option<bool>,
+    pub follow_symlinks: Option<bool>,
+    pub files: Option<Vec<String>>,
+    pub max_stale_ms: Option<i64>,
+    pub include_basis: Option<bool>,
+}
+
+impl From<GraphSymbolsParams> for proto::GraphParams {
+    fn from(p: GraphSymbolsParams) -> Self {
+        Self {
+            root: p.root,
+            op: proto::GraphOp::Symbols { path: p.path },
+            hidden: p.hidden.unwrap_or(false),
+            respect_gitignore: p.respect_gitignore.unwrap_or(true),
+            follow_symlinks: p.follow_symlinks.unwrap_or(false),
+            files: p.files.unwrap_or_default(),
+            max_stale_ms: p.max_stale_ms.map(|v| v.max(0) as u64),
+            include_basis: p.include_basis.unwrap_or(false),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphOutlineParams {
+    pub root: String,
+    pub path: String,
+    pub hidden: Option<bool>,
+    pub respect_gitignore: Option<bool>,
+    pub follow_symlinks: Option<bool>,
+    pub files: Option<Vec<String>>,
+    pub max_stale_ms: Option<i64>,
+    pub include_basis: Option<bool>,
+}
+
+impl From<GraphOutlineParams> for proto::GraphParams {
+    fn from(p: GraphOutlineParams) -> Self {
+        Self {
+            root: p.root,
+            op: proto::GraphOp::Outline { path: p.path },
+            hidden: p.hidden.unwrap_or(false),
+            respect_gitignore: p.respect_gitignore.unwrap_or(true),
+            follow_symlinks: p.follow_symlinks.unwrap_or(false),
+            files: p.files.unwrap_or_default(),
+            max_stale_ms: p.max_stale_ms.map(|v| v.max(0) as u64),
+            include_basis: p.include_basis.unwrap_or(false),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphSearchParams {
+    pub root: String,
+    pub query: String,
+    pub limit: Option<i64>,
+    pub hidden: Option<bool>,
+    pub respect_gitignore: Option<bool>,
+    pub follow_symlinks: Option<bool>,
+    pub files: Option<Vec<String>>,
+    pub max_stale_ms: Option<i64>,
+    pub include_basis: Option<bool>,
+}
+
+impl From<GraphSearchParams> for proto::GraphParams {
+    fn from(p: GraphSearchParams) -> Self {
+        Self {
+            root: p.root,
+            op: proto::GraphOp::Search {
+                query: p.query,
+                // Mirrors the proto serde default.
+                limit: p.limit.map(|v| v.max(0) as u64).unwrap_or(200),
+            },
+            hidden: p.hidden.unwrap_or(false),
+            respect_gitignore: p.respect_gitignore.unwrap_or(true),
+            follow_symlinks: p.follow_symlinks.unwrap_or(false),
+            files: p.files.unwrap_or_default(),
+            max_stale_ms: p.max_stale_ms.map(|v| v.max(0) as u64),
+            include_basis: p.include_basis.unwrap_or(false),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphDefinitionsParams {
+    pub root: String,
+    pub name: String,
+    pub limit: Option<i64>,
+    pub hidden: Option<bool>,
+    pub respect_gitignore: Option<bool>,
+    pub follow_symlinks: Option<bool>,
+    pub files: Option<Vec<String>>,
+    pub max_stale_ms: Option<i64>,
+    pub include_basis: Option<bool>,
+}
+
+impl From<GraphDefinitionsParams> for proto::GraphParams {
+    fn from(p: GraphDefinitionsParams) -> Self {
+        Self {
+            root: p.root,
+            op: proto::GraphOp::Definitions {
+                name: p.name,
+                // Mirrors the proto serde default.
+                limit: p.limit.map(|v| v.max(0) as u64).unwrap_or(200),
+            },
+            hidden: p.hidden.unwrap_or(false),
+            respect_gitignore: p.respect_gitignore.unwrap_or(true),
+            follow_symlinks: p.follow_symlinks.unwrap_or(false),
+            files: p.files.unwrap_or_default(),
+            max_stale_ms: p.max_stale_ms.map(|v| v.max(0) as u64),
+            include_basis: p.include_basis.unwrap_or(false),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphDepsParams {
+    pub root: String,
+    pub path: String,
+    pub depth: Option<u32>,
+    pub hidden: Option<bool>,
+    pub respect_gitignore: Option<bool>,
+    pub follow_symlinks: Option<bool>,
+    pub files: Option<Vec<String>>,
+    pub max_stale_ms: Option<i64>,
+    pub include_basis: Option<bool>,
+}
+
+impl From<GraphDepsParams> for proto::GraphParams {
+    fn from(p: GraphDepsParams) -> Self {
+        Self {
+            root: p.root,
+            op: proto::GraphOp::Deps {
+                path: p.path,
+                // Mirrors the proto serde default.
+                depth: p.depth.unwrap_or(1),
+            },
+            hidden: p.hidden.unwrap_or(false),
+            respect_gitignore: p.respect_gitignore.unwrap_or(true),
+            follow_symlinks: p.follow_symlinks.unwrap_or(false),
+            files: p.files.unwrap_or_default(),
+            max_stale_ms: p.max_stale_ms.map(|v| v.max(0) as u64),
+            include_basis: p.include_basis.unwrap_or(false),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphRdepsParams {
+    pub root: String,
+    pub path: String,
+    pub depth: Option<u32>,
+    pub verify: Option<bool>,
+    pub hidden: Option<bool>,
+    pub respect_gitignore: Option<bool>,
+    pub follow_symlinks: Option<bool>,
+    pub files: Option<Vec<String>>,
+    pub max_stale_ms: Option<i64>,
+    pub include_basis: Option<bool>,
+}
+
+impl From<GraphRdepsParams> for proto::GraphParams {
+    fn from(p: GraphRdepsParams) -> Self {
+        Self {
+            root: p.root,
+            op: proto::GraphOp::Rdeps {
+                path: p.path,
+                // Mirrors the proto serde default.
+                depth: p.depth.unwrap_or(1),
+                verify: p.verify.unwrap_or(true),
+            },
+            hidden: p.hidden.unwrap_or(false),
+            respect_gitignore: p.respect_gitignore.unwrap_or(true),
+            follow_symlinks: p.follow_symlinks.unwrap_or(false),
+            files: p.files.unwrap_or_default(),
+            max_stale_ms: p.max_stale_ms.map(|v| v.max(0) as u64),
+            include_basis: p.include_basis.unwrap_or(false),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphNeighborhoodParams {
+    pub root: String,
+    pub path: String,
+    pub depth: Option<u32>,
+    pub hidden: Option<bool>,
+    pub respect_gitignore: Option<bool>,
+    pub follow_symlinks: Option<bool>,
+    pub files: Option<Vec<String>>,
+    pub max_stale_ms: Option<i64>,
+    pub include_basis: Option<bool>,
+}
+
+impl From<GraphNeighborhoodParams> for proto::GraphParams {
+    fn from(p: GraphNeighborhoodParams) -> Self {
+        Self {
+            root: p.root,
+            op: proto::GraphOp::Neighborhood {
+                path: p.path,
+                // Mirrors the proto serde default.
+                depth: p.depth.unwrap_or(1),
+            },
+            hidden: p.hidden.unwrap_or(false),
+            respect_gitignore: p.respect_gitignore.unwrap_or(true),
+            follow_symlinks: p.follow_symlinks.unwrap_or(false),
+            files: p.files.unwrap_or_default(),
+            max_stale_ms: p.max_stale_ms.map(|v| v.max(0) as u64),
+            include_basis: p.include_basis.unwrap_or(false),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphStatusParams {
+    pub root: String,
+    pub hidden: Option<bool>,
+    pub respect_gitignore: Option<bool>,
+    pub follow_symlinks: Option<bool>,
+    pub files: Option<Vec<String>>,
+    pub max_stale_ms: Option<i64>,
+    pub include_basis: Option<bool>,
+}
+
+impl From<GraphStatusParams> for proto::GraphParams {
+    fn from(p: GraphStatusParams) -> Self {
+        Self {
+            root: p.root,
+            op: proto::GraphOp::Status,
+            hidden: p.hidden.unwrap_or(false),
+            respect_gitignore: p.respect_gitignore.unwrap_or(true),
+            follow_symlinks: p.follow_symlinks.unwrap_or(false),
+            files: p.files.unwrap_or_default(),
+            max_stale_ms: p.max_stale_ms.map(|v| v.max(0) as u64),
+            include_basis: p.include_basis.unwrap_or(false),
+        }
+    }
+}
+
+#[napi(string_enum = "camelCase")]
+#[derive(Clone, Copy)]
+pub enum GraphGuarantee {
+    Exact,
+    Approximate,
+}
+
+impl From<proto::GraphGuarantee> for GraphGuarantee {
+    fn from(v: proto::GraphGuarantee) -> Self {
+        match v {
+            proto::GraphGuarantee::Exact => GraphGuarantee::Exact,
+            proto::GraphGuarantee::Approximate => GraphGuarantee::Approximate,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphMeta {
+    pub guarantee: GraphGuarantee,
+    pub root: String,
+    pub universe_files: i64,
+    pub indexed_files: i64,
+    pub unsupported_files: i64,
+    pub oversize_files: i64,
+    pub revalidated_files: i64,
+    pub reindexed_files: i64,
+    pub swept: bool,
+    pub sweep_age_ms: i64,
+    pub walk_cache_hit: bool,
+    pub repair_truncated: bool,
+}
+
+impl From<proto::GraphMeta> for GraphMeta {
+    fn from(m: proto::GraphMeta) -> Self {
+        Self {
+            guarantee: m.guarantee.into(),
+            root: m.root,
+            universe_files: as_i64(m.universe_files),
+            indexed_files: as_i64(m.indexed_files),
+            unsupported_files: as_i64(m.unsupported_files),
+            oversize_files: as_i64(m.oversize_files),
+            revalidated_files: as_i64(m.revalidated_files),
+            reindexed_files: as_i64(m.reindexed_files),
+            swept: m.swept,
+            sweep_age_ms: as_i64(m.sweep_age_ms),
+            walk_cache_hit: m.walk_cache_hit,
+            repair_truncated: m.repair_truncated,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphSymbol {
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub node_id: String,
+    pub line: i64,
+    pub column: i64,
+    pub end_line: Option<i64>,
+    pub end_column: Option<i64>,
+    pub start_byte: Option<i64>,
+    pub end_byte: Option<i64>,
+    pub depth: u32,
+}
+
+impl From<proto::GraphSymbol> for GraphSymbol {
+    fn from(s: proto::GraphSymbol) -> Self {
+        Self {
+            name: s.name,
+            kind: s.kind,
+            path: s.path,
+            node_id: s.node_id,
+            line: as_i64(s.line),
+            column: as_i64(s.column),
+            end_line: s.end_line.map(as_i64),
+            end_column: s.end_column.map(as_i64),
+            start_byte: s.start_byte.map(as_i64),
+            end_byte: s.end_byte.map(as_i64),
+            depth: s.depth,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphNode {
+    pub path: String,
+    pub node_id: String,
+    pub language: Option<String>,
+    pub indexed: bool,
+}
+
+impl From<proto::GraphNode> for GraphNode {
+    fn from(n: proto::GraphNode) -> Self {
+        Self {
+            path: n.path,
+            node_id: n.node_id,
+            language: n.language,
+            indexed: n.indexed,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphDepEdge {
+    pub from: String,
+    pub to: String,
+    pub specifier: String,
+    pub kind: String,
+    pub line: i64,
+    pub guarantee: GraphGuarantee,
+}
+
+impl From<proto::GraphDepEdge> for GraphDepEdge {
+    fn from(e: proto::GraphDepEdge) -> Self {
+        Self {
+            from: e.from,
+            to: e.to,
+            specifier: e.specifier,
+            kind: e.kind,
+            line: as_i64(e.line),
+            guarantee: e.guarantee.into(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphUnresolvedImport {
+    pub specifier: String,
+    pub line: i64,
+    pub reason: String,
+}
+
+impl From<proto::GraphUnresolvedImport> for GraphUnresolvedImport {
+    fn from(i: proto::GraphUnresolvedImport) -> Self {
+        Self {
+            specifier: i.specifier,
+            line: as_i64(i.line),
+            reason: i.reason,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphRdepEntry {
+    pub node: GraphNode,
+    pub specifier: Option<String>,
+    pub line: i64,
+    pub guarantee: GraphGuarantee,
+}
+
+impl From<proto::GraphRdepEntry> for GraphRdepEntry {
+    fn from(e: proto::GraphRdepEntry) -> Self {
+        Self {
+            node: e.node.into(),
+            specifier: e.specifier,
+            line: as_i64(e.line),
+            guarantee: e.guarantee.into(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphBasisEntry {
+    pub path: String,
+    pub content_hash_hex: String,
+}
+
+impl From<proto::GraphBasisEntry> for GraphBasisEntry {
+    fn from(e: proto::GraphBasisEntry) -> Self {
+        Self {
+            path: e.path,
+            content_hash_hex: e.content_hash_hex,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphCoverage {
+    pub analyzed: i64,
+    pub stubs: i64,
+    pub basis: Vec<GraphBasisEntry>,
+}
+
+impl From<proto::GraphCoverage> for GraphCoverage {
+    fn from(c: proto::GraphCoverage) -> Self {
+        Self {
+            analyzed: as_i64(c.analyzed),
+            stubs: as_i64(c.stubs),
+            basis: c.basis.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphSymbolsResult {
+    pub path: String,
+    pub node_id: String,
+    pub symbols: Vec<GraphSymbol>,
+    pub truncated: bool,
+}
+
+impl From<proto::GraphSymbolsResult> for GraphSymbolsResult {
+    fn from(r: proto::GraphSymbolsResult) -> Self {
+        Self {
+            path: r.path,
+            node_id: r.node_id,
+            symbols: r.symbols.into_iter().map(Into::into).collect(),
+            truncated: r.truncated,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphOutlineResult {
+    pub path: String,
+    pub node_id: String,
+    pub symbols: Vec<GraphSymbol>,
+    pub truncated: bool,
+}
+
+impl From<proto::GraphOutlineResult> for GraphOutlineResult {
+    fn from(r: proto::GraphOutlineResult) -> Self {
+        Self {
+            path: r.path,
+            node_id: r.node_id,
+            symbols: r.symbols.into_iter().map(Into::into).collect(),
+            truncated: r.truncated,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphSearchResult {
+    pub symbols: Vec<GraphSymbol>,
+    pub limit_reached: bool,
+}
+
+impl From<proto::GraphSearchResult> for GraphSearchResult {
+    fn from(r: proto::GraphSearchResult) -> Self {
+        Self {
+            symbols: r.symbols.into_iter().map(Into::into).collect(),
+            limit_reached: r.limit_reached,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphDefinitionsResult {
+    pub symbols: Vec<GraphSymbol>,
+    pub limit_reached: bool,
+}
+
+impl From<proto::GraphDefinitionsResult> for GraphDefinitionsResult {
+    fn from(r: proto::GraphDefinitionsResult) -> Self {
+        Self {
+            symbols: r.symbols.into_iter().map(Into::into).collect(),
+            limit_reached: r.limit_reached,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphDepsResult {
+    pub node: GraphNode,
+    pub edges: Vec<GraphDepEdge>,
+    pub unresolved: Vec<GraphUnresolvedImport>,
+    pub coverage: GraphCoverage,
+}
+
+impl From<proto::GraphDepsResult> for GraphDepsResult {
+    fn from(r: proto::GraphDepsResult) -> Self {
+        Self {
+            node: r.node.into(),
+            edges: r.edges.into_iter().map(Into::into).collect(),
+            unresolved: r.unresolved.into_iter().map(Into::into).collect(),
+            coverage: r.coverage.into(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphRdepsResult {
+    pub node: GraphNode,
+    pub importers: Vec<GraphRdepEntry>,
+    pub verified: bool,
+    pub coverage: GraphCoverage,
+}
+
+impl From<proto::GraphRdepsResult> for GraphRdepsResult {
+    fn from(r: proto::GraphRdepsResult) -> Self {
+        Self {
+            node: r.node.into(),
+            importers: r.importers.into_iter().map(Into::into).collect(),
+            verified: r.verified,
+            coverage: r.coverage.into(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphNeighborhoodResult {
+    pub center: GraphNode,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphDepEdge>,
+    pub coverage: GraphCoverage,
+}
+
+impl From<proto::GraphNeighborhoodResult> for GraphNeighborhoodResult {
+    fn from(r: proto::GraphNeighborhoodResult) -> Self {
+        Self {
+            center: r.center.into(),
+            nodes: r.nodes.into_iter().map(Into::into).collect(),
+            edges: r.edges.into_iter().map(Into::into).collect(),
+            coverage: r.coverage.into(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphLanguageStatus {
+    pub language: String,
+    pub files: i64,
+    pub symbols: i64,
+}
+
+impl From<proto::GraphLanguageStatus> for GraphLanguageStatus {
+    fn from(s: proto::GraphLanguageStatus) -> Self {
+        Self {
+            language: s.language,
+            files: as_i64(s.files),
+            symbols: as_i64(s.symbols),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct GraphStatusResult {
+    pub built: bool,
+    pub building: bool,
+    pub universe_files: i64,
+    pub indexed_files: i64,
+    pub unsupported_files: i64,
+    pub oversize_files: i64,
+    pub pending_files: i64,
+    pub stale_files: i64,
+    pub failed_files: i64,
+    pub symbols: i64,
+    pub edges: i64,
+    pub components: i64,
+    pub languages: Vec<GraphLanguageStatus>,
+    pub last_sweep_ms_ago: Option<i64>,
+    pub build_duration_us: Option<i64>,
+}
+
+impl From<proto::GraphStatusResult> for GraphStatusResult {
+    fn from(r: proto::GraphStatusResult) -> Self {
+        Self {
+            built: r.built,
+            building: r.building,
+            universe_files: as_i64(r.universe_files),
+            indexed_files: as_i64(r.indexed_files),
+            unsupported_files: as_i64(r.unsupported_files),
+            oversize_files: as_i64(r.oversize_files),
+            pending_files: as_i64(r.pending_files),
+            stale_files: as_i64(r.stale_files),
+            failed_files: as_i64(r.failed_files),
+            symbols: as_i64(r.symbols),
+            edges: as_i64(r.edges),
+            components: as_i64(r.components),
+            languages: r.languages.into_iter().map(Into::into).collect(),
+            last_sweep_ms_ago: r.last_sweep_ms_ago.map(as_i64),
+            build_duration_us: r.build_duration_us.map(as_i64),
+        }
+    }
+}
+
+/// Exactly one output field is set, matching the requested graph operation.
+#[napi(object)]
+pub struct GraphResult {
+    pub meta: GraphMeta,
+    pub symbols: Option<GraphSymbolsResult>,
+    pub outline: Option<GraphOutlineResult>,
+    pub search: Option<GraphSearchResult>,
+    pub definitions: Option<GraphDefinitionsResult>,
+    pub deps: Option<GraphDepsResult>,
+    pub rdeps: Option<GraphRdepsResult>,
+    pub neighborhood: Option<GraphNeighborhoodResult>,
+    pub status: Option<GraphStatusResult>,
+}
+
+impl From<proto::GraphResult> for GraphResult {
+    fn from(r: proto::GraphResult) -> Self {
+        match r.output {
+            proto::GraphOutput::Symbols(output) => Self {
+                meta: r.meta.into(),
+                symbols: Some(output.into()),
+                outline: None,
+                search: None,
+                definitions: None,
+                deps: None,
+                rdeps: None,
+                neighborhood: None,
+                status: None,
+            },
+            proto::GraphOutput::Outline(output) => Self {
+                meta: r.meta.into(),
+                symbols: None,
+                outline: Some(output.into()),
+                search: None,
+                definitions: None,
+                deps: None,
+                rdeps: None,
+                neighborhood: None,
+                status: None,
+            },
+            proto::GraphOutput::Search(output) => Self {
+                meta: r.meta.into(),
+                symbols: None,
+                outline: None,
+                search: Some(output.into()),
+                definitions: None,
+                deps: None,
+                rdeps: None,
+                neighborhood: None,
+                status: None,
+            },
+            proto::GraphOutput::Definitions(output) => Self {
+                meta: r.meta.into(),
+                symbols: None,
+                outline: None,
+                search: None,
+                definitions: Some(output.into()),
+                deps: None,
+                rdeps: None,
+                neighborhood: None,
+                status: None,
+            },
+            proto::GraphOutput::Deps(output) => Self {
+                meta: r.meta.into(),
+                symbols: None,
+                outline: None,
+                search: None,
+                definitions: None,
+                deps: Some(output.into()),
+                rdeps: None,
+                neighborhood: None,
+                status: None,
+            },
+            proto::GraphOutput::Rdeps(output) => Self {
+                meta: r.meta.into(),
+                symbols: None,
+                outline: None,
+                search: None,
+                definitions: None,
+                deps: None,
+                rdeps: Some(output.into()),
+                neighborhood: None,
+                status: None,
+            },
+            proto::GraphOutput::Neighborhood(output) => Self {
+                meta: r.meta.into(),
+                symbols: None,
+                outline: None,
+                search: None,
+                definitions: None,
+                deps: None,
+                rdeps: None,
+                neighborhood: Some(output.into()),
+                status: None,
+            },
+            proto::GraphOutput::Status(output) => Self {
+                meta: r.meta.into(),
+                symbols: None,
+                outline: None,
+                search: None,
+                definitions: None,
+                deps: None,
+                rdeps: None,
+                neighborhood: None,
+                status: Some(output.into()),
+            },
         }
     }
 }
