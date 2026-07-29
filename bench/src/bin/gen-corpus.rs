@@ -12,7 +12,9 @@ use std::process::Command;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let dir = args.next().expect("usage: gen-corpus <dir> [num_files] [dirs] [lines]");
+    let dir = args
+        .next()
+        .expect("usage: gen-corpus <dir> [num_files] [dirs] [lines]");
     let num_files: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(2000);
     let dirs: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(32);
     let lines: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(200);
@@ -41,7 +43,11 @@ fn main() {
         let d = root.join(sub);
         std::fs::create_dir_all(&d).unwrap();
         for i in 0..300 {
-            std::fs::write(d.join(format!("junk{i:04}.rs")), hearth_bench::file_text(i as u64, 80)).unwrap();
+            std::fs::write(
+                d.join(format!("junk{i:04}.rs")),
+                hearth_bench::file_text(i as u64, 80),
+            )
+            .unwrap();
         }
     }
     for i in 0..200 {
@@ -49,9 +55,16 @@ fn main() {
     }
 
     // Make it a real git repo so .gitignore is honored exactly as in a real project.
-    let _ = Command::new("git").arg("init").arg("-q").current_dir(root).status();
+    let _ = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(root)
+        .status();
 
-    let bytes: u64 = paths.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+    let bytes: u64 = paths
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
     eprintln!("generated {num_files} tracked files ({dirs} dirs) + BIG.rs + binary + hidden");
     eprintln!("plus ~900 git-ignored files (target/node_modules/dist) + 200 *.log to be skipped");
     eprintln!("tracked corpus bytes: {bytes}");

@@ -71,9 +71,18 @@ impl Profiler {
     pub fn span(&self, name: &'static str) -> ProfileGuard<'_> {
         if self.is_enabled() {
             let _pause = allocation::pause_tracking();
-            STACK.with(|s| s.borrow_mut().push(Frame { start: Instant::now(), child: Duration::ZERO }));
+            STACK.with(|s| {
+                s.borrow_mut().push(Frame {
+                    start: Instant::now(),
+                    child: Duration::ZERO,
+                })
+            });
         }
-        ProfileGuard { profiler: self, name, active: self.is_enabled() }
+        ProfileGuard {
+            profiler: self,
+            name,
+            active: self.is_enabled(),
+        }
     }
 
     /// Record a raw duration sample for `name`.

@@ -7,7 +7,14 @@ use hearth_proto::*;
 use hearth_tools::{bash, edit, grep, read, write};
 
 fn run(eng: &hearth_core::Engine, command: &str, timeout_ms: Option<u64>) -> BashResult {
-    bash(eng, &BashParams { timeout_ms, ..BashParams::new(command) }).unwrap()
+    bash(
+        eng,
+        &BashParams {
+            timeout_ms,
+            ..BashParams::new(command)
+        },
+    )
+    .unwrap()
 }
 
 #[test]
@@ -33,11 +40,20 @@ fn read_window_and_line_numbers() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
     let path = abs(dir.path(), "n.txt");
-    write(&eng, &WriteParams::new(path.clone(), "l1\nl2\nl3\nl4\nl5\n")).unwrap();
+    write(
+        &eng,
+        &WriteParams::new(path.clone(), "l1\nl2\nl3\nl4\nl5\n"),
+    )
+    .unwrap();
 
     let r = read(
         &eng,
-        &ReadParams { offset: Some(2), limit: Some(2), line_numbers: true, ..ReadParams::new(&path) },
+        &ReadParams {
+            offset: Some(2),
+            limit: Some(2),
+            line_numbers: true,
+            ..ReadParams::new(&path)
+        },
     )
     .unwrap();
     assert!(r.truncated);
@@ -87,22 +103,48 @@ fn edit_unique_and_replace_all() {
 fn grep_content_and_files() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    write(&eng, &WriteParams::new(abs(dir.path(), "x.rs"), "fn main() {}\nlet x = 1;\n")).unwrap();
-    write(&eng, &WriteParams::new(abs(dir.path(), "y.rs"), "fn helper() {}\n")).unwrap();
-    write(&eng, &WriteParams::new(abs(dir.path(), "z.txt"), "no functions here\n")).unwrap();
+    write(
+        &eng,
+        &WriteParams::new(abs(dir.path(), "x.rs"), "fn main() {}\nlet x = 1;\n"),
+    )
+    .unwrap();
+    write(
+        &eng,
+        &WriteParams::new(abs(dir.path(), "y.rs"), "fn helper() {}\n"),
+    )
+    .unwrap();
+    write(
+        &eng,
+        &WriteParams::new(abs(dir.path(), "z.txt"), "no functions here\n"),
+    )
+    .unwrap();
 
     let base = GrepParams {
         globs: vec!["*.rs".into()],
         ..GrepParams::new("fn ", dir.path().display().to_string())
     };
 
-    let g = grep(&eng, &GrepParams { mode: GrepMode::Content, ..base.clone() }).unwrap();
+    let g = grep(
+        &eng,
+        &GrepParams {
+            mode: GrepMode::Content,
+            ..base.clone()
+        },
+    )
+    .unwrap();
     assert_eq!(g.total_matches, 2);
     assert_eq!(g.files.len(), 2);
     assert!(g.root_is_dir);
 
     // Second grep over the same tree → warm walk cache hit.
-    let g2 = grep(&eng, &GrepParams { mode: GrepMode::FilesWithMatches, ..base }).unwrap();
+    let g2 = grep(
+        &eng,
+        &GrepParams {
+            mode: GrepMode::FilesWithMatches,
+            ..base
+        },
+    )
+    .unwrap();
     assert!(g2.walk_cache_hit, "second grep should reuse the walk cache");
     assert_eq!(g2.files.len(), 2);
 }
@@ -137,7 +179,10 @@ fn trust_cache_stays_coherent_for_self_writes() {
     // Overwrite through Hearth → still coherent.
     write(
         &eng,
-        &WriteParams { create_dirs: false, ..WriteParams::new(path.clone(), "three\n") },
+        &WriteParams {
+            create_dirs: false,
+            ..WriteParams::new(path.clone(), "three\n")
+        },
     )
     .unwrap();
     let r3 = read(&eng, &ReadParams::new(path.clone())).unwrap();
@@ -171,7 +216,11 @@ fn warm_shell_correctness() {
     // 5. cwd isolation across calls (subshell must not leak cwd)
     run(&eng, "cd /tmp", None);
     let r = run(&eng, "pwd", None);
-    assert_ne!(r.stdout.trim(), "/tmp", "cwd must not leak between warm-shell commands");
+    assert_ne!(
+        r.stdout.trim(),
+        "/tmp",
+        "cwd must not leak between warm-shell commands"
+    );
 
     // 6. large output
     let r = run(&eng, "seq 200000", None);
@@ -200,7 +249,10 @@ fn warm_shell_incomplete_command_fast_fail() {
     let start = std::time::Instant::now();
     let r = run(&eng, "echo \"foo", Some(5000));
     assert!(!r.timed_out, "incomplete command must NOT hit the timeout");
-    assert_ne!(r.exit_code, 0, "incomplete command must fail with a non-zero exit");
+    assert_ne!(
+        r.exit_code, 0,
+        "incomplete command must fail with a non-zero exit"
+    );
     assert!(
         start.elapsed() < std::time::Duration::from_millis(2000),
         "incomplete command must fail fast, well under the 5s timeout"

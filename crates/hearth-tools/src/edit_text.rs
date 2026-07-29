@@ -73,9 +73,22 @@ pub fn restore_line_endings(text: &str, crlf: bool) -> String {
 fn is_js_whitespace(c: char) -> bool {
     matches!(
         c,
-        '\u{0009}' | '\u{000A}' | '\u{000B}' | '\u{000C}' | '\u{000D}' | '\u{0020}'
-            | '\u{00A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}'
-            | '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}'
+        '\u{0009}'
+            | '\u{000A}'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
     )
 }
 
@@ -135,7 +148,8 @@ pub fn normalize_for_fuzzy_match(text: &str) -> String {
 
 /// Whether any line ends in whitespace this normalization would trim.
 fn has_trailing_line_whitespace(text: &str) -> bool {
-    text.split('\n').any(|line| line.ends_with(is_js_whitespace))
+    text.split('\n')
+        .any(|line| line.ends_with(is_js_whitespace))
 }
 
 /// [`normalize_for_fuzzy_match`], borrowing when normalization is a no-op.
@@ -169,11 +183,17 @@ fn find_text(
     normalized_old: &str,
 ) -> Option<Match> {
     if let Some(index) = content.find(old) {
-        return Some(Match { index, length: old.len(), used_fallback: false });
+        return Some(Match {
+            index,
+            length: old.len(),
+            used_fallback: false,
+        });
     }
-    normalized_content
-        .find(normalized_old)
-        .map(|index| Match { index, length: normalized_old.len(), used_fallback: true })
+    normalized_content.find(normalized_old).map(|index| Match {
+        index,
+        length: normalized_old.len(),
+        used_fallback: true,
+    })
 }
 
 /// How many times `old` occurs, always compared in normalized space so two
@@ -232,7 +252,9 @@ fn replacement_line_range(spans: &[(usize, usize)], r: &Resolved) -> ToolResult<
         end_line += 1;
     }
     if end_line >= spans.len() {
-        return Err(ToolError::internal("replacement range is outside the base content"));
+        return Err(ToolError::internal(
+            "replacement range is outside the base content",
+        ));
     }
     Ok((start_line, end_line + 1))
 }
@@ -274,7 +296,11 @@ fn apply_preserving_unchanged_lines(
                 current.end_line = current.end_line.max(end_line);
                 current.replacements.push(i);
             }
-            _ => groups.push(Group { start_line, end_line, replacements: vec![i] }),
+            _ => groups.push(Group {
+                start_line,
+                end_line,
+                replacements: vec![i],
+            }),
         }
     }
 
@@ -286,8 +312,16 @@ fn apply_preserving_unchanged_lines(
         }
         let start_offset = base_spans[group.start_line].0;
         let end_offset = base_spans[group.end_line - 1].1;
-        let members: Vec<&Resolved> = group.replacements.iter().map(|&i| &replacements[i]).collect();
-        out.push_str(&apply_replacements(&base[start_offset..end_offset], &members, start_offset));
+        let members: Vec<&Resolved> = group
+            .replacements
+            .iter()
+            .map(|&i| &replacements[i])
+            .collect();
+        out.push_str(&apply_replacements(
+            &base[start_offset..end_offset],
+            &members,
+            start_offset,
+        ));
         line_cursor = group.end_line;
     }
     for line in &original_lines[line_cursor..] {
@@ -330,7 +364,9 @@ pub fn apply_edits_opts(
     whitespace_policy: WhitespaceOnlyTargetPolicy,
 ) -> ToolResult<AppliedEdits> {
     if edits.is_empty() {
-        return Err(ToolError::invalid("edits must contain at least one replacement"));
+        return Err(ToolError::invalid(
+            "edits must contain at least one replacement",
+        ));
     }
 
     let normalized: Vec<(Cow<'_, str>, Cow<'_, str>)> = edits
@@ -377,12 +413,16 @@ pub fn apply_edits_opts(
 
     // If any edit needs the fallback, every edit is resolved in normalized
     // space so all offsets share one coordinate system.
-    let used_fallback = normalized.iter().zip(&normalized_olds).any(|((old, _), normalized_old)| {
-        matches!(
-            find_text(content, &normalized_content, old, normalized_old),
-            Some(m) if m.used_fallback
-        )
-    });
+    let used_fallback =
+        normalized
+            .iter()
+            .zip(&normalized_olds)
+            .any(|((old, _), normalized_old)| {
+                matches!(
+                    find_text(content, &normalized_content, old, normalized_old),
+                    Some(m) if m.used_fallback
+                )
+            });
 
     // A whitespace-only span vanishes in normalized space, where an empty
     // pattern would "match" at offset 0 and turn the replacement into an
@@ -391,13 +431,20 @@ pub fn apply_edits_opts(
     // base, so no companion edit can resolve, let alone through the fallback),
     // but the invariant must hold even if normalization rules evolve.
     if used_fallback && has_whitespace_only {
-        let index = normalized_olds.iter().position(String::is_empty).unwrap_or(0);
+        let index = normalized_olds
+            .iter()
+            .position(String::is_empty)
+            .unwrap_or(0);
         return Err(ToolError::invalid(
             "a whitespace-only oldText cannot be combined with edits that need the normalized fallback",
         )
         .with_edit_index(index));
     }
-    let base_for_matching: &str = if used_fallback { &normalized_content } else { content };
+    let base_for_matching: &str = if used_fallback {
+        &normalized_content
+    } else {
+        content
+    };
 
     let mut resolved: Vec<Resolved> = Vec::with_capacity(normalized.len());
     for (i, ((old, new), normalized_old)) in normalized.iter().zip(&normalized_olds).enumerate() {
@@ -454,7 +501,10 @@ pub fn apply_edits_opts(
         ));
     }
 
-    Ok(AppliedEdits { new_content, used_fallback })
+    Ok(AppliedEdits {
+        new_content,
+        used_fallback,
+    })
 }
 
 /// The changed regions of `old` → `new`, with `context` unchanged lines kept
@@ -515,7 +565,10 @@ mod tests {
     use super::*;
 
     fn edit(old: &str, new: &str) -> EditReplacement {
-        EditReplacement { old_text: old.into(), new_text: new.into() }
+        EditReplacement {
+            old_text: old.into(),
+            new_text: new.into(),
+        }
     }
 
     #[test]
@@ -597,35 +650,54 @@ mod tests {
     #[test]
     fn exact_file_policy_allows_a_whole_file_whitespace_target() {
         // The issue's motivating case: a file containing exactly three spaces.
-        let out = apply_edits_opts("   ", &[edit("   ", "x")], WhitespaceOnlyTargetPolicy::ExactFile)
-            .unwrap();
+        let out = apply_edits_opts(
+            "   ",
+            &[edit("   ", "x")],
+            WhitespaceOnlyTargetPolicy::ExactFile,
+        )
+        .unwrap();
         assert_eq!(out.new_content, "x");
         assert!(!out.used_fallback);
 
         // Any is_js_whitespace mix works, as long as it equals the whole file.
-        let out =
-            apply_edits_opts("\t \u{00A0}", &[edit("\t \u{00A0}", "y")], WhitespaceOnlyTargetPolicy::ExactFile)
-                .unwrap();
+        let out = apply_edits_opts(
+            "\t \u{00A0}",
+            &[edit("\t \u{00A0}", "y")],
+            WhitespaceOnlyTargetPolicy::ExactFile,
+        )
+        .unwrap();
         assert_eq!(out.new_content, "y");
     }
 
     #[test]
     fn exact_file_policy_keeps_empty_invalid_and_partial_whitespace_no_match() {
         // Empty oldText stays invalid regardless of policy.
-        let err = apply_edits_opts("a\n", &[edit("", "x")], WhitespaceOnlyTargetPolicy::ExactFile)
-            .unwrap_err();
+        let err = apply_edits_opts(
+            "a\n",
+            &[edit("", "x")],
+            WhitespaceOnlyTargetPolicy::ExactFile,
+        )
+        .unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidInput);
 
         // A whitespace target that is not the whole file is NoMatch — never a
         // positional guess inside the file.
-        let err = apply_edits_opts("a   b\n", &[edit("   ", "x")], WhitespaceOnlyTargetPolicy::ExactFile)
-            .unwrap_err();
+        let err = apply_edits_opts(
+            "a   b\n",
+            &[edit("   ", "x")],
+            WhitespaceOnlyTargetPolicy::ExactFile,
+        )
+        .unwrap_err();
         assert_eq!(err.kind, ErrorKind::NoMatch);
         assert_eq!(err.edit_index, Some(0));
 
         // Identical replacement of the whole file is still NoChange.
-        let err = apply_edits_opts("   ", &[edit("   ", "   ")], WhitespaceOnlyTargetPolicy::ExactFile)
-            .unwrap_err();
+        let err = apply_edits_opts(
+            "   ",
+            &[edit("   ", "   ")],
+            WhitespaceOnlyTargetPolicy::ExactFile,
+        )
+        .unwrap_err();
         assert_eq!(err.kind, ErrorKind::NoChange);
     }
 
@@ -654,8 +726,16 @@ mod tests {
         assert_eq!(hunks.len(), 1);
         let h = &hunks[0];
         assert_eq!(h.old_start, 5);
-        assert!(h.rows.iter().any(|r| r.op == DiffOp::Insert && r.text == "SEVEN"));
-        assert!(h.rows.iter().any(|r| r.op == DiffOp::Delete && r.text == "7"));
+        assert!(
+            h.rows
+                .iter()
+                .any(|r| r.op == DiffOp::Insert && r.text == "SEVEN")
+        );
+        assert!(
+            h.rows
+                .iter()
+                .any(|r| r.op == DiffOp::Delete && r.text == "7")
+        );
         // Far-away context is not carried.
         assert!(!h.rows.iter().any(|r| r.text == "1"));
     }

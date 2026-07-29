@@ -13,8 +13,8 @@
 //! [`ErrorKind::Cancelled`]: hearth_proto::ErrorKind::Cancelled
 
 use hearth_proto::{ToolError, ToolResult};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A cheap-to-clone cancellation latch.
 #[derive(Debug, Clone, Default)]

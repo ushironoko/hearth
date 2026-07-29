@@ -40,7 +40,10 @@ fn the_two_line_modes_differ_only_around_newlines() {
     // because joining the trailing empty element puts the newline back.
     let split = read(
         &eng,
-        &ReadParams { line_mode: LineWindowMode::SplitLines, ..ReadParams::new(&path) },
+        &ReadParams {
+            line_mode: LineWindowMode::SplitLines,
+            ..ReadParams::new(&path)
+        },
     )
     .unwrap();
     assert_eq!(split.total_lines, 4);
@@ -59,9 +62,14 @@ fn a_file_without_a_trailing_newline_counts_the_same_in_both_modes() {
     let path = seed(dir.path(), "bare.txt", "a\nb");
 
     let slice = read(&eng, &ReadParams::new(&path)).unwrap();
-    let split =
-        read(&eng, &ReadParams { line_mode: LineWindowMode::SplitLines, ..ReadParams::new(&path) })
-            .unwrap();
+    let split = read(
+        &eng,
+        &ReadParams {
+            line_mode: LineWindowMode::SplitLines,
+            ..ReadParams::new(&path)
+        },
+    )
+    .unwrap();
     assert_eq!(slice.total_lines, 2);
     assert_eq!(split.total_lines, 2);
     assert!(!slice.ends_with_newline);
@@ -81,7 +89,10 @@ fn an_offset_past_the_end_is_an_error_and_a_limit_past_it_is_not() {
     let clipped = read(&eng, &windowed(&path, 2, 99, LineWindowMode::Slice)).unwrap();
     assert_eq!(clipped.content, "b\n");
     assert_eq!(clipped.returned_lines, 1);
-    assert!(clipped.truncated, "starting past line 1 counts as truncated");
+    assert!(
+        clipped.truncated,
+        "starting past line 1 counts as truncated"
+    );
 }
 
 #[test]
@@ -106,7 +117,10 @@ fn binary_content_is_flagged_and_readable_as_bytes() {
 
     let r = read(&eng, &ReadParams::new(&path)).unwrap();
     assert!(r.binary);
-    assert!(r.content.is_empty(), "binary content is not guessed at as text");
+    assert!(
+        r.content.is_empty(),
+        "binary content is not guessed at as text"
+    );
     assert_eq!(r.byte_len, 5);
 
     assert_eq!(read_bytes(&eng, &ReadParams::new(&path)).unwrap(), bytes);
@@ -121,14 +135,21 @@ fn a_pre_aborted_read_rejects_without_touching_the_cache() {
     cancel.cancel();
 
     assert_eq!(
-        read_cancellable(&eng, &ReadParams::new(&path), &cancel).unwrap_err().kind,
+        read_cancellable(&eng, &ReadParams::new(&path), &cancel)
+            .unwrap_err()
+            .kind,
         ErrorKind::Cancelled
     );
     assert_eq!(
-        read_bytes_cancellable(&eng, &ReadParams::new(&path), &cancel).unwrap_err().kind,
+        read_bytes_cancellable(&eng, &ReadParams::new(&path), &cancel)
+            .unwrap_err()
+            .kind,
         ErrorKind::Cancelled
     );
-    assert!(eng.files().is_empty(), "an aborted read must not warm the cache");
+    assert!(
+        eng.files().is_empty(),
+        "an aborted read must not warm the cache"
+    );
 }
 
 // -- write -----------------------------------------------------------------
@@ -152,7 +173,10 @@ fn write_creates_parents_overwrites_and_handles_empty_content() {
     let deeper = abs(dir.path(), "x/y/z.txt");
     let err = write(
         &eng,
-        &WriteParams { create_dirs: false, ..WriteParams::new(&deeper, "nope") },
+        &WriteParams {
+            create_dirs: false,
+            ..WriteParams::new(&deeper, "nope")
+        },
     )
     .unwrap_err();
     assert_eq!(err.kind, ErrorKind::NotFound);
@@ -169,7 +193,11 @@ fn the_atomic_mode_replaces_the_inode_but_carries_the_mode_across() {
     write(&eng, &WriteParams::new(&path, "#!/bin/sh\necho hi\n")).unwrap();
 
     let after = std::fs::metadata(&path).unwrap();
-    assert_ne!(before.ino(), after.ino(), "an atomic write is a rename over the target");
+    assert_ne!(
+        before.ino(),
+        after.ino(),
+        "an atomic write is a rename over the target"
+    );
     assert_eq!(
         after.permissions().mode() & 0o777,
         0o755,
@@ -188,12 +216,19 @@ fn the_in_place_mode_keeps_the_inode_and_every_hardlink() {
 
     write(
         &eng,
-        &WriteParams { mode: WriteMode::InPlace, ..WriteParams::new(&path, "after\n") },
+        &WriteParams {
+            mode: WriteMode::InPlace,
+            ..WriteParams::new(&path, "after\n")
+        },
     )
     .unwrap();
 
     let after = std::fs::metadata(&path).unwrap();
-    assert_eq!(before.ino(), after.ino(), "an in-place write rewrites the same inode");
+    assert_eq!(
+        before.ino(),
+        after.ino(),
+        "an in-place write rewrites the same inode"
+    );
     assert_eq!(
         std::fs::read_to_string(&hardlink).unwrap(),
         "after\n",
@@ -217,7 +252,12 @@ fn writing_through_a_symlink_does_not_replace_the_link() {
 
     let r = write(&eng, &WriteParams::new(link.display().to_string(), "new\n")).unwrap();
     assert!(r.followed_symlink);
-    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
 
     // Opting out replaces the link with a regular file, as asked.
@@ -230,7 +270,12 @@ fn writing_through_a_symlink_does_not_replace_the_link() {
     )
     .unwrap();
     assert!(!r.followed_symlink);
-    assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(
+        !std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
 }
 
@@ -243,8 +288,9 @@ fn concurrent_writes_to_one_path_are_serialized_and_never_interleave() {
 
     // Every writer writes a distinct, uniform body. Serialization means a reader
     // can only ever observe one writer's body, never a mix of two.
-    let bodies: Vec<String> =
-        ('a'..='h').map(|c| std::iter::repeat_n(c, 200_000).collect()).collect();
+    let bodies: Vec<String> = ('a'..='h')
+        .map(|c| std::iter::repeat_n(c, 200_000).collect())
+        .collect();
     std::thread::scope(|scope| {
         for body in &bodies {
             let (eng, path) = (&eng, &path);

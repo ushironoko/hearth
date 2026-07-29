@@ -65,7 +65,11 @@ impl PathLocks {
             Arc::clone(map.entry(key.clone()).or_default())
         };
         let guard = entry.lock_arc();
-        PathGuard { locks: Arc::clone(self), key, guard: Some(guard) }
+        PathGuard {
+            locks: Arc::clone(self),
+            key,
+            guard: Some(guard),
+        }
     }
 
     /// Number of live entries. Test/observability only.
@@ -87,7 +91,8 @@ impl PathLocks {
     fn release(&self, key: &Path) {
         let mut map = self.map.lock();
         if let Some(entry) = map.get(key)
-            && Arc::strong_count(entry) == 1 {
+            && Arc::strong_count(entry) == 1
+        {
             map.remove(key);
         }
     }
@@ -148,7 +153,11 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(max_seen.load(Ordering::SeqCst), 1, "mutations must be serialized");
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "mutations must be serialized"
+        );
         assert!(locks.is_empty(), "entries must be reclaimed once unused");
     }
 

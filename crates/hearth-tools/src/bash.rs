@@ -17,7 +17,7 @@
 //! streaming and having the final output.
 
 use crate::shell::{Dispatch, WarmShellPool};
-use hearth_core::{profile, CancelToken, Engine};
+use hearth_core::{CancelToken, Engine, profile};
 use hearth_proto::{
     BashChannel, BashChunk, BashParams, BashResult, ErrorKind, ShellSpec, ShellTransport,
     ToolError, ToolResult,
@@ -72,7 +72,10 @@ pub fn bash_stream(
             .clone()
             .unwrap_or_else(|| engine.config().default_cwd.display().to_string());
         let timeout = Duration::from_millis(
-            params.timeout_ms.unwrap_or(engine.config().bash_timeout_ms).max(1),
+            params
+                .timeout_ms
+                .unwrap_or(engine.config().bash_timeout_ms)
+                .max(1),
         );
         let spec = params
             .shell
@@ -96,15 +99,11 @@ pub fn bash_stream(
             );
             match dispatch {
                 Dispatch::Done { exit_code } => {
-                    return Ok(emitter.finish(exit_code, None, false, false, start))
+                    return Ok(emitter.finish(exit_code, None, false, false, start));
                 }
-                Dispatch::TimedOut => {
-                    return Ok(emitter.finish(-1, None, true, false, start))
-                }
+                Dispatch::TimedOut => return Ok(emitter.finish(-1, None, true, false, start)),
                 Dispatch::Aborted => return Ok(emitter.finish(-1, None, false, true, start)),
-                Dispatch::Indeterminate(message) => {
-                    return Err(ToolError::indeterminate(message))
-                }
+                Dispatch::Indeterminate(message) => return Err(ToolError::indeterminate(message)),
                 // Provably never reached the shell — running it now is the
                 // first and only execution.
                 Dispatch::NotDispatched => {}
@@ -159,7 +158,11 @@ impl<'a> Emitter<'a> {
             }
         }
         self.seq += 1;
-        (self.on_chunk)(BashChunk { seq: self.seq, channel, text });
+        (self.on_chunk)(BashChunk {
+            seq: self.seq,
+            channel,
+            text,
+        });
     }
 
     fn finish(
@@ -269,7 +272,11 @@ fn spawn_bash(
         cmd.arg(&params.command);
     }
     cmd.current_dir(cwd)
-        .stdin(if command_on_stdin { Stdio::piped() } else { Stdio::null() })
+        .stdin(if command_on_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -281,7 +288,10 @@ fn spawn_bash(
     }
 
     let mut child = cmd.spawn().map_err(|e| {
-        ToolError::new(ErrorKind::Io, format!("failed to spawn {}: {e}", spec.program))
+        ToolError::new(
+            ErrorKind::Io,
+            format!("failed to spawn {}: {e}", spec.program),
+        )
     })?;
     let pid = child.id() as i32;
 

@@ -4,10 +4,10 @@
 //! The warm case is the resident-server advantage: the tree walk and
 //! `.gitignore` parsing happen once and are reused.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use grep_regex::RegexMatcher;
-use grep_searcher::sinks::UTF8;
 use grep_searcher::SearcherBuilder;
+use grep_searcher::sinks::UTF8;
 use hearth_bench::{bench_engine, bench_engine_trusted, gen_corpus};
 use hearth_core::Engine;
 use hearth_proto::{GrepMode, GrepParams};
@@ -44,15 +44,19 @@ fn baseline(root: &Path, threads: usize) -> u64 {
     let (tx, rx) = crossbeam_channel::unbounded::<std::path::PathBuf>();
     // walk
     let sink = parking_lot::Mutex::new(Vec::new());
-    WalkBuilder::new(root).threads(threads).build_parallel().run(|| {
-        Box::new(|res| {
-            if let Ok(e) = res
-                && e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                sink.lock().push(e.into_path());
-            }
-            ignore::WalkState::Continue
-        })
-    });
+    WalkBuilder::new(root)
+        .threads(threads)
+        .build_parallel()
+        .run(|| {
+            Box::new(|res| {
+                if let Ok(e) = res
+                    && e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                {
+                    sink.lock().push(e.into_path());
+                }
+                ignore::WalkState::Continue
+            })
+        });
     for p in sink.into_inner() {
         let _ = tx.send(p);
     }
@@ -66,10 +70,14 @@ fn baseline(root: &Path, threads: usize) -> u64 {
                 let mut searcher = SearcherBuilder::new().build();
                 while let Ok(path) = rx.recv() {
                     let mut hit = false;
-                    let _ = searcher.search_path(matcher, &path, UTF8(|_, _| {
-                        hit = true;
-                        Ok(false)
-                    }));
+                    let _ = searcher.search_path(
+                        matcher,
+                        &path,
+                        UTF8(|_, _| {
+                            hit = true;
+                            Ok(false)
+                        }),
+                    );
                     if hit {
                         count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -99,7 +107,11 @@ fn bench_grep(c: &mut Criterion) {
     });
 
     // Content mode (many matches) — exercises the arena sink's per-line path.
-    let content_p = GrepParams { pattern: "function_".into(), mode: GrepMode::Content, ..p.clone() };
+    let content_p = GrepParams {
+        pattern: "function_".into(),
+        mode: GrepMode::Content,
+        ..p.clone()
+    };
     let _ = grep(&warm_engine, &content_p).unwrap();
     group.bench_function("hearth_warm_content", |b| {
         b.iter(|| black_box(grep(&warm_engine, &content_p).unwrap().total_matches));

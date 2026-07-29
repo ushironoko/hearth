@@ -46,7 +46,8 @@ impl FileEntry {
 
     /// The line index, built once and cached.
     pub fn line_index(&self) -> &LineIndex {
-        self.line_index.get_or_init(|| Arc::new(LineIndex::new(&self.data)))
+        self.line_index
+            .get_or_init(|| Arc::new(LineIndex::new(&self.data)))
     }
 
     /// xxh3 content fingerprint, computed once.
@@ -64,7 +65,9 @@ impl FileEntry {
     /// the key to a fast warm read: after the first check, later reads skip the
     /// validation pass entirely.
     pub fn is_valid_utf8(&self) -> bool {
-        *self.valid_utf8.get_or_init(|| std::str::from_utf8(&self.data).is_ok())
+        *self
+            .valid_utf8
+            .get_or_init(|| std::str::from_utf8(&self.data).is_ok())
     }
 
     /// The content as `&str` without copying, when valid UTF-8.
@@ -129,13 +132,19 @@ impl FileCache {
 
     /// Cumulative `(hits, misses)` since construction (always-on).
     pub fn cache_stats(&self) -> (u64, u64) {
-        (self.hits.load(Ordering::Relaxed), self.misses.load(Ordering::Relaxed))
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Stamp an entry as just-accessed (for LRU).
     #[inline]
     fn touch(&self, entry: &FileEntry) {
-        entry.last_access.store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        entry.last_access.store(
+            self.clock.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 
     /// Saturating subtract from `total_bytes` (never underflow-wraps, so a
@@ -145,7 +154,12 @@ impl FileCache {
         let mut cur = self.total_bytes.load(Ordering::Relaxed);
         loop {
             let new = cur.saturating_sub(n);
-            match self.total_bytes.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
+            match self.total_bytes.compare_exchange_weak(
+                cur,
+                new,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }
@@ -183,7 +197,11 @@ impl FileCache {
 
     /// As [`get`](Self::get), but skips the freshness `stat` on a hit when
     /// `trust` is set (see [`get_bounded_trusting`](Self::get_bounded_trusting)).
-    pub fn get_trusting(&self, path: &Path, trust: bool) -> Result<(Arc<FileEntry>, bool), ToolError> {
+    pub fn get_trusting(
+        &self,
+        path: &Path,
+        trust: bool,
+    ) -> Result<(Arc<FileEntry>, bool), ToolError> {
         match self.get_bounded_trusting(path, u64::MAX, trust)? {
             Some(pair) => Ok(pair),
             None => Err(ToolError::internal("file exceeds cache bound")),
@@ -212,8 +230,7 @@ impl FileCache {
         max_bytes: u64,
         trust: bool,
     ) -> Result<Option<(Arc<FileEntry>, bool)>, ToolError> {
-        if trust
-            && let Some(entry) = self.map.get(path) {
+        if trust && let Some(entry) = self.map.get(path) {
             crate::profiler::count("cache.file.hit_trusted", 1);
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.touch(entry.value());
@@ -221,14 +238,18 @@ impl FileCache {
         }
         let meta = std::fs::metadata(path).map_err(|e| map_io(e, path))?;
         if !meta.is_file() {
-            return Err(ToolError::invalid(format!("not a regular file: {}", path.display()))
-                .with_path(path.display().to_string()));
+            return Err(
+                ToolError::invalid(format!("not a regular file: {}", path.display()))
+                    .with_path(path.display().to_string()),
+            );
         }
         let size = meta.len();
         let mtime_ns = mtime_nanos(&meta);
 
         if let Some(entry) = self.map.get(path)
-            && entry.size == size && entry.mtime_ns == mtime_ns {
+            && entry.size == size
+            && entry.mtime_ns == mtime_ns
+        {
             crate::profiler::count("cache.file.hit", 1);
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.touch(entry.value());
@@ -295,7 +316,11 @@ impl FileCache {
             .map
             .iter()
             .map(|e| {
-                (e.key().clone(), Arc::clone(e.value()), e.value().last_access.load(Ordering::Relaxed))
+                (
+                    e.key().clone(),
+                    Arc::clone(e.value()),
+                    e.value().last_access.load(Ordering::Relaxed),
+                )
             })
             .collect();
         items.sort_by_key(|(_, _, la)| *la);
@@ -359,8 +384,12 @@ impl FileCache {
     /// even when pointed at a huge directory.
     pub fn invalidate_prefix(&self, root: &Path) -> usize {
         let mut removed = 0;
-        let victims: Vec<PathBuf> =
-            self.map.iter().map(|e| e.key().clone()).filter(|p| p.starts_with(root)).collect();
+        let victims: Vec<PathBuf> = self
+            .map
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|p| p.starts_with(root))
+            .collect();
         for path in victims {
             if self.invalidate(&path) {
                 removed += 1;
@@ -429,8 +458,14 @@ mod tests {
         assert!(cache.total_bytes() <= 2000);
 
         // a and b remain cached (trusted hit); c was evicted (re-read → miss).
-        assert!(cache.get_trusting(&a, true).unwrap().1, "a should still be warm");
-        assert!(!cache.get_trusting(&c, true).unwrap().1, "c should have been evicted");
+        assert!(
+            cache.get_trusting(&a, true).unwrap().1,
+            "a should still be warm"
+        );
+        assert!(
+            !cache.get_trusting(&c, true).unwrap().1,
+            "c should have been evicted"
+        );
 
         // Tighter budget must actually reach it (regression for the freed
         // double-count that stopped eviction one entry short).
@@ -439,15 +474,19 @@ mod tests {
         cache.get(&c).unwrap();
         assert_eq!(cache.total_bytes(), 3000);
         cache.evict_to_bytes(1000);
-        assert!(cache.total_bytes() <= 1000, "budget must be reached, not one short");
+        assert!(
+            cache.total_bytes() <= 1000,
+            "budget must be reached, not one short"
+        );
     }
 
     #[test]
     fn total_bytes_consistent_under_concurrency() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Arc::new(FileCache::new());
-        let paths: Vec<PathBuf> =
-            (0..16).map(|i| write_file(dir.path(), &format!("f{i}"), 100 + i * 10)).collect();
+        let paths: Vec<PathBuf> = (0..16)
+            .map(|i| write_file(dir.path(), &format!("f{i}"), 100 + i * 10))
+            .collect();
 
         let mut handles = Vec::new();
         for t in 0..8u64 {
@@ -476,7 +515,11 @@ mod tests {
         // After all mutation stops, total_bytes must equal the real sum — no
         // drift, no underflow-wrap.
         let actual: u64 = cache.map.iter().map(|e| e.value().size).sum();
-        assert_eq!(cache.total_bytes(), actual, "total_bytes drifted from the true sum");
+        assert_eq!(
+            cache.total_bytes(),
+            actual,
+            "total_bytes drifted from the true sum"
+        );
     }
 
     #[test]

@@ -16,14 +16,14 @@ use dashmap::DashMap;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use hearth_core::cache::WalkKey;
-use hearth_core::{profile, CancelToken, Engine};
+use hearth_core::{CancelToken, Engine, profile};
 use hearth_proto::{
     FileMatches, GrepLine, GrepMode, GrepParams, GrepResult, ToolError, ToolResult,
 };
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub fn grep(engine: &Engine, params: &GrepParams) -> ToolResult<GrepResult> {
     grep_cancellable(engine, params, &CancelToken::none())
@@ -54,27 +54,30 @@ pub fn grep_cancellable(
         // glob filter — no per-file PathBuf clones (the walk's Arc is reused).
         // The walk cache returns a path-sorted list, so index order *is* path
         // order, which is what makes the global limit deterministic.
-        let (all_files, indices, walk_hit): (Arc<Vec<PathBuf>>, Vec<usize>, bool) =
-            if !root_is_dir {
-                (Arc::new(vec![root.clone()]), vec![0], false)
-            } else {
-                let key = WalkKey {
-                    respect_gitignore: params.respect_gitignore,
-                    hidden: params.hidden,
-                    follow_symlinks: params.follow_symlinks,
-                };
-                engine.watch_root(&root);
-                let (entry, hit) = engine.walks().get(&root, key);
-                let files = Arc::clone(&entry.files);
-                let idx: Vec<usize> =
-                    (0..files.len()).filter(|&i| glob_filter.is_match(&files[i])).collect();
-                (files, idx, hit)
+        let (all_files, indices, walk_hit): (Arc<Vec<PathBuf>>, Vec<usize>, bool) = if !root_is_dir
+        {
+            (Arc::new(vec![root.clone()]), vec![0], false)
+        } else {
+            let key = WalkKey {
+                respect_gitignore: params.respect_gitignore,
+                hidden: params.hidden,
+                follow_symlinks: params.follow_symlinks,
             };
+            engine.watch_root(&root);
+            let (entry, hit) = engine.walks().get(&root, key);
+            let files = Arc::clone(&entry.files);
+            let idx: Vec<usize> = (0..files.len())
+                .filter(|&i| glob_filter.is_match(&files[i]))
+                .collect();
+            (files, idx, hit)
+        };
 
         // If a healthy watcher covers this root and trust_watch is on, warm
         // hits skip the per-file freshness stat.
         let trust = engine.stat_free(&root);
-        let limiter = params.max_total_count.map(|limit| Limiter::new(indices.len(), limit));
+        let limiter = params
+            .max_total_count
+            .map(|limit| Limiter::new(indices.len(), limit));
         let searched = AtomicU64::new(0);
         let threads = engine.config().walk_threads.min(indices.len().max(1));
         let (tx, rx) = crossbeam_channel::unbounded::<(usize, usize)>();
@@ -198,7 +201,11 @@ fn apply_total_limit(files: &mut Vec<FileMatches>, limit: u64, after_context: u6
                 // The rows just before a dropped match are *its* leading
                 // context, not the kept match's trailing context.
                 let keep_through = last_match_line + after_context;
-                while file.lines.last().is_some_and(|l| l.line_number > keep_through) {
+                while file
+                    .lines
+                    .last()
+                    .is_some_and(|l| l.line_number > keep_through)
+                {
                     file.lines.pop();
                 }
             }
@@ -319,11 +326,13 @@ fn build_matcher(params: &GrepParams) -> ToolResult<RegexMatcher> {
         params.pattern.clone()
     };
     let mut b = RegexMatcherBuilder::new();
-    b.case_insensitive(params.case_insensitive).case_smart(params.smart_case);
+    b.case_insensitive(params.case_insensitive)
+        .case_smart(params.smart_case);
     if params.multiline {
         b.multi_line(true).dot_matches_new_line(true);
     }
-    b.build(&pattern).map_err(|e| ToolError::invalid(format!("invalid pattern: {e}")))
+    b.build(&pattern)
+        .map_err(|e| ToolError::invalid(format!("invalid pattern: {e}")))
 }
 
 fn build_searcher(params: &GrepParams) -> Searcher {
@@ -364,8 +373,13 @@ fn search_one(
     // a warm file, and no freshness stat when `trust` is set). Oversize or
     // uncacheable files fall back to grep-searcher's own IO. Unreadable/binary
     // files are silently skipped, matching rg.
-    let searched_ok = match engine.files().get_bounded_trusting(path, MAX_GREP_CACHE_BYTES, trust) {
-        Ok(Some((entry, _hit))) => searcher.search_slice(matcher, entry.bytes(), &mut sink).is_ok(),
+    let searched_ok = match engine
+        .files()
+        .get_bounded_trusting(path, MAX_GREP_CACHE_BYTES, trust)
+    {
+        Ok(Some((entry, _hit))) => searcher
+            .search_slice(matcher, entry.bytes(), &mut sink)
+            .is_ok(),
         _ => searcher.search_path(matcher, path, &mut sink).is_ok(),
     };
     if !searched_ok || !sink.found {
@@ -407,7 +421,12 @@ impl CollectSink<'_> {
         let text = trim_eol(bytes);
         let start = self.blob.len() as u32;
         self.blob.extend_from_slice(text);
-        self.spans.push(LineSpan { line_number, start, len: text.len() as u32, is_match });
+        self.spans.push(LineSpan {
+            line_number,
+            start,
+            len: text.len() as u32,
+            is_match,
+        });
     }
 
     /// Build the owned result once, slicing each line out of the arena blob.
@@ -446,7 +465,8 @@ impl Sink for CollectSink<'_> {
             self.push_line(line_number, mat.bytes(), true);
         }
         if let Some(mc) = self.max_count
-            && self.match_count >= mc {
+            && self.match_count >= mc
+        {
             return Ok(false);
         }
         Ok(true)

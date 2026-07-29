@@ -7,7 +7,7 @@
 
 use crate::edit_text;
 use crate::util::{resolve_path, resolve_write_target, write_bytes};
-use hearth_core::{profile, CancelToken, Engine};
+use hearth_core::{CancelToken, Engine, profile};
 use hearth_proto::{
     EditBatchParams, EditBatchResult, EditParams, EditResult, ErrorKind, ToolError, ToolResult,
 };
@@ -28,7 +28,9 @@ pub fn edit_cancellable(
     profile!("tool.edit", {
         cancel.check()?;
         if params.old_string == params.new_string {
-            return Err(ToolError::invalid("old_string and new_string are identical"));
+            return Err(ToolError::invalid(
+                "old_string and new_string are identical",
+            ));
         }
         if params.old_string.is_empty() {
             return Err(ToolError::invalid("old_string must not be empty"));
@@ -61,7 +63,10 @@ pub fn edit_cancellable(
         }
 
         let (new_text, replacements) = if params.replace_all {
-            (text.replace(&params.old_string, &params.new_string), count as u64)
+            (
+                text.replace(&params.old_string, &params.new_string),
+                count as u64,
+            )
         } else {
             (text.replacen(&params.old_string, &params.new_string, 1), 1)
         };
@@ -70,7 +75,10 @@ pub fn edit_cancellable(
         let byte_len = commit(engine, &requested, &path, new_text)?;
 
         hearth_core::profiler::count("tool.edit.replacements", replacements);
-        Ok(EditResult { replacements, byte_len })
+        Ok(EditResult {
+            replacements,
+            byte_len,
+        })
     })
 }
 
@@ -94,7 +102,9 @@ pub fn edit_batch_cancellable(
     profile!("tool.edit_batch", {
         cancel.check()?;
         if params.edits.is_empty() {
-            return Err(ToolError::invalid("edits must contain at least one replacement"));
+            return Err(ToolError::invalid(
+                "edits must contain at least one replacement",
+            ));
         }
 
         let requested = resolve_path(engine, &params.path);
@@ -122,9 +132,12 @@ pub fn edit_batch_cancellable(
         let content = edit_text::normalize_to_lf(without_bom);
 
         cancel.check()?;
-        let applied =
-            edit_text::apply_edits_opts(&content, &params.edits, params.whitespace_only_target_policy)
-                .map_err(|e| annotate(e, &params.path))?;
+        let applied = edit_text::apply_edits_opts(
+            &content,
+            &params.edits,
+            params.whitespace_only_target_policy,
+        )
+        .map_err(|e| annotate(e, &params.path))?;
 
         let (hunks, first_changed_line) = if params.skip_diff {
             (Vec::new(), None)
@@ -181,7 +194,13 @@ fn commit(
     path: &std::path::Path,
     new_text: String,
 ) -> ToolResult<u64> {
-    commit_with(engine, requested, path, new_text, hearth_proto::WriteMode::default())
+    commit_with(
+        engine,
+        requested,
+        path,
+        new_text,
+        hearth_proto::WriteMode::default(),
+    )
 }
 
 /// Persist the edited text and refresh the caches. The caller must already hold
@@ -196,7 +215,9 @@ fn commit_with(
     let byte_len = new_text.len() as u64;
     let meta = write_bytes(path, new_text.as_bytes(), false, mode)?;
     let arc: Arc<[u8]> = Arc::from(new_text.into_bytes().into_boxed_slice());
-    engine.files().put_written(path, arc, meta.size, meta.mtime_ns);
+    engine
+        .files()
+        .put_written(path, arc, meta.size, meta.mtime_ns);
     // An edit never creates the file, but it can rewrite one that steers
     // directory traversal — `.gitignore` and friends — which changes what a
     // cached walk would enumerate.

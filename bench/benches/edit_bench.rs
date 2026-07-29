@@ -2,7 +2,7 @@
 //! write baseline. Each iteration edits there-and-back so the file always has a
 //! match and stays warm in the cache.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hearth_bench::{bench_engine, file_text};
 use hearth_proto::EditParams;
 use hearth_tools::edit;
@@ -29,18 +29,32 @@ fn bench_edit(c: &mut Criterion) {
         std::fs::write(&path, file_text(7, lines)).unwrap();
         let ps = path.display().to_string();
 
-        let there = EditParams { path: ps.clone(), old_string: "engine".into(), new_string: "ENGINE".into(), replace_all: true };
-        let back = EditParams { path: ps.clone(), old_string: "ENGINE".into(), new_string: "engine".into(), replace_all: true };
+        let there = EditParams {
+            path: ps.clone(),
+            old_string: "engine".into(),
+            new_string: "ENGINE".into(),
+            replace_all: true,
+        };
+        let back = EditParams {
+            path: ps.clone(),
+            old_string: "ENGINE".into(),
+            new_string: "engine".into(),
+            replace_all: true,
+        };
         // Warm the cache.
         edit(&eng, &there).unwrap();
         edit(&eng, &back).unwrap();
 
-        group.bench_with_input(BenchmarkId::new("hearth_warm", name), &(&there, &back), |b, (there, back)| {
-            b.iter(|| {
-                edit(&eng, there).unwrap();
-                black_box(edit(&eng, back).unwrap().replacements)
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("hearth_warm", name),
+            &(&there, &back),
+            |b, (there, back)| {
+                b.iter(|| {
+                    edit(&eng, there).unwrap();
+                    black_box(edit(&eng, back).unwrap().replacements)
+                });
+            },
+        );
         group.bench_with_input(BenchmarkId::new("disk_baseline", name), &path, |b, path| {
             b.iter(|| {
                 baseline_edit(path, "engine", "ENGINE");

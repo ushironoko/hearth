@@ -1,7 +1,7 @@
 //! The `read` tool: windowed file reads served from the warm file cache.
 
 use crate::util::resolve_path;
-use hearth_core::{profile, CancelToken, Engine};
+use hearth_core::{CancelToken, Engine, profile};
 use hearth_proto::{LineWindowMode, ReadParams, ReadResult, ToolError, ToolResult};
 use std::fmt::Write as _;
 
@@ -53,7 +53,11 @@ pub fn read_cancellable(
         let split_mode = params.line_mode == LineWindowMode::SplitLines;
         // `split('\n')` counts the empty element after a trailing newline; the
         // `cat`-style slice does not.
-        let total_lines = if split_mode { idx.split_count() } else { idx.line_count() };
+        let total_lines = if split_mode {
+            idx.split_count()
+        } else {
+            idx.line_count()
+        };
         let byte_len = bytes.len() as u64;
         let binary = entry.is_binary();
         let ends_with_newline = bytes.last() == Some(&b'\n');
@@ -108,12 +112,16 @@ pub fn read_cancellable(
         let end_off = if split_mode {
             // Join semantics: stop at the end of the last element's text, so the
             // window never carries a trailing newline.
-            idx.line_range(end_line).map(|(_, e)| e).unwrap_or(bytes.len())
+            idx.line_range(end_line)
+                .map(|(_, e)| e)
+                .unwrap_or(bytes.len())
         } else if end_line < total_lines {
             // Slice semantics: include the trailing newline of the last line in
             // the window (so it matches `cat`) by ending at the start of the
             // following line.
-            idx.line_range(end_line + 1).map(|(s, _)| s).unwrap_or(bytes.len())
+            idx.line_range(end_line + 1)
+                .map(|(s, _)| s)
+                .unwrap_or(bytes.len())
         } else {
             bytes.len()
         };

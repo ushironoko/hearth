@@ -14,8 +14,8 @@ mod core;
 mod metrics;
 
 pub use allocation::{
-    pause_tracking, reset_counters, set_tracking_enabled, snapshot as allocation_snapshot,
-    AllocationSnapshot, ProfilingAllocator, TrackingPause,
+    AllocationSnapshot, ProfilingAllocator, TrackingPause, pause_tracking, reset_counters,
+    set_tracking_enabled, snapshot as allocation_snapshot,
 };
 pub use core::{ProfileGuard, Profiler};
 pub use metrics::{Counter, Metrics};
@@ -90,7 +90,11 @@ pub fn report() -> String {
     if !counters.is_empty() {
         out.push_str("\n── counters ──\n");
         for (name, c) in &counters {
-            let _ = writeln!(out, "{:<28} total={:<12} samples={}", name, c.total, c.samples);
+            let _ = writeln!(
+                out,
+                "{:<28} total={:<12} samples={}",
+                name, c.total, c.samples
+            );
         }
     }
 

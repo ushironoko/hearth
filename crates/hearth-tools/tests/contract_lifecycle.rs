@@ -57,7 +57,10 @@ fn engines_can_be_created_and_dropped_repeatedly_without_accumulating_shells() {
         drop(eng);
     }
     for pid in pids {
-        assert!(wait_for_exit(pid, Duration::from_secs(5)), "shell {pid} outlived its engine");
+        assert!(
+            wait_for_exit(pid, Duration::from_secs(5)),
+            "shell {pid} outlived its engine"
+        );
     }
 }
 
@@ -75,15 +78,24 @@ fn one_engine_serves_every_tool_and_stays_coherent_across_them() {
 
     let path = dir.path().join("src.rs").display().to_string();
     write(&eng, &WriteParams::new(&path, "fn marker() {}\n")).unwrap();
-    assert_eq!(read(&eng, &ReadParams::new(&path)).unwrap().content, "fn marker() {}\n");
     assert_eq!(
-        grep(&eng, &GrepParams::new("marker", dir.path().display().to_string()))
-            .unwrap()
-            .files
-            .len(),
+        read(&eng, &ReadParams::new(&path)).unwrap().content,
+        "fn marker() {}\n"
+    );
+    assert_eq!(
+        grep(
+            &eng,
+            &GrepParams::new("marker", dir.path().display().to_string())
+        )
+        .unwrap()
+        .files
+        .len(),
         1
     );
-    assert_eq!(bash(&eng, &BashParams::new("printf ok")).unwrap().stdout, "ok");
+    assert_eq!(
+        bash(&eng, &BashParams::new("printf ok")).unwrap().stdout,
+        "ok"
+    );
 
     // Let the optimizer tick at least once while the engine is live.
     std::thread::sleep(Duration::from_millis(250));

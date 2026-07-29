@@ -25,7 +25,9 @@ where
     V: Clone,
 {
     fn default() -> Self {
-        Self { in_flight: Mutex::new(HashMap::new()) }
+        Self {
+            in_flight: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -53,7 +55,10 @@ where
                 }
                 return guard.as_ref().unwrap().clone();
             }
-            let call = Arc::new(Call { result: Mutex::new(None), ready: Condvar::new() });
+            let call = Arc::new(Call {
+                result: Mutex::new(None),
+                ready: Condvar::new(),
+            });
             map.insert(key.clone(), Arc::clone(&call));
             call
         };
