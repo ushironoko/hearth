@@ -10,7 +10,7 @@ use crate::cache::{FileCache, WalkCache};
 use crate::invalidation::InvalidationLog;
 #[cfg(not(any(test, feature = "test-poll-watcher")))]
 use notify::RecommendedWatcher;
-use notify::event::ModifyKind;
+use notify::event::{MetadataKind, ModifyKind};
 #[cfg(any(test, feature = "test-poll-watcher"))]
 use notify::{Config, PollWatcher};
 use notify::{Event, EventHandler, EventKind, RecursiveMode, Watcher};
@@ -58,13 +58,15 @@ enum EventPathExpansion {
 }
 
 fn event_effect(kind: &EventKind) -> EventEffect {
-    // Metadata-only events (for example atime bumps caused by our own reads)
-    // must not trigger a read -> atime -> invalidate feedback loop.
+    // Access-time and other metadata-only events must not trigger a
+    // read -> atime -> invalidate feedback loop. WriteTime is different:
+    // PollWatcher may use it as the sole notification for a content write.
     let invalidate_content = matches!(
         kind,
         EventKind::Create(_)
             | EventKind::Remove(_)
             | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime))
             | EventKind::Modify(ModifyKind::Any)
             | EventKind::Modify(ModifyKind::Name(_))
     );
@@ -749,17 +751,39 @@ mod tests {
     }
 
     #[test]
-    fn metadata_only_changes_are_not_recorded() {
+    fn write_time_metadata_invalidates_content_and_is_recorded() {
         assert_eq!(
             event_effect(&EventKind::Modify(ModifyKind::Metadata(
                 MetadataKind::WriteTime
             ))),
             EventEffect {
-                invalidate_content: false,
+                invalidate_content: true,
                 invalidate_walk: false,
-                record: false,
+                record: true,
             }
         );
+    }
+
+    #[test]
+    fn non_content_metadata_changes_are_not_recorded() {
+        for metadata in [
+            MetadataKind::Any,
+            MetadataKind::AccessTime,
+            MetadataKind::Permissions,
+            MetadataKind::Ownership,
+            MetadataKind::Extended,
+            MetadataKind::Other,
+        ] {
+            assert_eq!(
+                event_effect(&EventKind::Modify(ModifyKind::Metadata(metadata))),
+                EventEffect {
+                    invalidate_content: false,
+                    invalidate_walk: false,
+                    record: false,
+                },
+                "{metadata:?}"
+            );
+        }
     }
 
     #[test]
