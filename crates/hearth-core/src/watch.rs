@@ -8,10 +8,10 @@
 
 use crate::cache::{FileCache, WalkCache};
 use crate::invalidation::InvalidationLog;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-poll-watcher")))]
 use notify::RecommendedWatcher;
 use notify::event::ModifyKind;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-poll-watcher"))]
 use notify::{Config, PollWatcher};
 use notify::{Event, EventHandler, EventKind, RecursiveMode, Watcher};
 use parking_lot::RwLock;
@@ -19,14 +19,14 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-poll-watcher"))]
 use std::time::Duration;
 
 const MAX_EXPANDED_PATHS: usize = 64;
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-poll-watcher")))]
 type WatcherBackend = RecommendedWatcher;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-poll-watcher"))]
 type WatcherBackend = PollWatcher;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,12 +84,12 @@ fn normalize_root(root: &Path) -> PathBuf {
     resolve_root(root).0
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-poll-watcher")))]
 fn new_watcher(event_handler: impl EventHandler) -> Result<WatcherBackend, notify::Error> {
     notify::recommended_watcher(event_handler)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-poll-watcher"))]
 fn new_watcher(event_handler: impl EventHandler) -> Result<WatcherBackend, notify::Error> {
     // Polling is a real watcher backend and keeps callback integration tests
     // deterministic on temporary filesystems where native event delivery can
