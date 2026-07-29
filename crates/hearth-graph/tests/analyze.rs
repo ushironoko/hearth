@@ -233,6 +233,7 @@ fn analyze_and_index_drivers_keep_distinct_prefilters() {
         language: tree_sitter_javascript::LANGUAGE.into(),
         extensions: ["dep".into()].into_iter().collect(),
         tags_query: None,
+        merge_adjacent_same_name_definitions: false,
         imports: Some(ImportSpec::Query {
             source: Cow::Borrowed("(import_statement source: (string) @import.source.static)"),
             kind_map: static_import_kind,

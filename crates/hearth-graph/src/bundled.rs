@@ -34,8 +34,20 @@ fn language_spec_with_imports(
             .map(CompactString::new)
             .collect::<SmallVec<_>>(),
         tags_query: Some(tags_query),
+        merge_adjacent_same_name_definitions: false,
         imports,
     }
+}
+
+fn language_spec_merging_adjacent_definitions(
+    name: &'static str,
+    language: Language,
+    extensions: &[&str],
+    tags_query: Cow<'static, str>,
+) -> LanguageSpec {
+    let mut spec = language_spec(name, language, extensions, tags_query);
+    spec.merge_adjacent_same_name_definitions = true;
+    spec
 }
 
 fn import_kind(capture: &str) -> ImportKind {
@@ -168,7 +180,7 @@ impl LanguageRegistry {
             &["sh", "bash", "zsh"],
             Cow::Borrowed(include_str!("../queries/bash/tags.scm")),
         ));
-        registry.register(language_spec(
+        registry.register(language_spec_merging_adjacent_definitions(
             "haskell",
             tree_sitter_haskell::LANGUAGE.into(),
             &["hs", "lhs"],

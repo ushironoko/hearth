@@ -44,6 +44,11 @@ pub struct LanguageSpec {
     pub extensions: SmallVec<[CompactString; 4]>,
     /// Tree-sitter tags query used for symbol extraction.
     pub tags_query: Option<Cow<'static, str>>,
+    /// Merge adjacent same-name definitions emitted for one logical symbol.
+    ///
+    /// This is intended for grammars such as Haskell, where each equation of
+    /// one function is represented by a separate definition node.
+    pub merge_adjacent_same_name_definitions: bool,
     /// Import extraction strategy, when available.
     pub imports: Option<ImportSpec>,
 }

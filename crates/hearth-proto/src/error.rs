@@ -76,7 +76,12 @@ pub struct ToolError {
 
 impl ToolError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), path: None, edit_index: None }
+        Self {
+            kind,
+            message: message.into(),
+            path: None,
+            edit_index: None,
+        }
     }
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
@@ -91,7 +96,11 @@ impl ToolError {
 
     pub fn not_found(path: impl Into<String>) -> Self {
         let path = path.into();
-        Self::new(ErrorKind::NotFound, format!("no such file or directory: {path}")).with_path(path)
+        Self::new(
+            ErrorKind::NotFound,
+            format!("no such file or directory: {path}"),
+        )
+        .with_path(path)
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {

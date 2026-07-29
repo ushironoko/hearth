@@ -10,8 +10,12 @@ use hearth_proto::{
     Request, Response, WriteParams,
 };
 use hearth_tools::{dispatch, graph, graph_cancellable, graph_clear, write};
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::fs::{FileTimes, OpenOptions};
 use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -214,6 +218,43 @@ fn verification_04_oversize_importer_is_approximate_rdeps_grep_backstop() {
 }
 
 #[test]
+fn oversized_dependency_is_a_path_identified_zero_hash_stub() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let importer = seed(
+        &root,
+        "src/a.ts",
+        "import { b } from \"./b\";\nexport const a = b;\n",
+    );
+    let oversize_source = "x".repeat(2 * 1024 * 1024 + 1);
+    let target = seed(&root, "src/b.ts", &oversize_source);
+    let eng = engine(&root);
+
+    let result = graph(
+        &eng,
+        &params(
+            &root,
+            GraphOp::Neighborhood {
+                path: importer,
+                depth: 1,
+            },
+        ),
+    )
+    .unwrap();
+    let GraphOutput::Neighborhood(neighborhood) = result.output else {
+        panic!("expected neighborhood");
+    };
+    let stub = neighborhood
+        .nodes
+        .iter()
+        .find(|node| node.path == target)
+        .expect("oversized dependency must remain visible as a stub");
+
+    assert!(!stub.indexed);
+    assert_eq!(stub.node_id, "src/b.ts@0000000000000000");
+}
+
+#[test]
 fn verification_05_hearth_write_immediately_adds_new_rdeps_importer() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -336,6 +377,95 @@ fn verification_07_closed_deps_fixture_synthesizes_exact_guarantees() {
     );
     assert_eq!(result.meta.indexed_files, 3);
     assert_eq!(result.meta.guarantee, GraphGuarantee::Exact);
+}
+
+#[test]
+fn dependency_edges_expose_joinable_node_ids_and_discriminate_external_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let importer = seed(
+        &root,
+        "src/app.ts",
+        concat!(
+            "import { value } from \"./value\";\n",
+            "import React from \"react\";\n",
+            "export const result = [value, React];\n"
+        ),
+    );
+    let target = seed(&root, "src/value.ts", "export const value = 1;\n");
+    seed(
+        &root,
+        "node_modules/react/package.json",
+        "{\"name\":\"react\",\"main\":\"index.js\"}\n",
+    );
+    seed(&root, "node_modules/react/index.js", "export default {};\n");
+    let eng = engine(&root);
+
+    let deps_result = graph(
+        &eng,
+        &params(
+            &root,
+            GraphOp::Deps {
+                path: importer.clone(),
+                depth: 1,
+            },
+        ),
+    )
+    .unwrap();
+    let GraphOutput::Deps(deps) = &deps_result.output else {
+        panic!("expected deps");
+    };
+    let workspace_edge = deps
+        .edges
+        .iter()
+        .find(|edge| edge.to == target)
+        .expect("workspace dependency edge");
+    assert_eq!(workspace_edge.from_node_id, deps.node.node_id);
+    assert_eq!(workspace_edge.to_kind, "path");
+    assert!(workspace_edge.to_node_id.is_some());
+
+    let external_edge = deps
+        .edges
+        .iter()
+        .find(|edge| edge.specifier == "react")
+        .expect("external dependency edge");
+    assert_eq!(external_edge.from_node_id, deps.node.node_id);
+    assert_eq!(external_edge.to, "react");
+    assert_eq!(external_edge.to_kind, "external");
+    assert_eq!(external_edge.to_node_id, None);
+
+    let neighborhood_result = graph(
+        &eng,
+        &params(
+            &root,
+            GraphOp::Neighborhood {
+                path: importer,
+                depth: 1,
+            },
+        ),
+    )
+    .unwrap();
+    let GraphOutput::Neighborhood(neighborhood) = &neighborhood_result.output else {
+        panic!("expected neighborhood");
+    };
+    let edge = neighborhood
+        .edges
+        .iter()
+        .find(|edge| edge.to == target)
+        .expect("workspace neighborhood edge");
+    let from = neighborhood
+        .nodes
+        .iter()
+        .find(|node| node.path == edge.from)
+        .expect("edge source node");
+    let to = neighborhood
+        .nodes
+        .iter()
+        .find(|node| node.path == edge.to)
+        .expect("edge target node");
+    assert_eq!(edge.from_node_id, from.node_id);
+    assert_eq!(edge.to_node_id.as_deref(), Some(to.node_id.as_str()));
+    assert_eq!(edge.to_kind, "path");
 }
 
 #[test]
@@ -543,6 +673,248 @@ fn verification_10b_subset_freshness_never_covers_the_walk_universe() {
 }
 
 #[test]
+fn files_view_deps_excludes_out_of_view_targets_and_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let a = seed(
+        &root,
+        "src/a.ts",
+        concat!(
+            "import { b } from \"./b\";\n",
+            "import React from \"react\";\n",
+            "export const a = [b, React];\n"
+        ),
+    );
+    let b = seed(
+        &root,
+        "src/b.ts",
+        "import { c } from \"./c\";\nexport const b = c;\n",
+    );
+    let c = seed(&root, "src/c.ts", "export const c = 1;\n");
+    seed(
+        &root,
+        "node_modules/react/package.json",
+        "{\"name\":\"react\",\"main\":\"index.js\"}\n",
+    );
+    seed(&root, "node_modules/react/index.js", "export default {};\n");
+    let eng = engine(&root);
+    let op = GraphOp::Deps {
+        path: a.clone(),
+        depth: 2,
+    };
+
+    let initial = graph(&eng, &params(&root, op.clone())).unwrap();
+    assert_eq!(initial.meta.guarantee, GraphGuarantee::Exact);
+    assert!(dep_targets(&initial).contains(&c.as_str()));
+
+    let mut view_query = params(&root, op);
+    view_query.files = vec![a.clone(), b.clone()];
+    view_query.include_basis = true;
+    let result = graph(&eng, &view_query).unwrap();
+    let GraphOutput::Deps(deps) = &result.output else {
+        panic!("expected deps");
+    };
+
+    assert!(result.meta.swept);
+    assert_eq!(result.meta.guarantee, GraphGuarantee::Approximate);
+    assert!(dep_targets(&result).contains(&b.as_str()));
+    assert!(dep_targets(&result).contains(&"react"));
+    assert!(!dep_targets(&result).contains(&c.as_str()));
+    assert!(deps.edges.iter().all(|edge| edge.to != c));
+    let external = deps
+        .edges
+        .iter()
+        .find(|edge| edge.to == "react")
+        .expect("an external edge from an in-view owner stays visible");
+    assert_eq!(external.from, a);
+    assert_eq!(external.to_node_id, None);
+    assert_eq!(external.to_kind, "external");
+    assert_eq!(deps.coverage.analyzed, 2);
+    assert_eq!(deps.coverage.stubs, 0);
+    let basis_paths: Vec<_> = deps
+        .coverage
+        .basis
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(basis_paths, [a.as_str(), b.as_str()]);
+}
+
+#[test]
+fn files_view_deps_stays_exact_when_every_reached_node_is_revalidated() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let a = seed(
+        &root,
+        "src/a.ts",
+        "import { b } from \"./b\";\nexport const a = b;\n",
+    );
+    let b = seed(
+        &root,
+        "src/b.ts",
+        "import { c } from \"./c\";\nexport const b = c;\n",
+    );
+    let c = seed(&root, "src/c.ts", "export const c = 1;\n");
+    let eng = engine(&root);
+    let op = GraphOp::Deps { path: a, depth: 2 };
+
+    graph(&eng, &params(&root, op.clone())).unwrap();
+
+    let mut view_query = params(&root, op);
+    view_query.files = vec!["src/a.ts".into(), "src/b.ts".into(), "src/c.ts".into()];
+    let result = graph(&eng, &view_query).unwrap();
+    let GraphOutput::Deps(deps) = &result.output else {
+        panic!("expected deps");
+    };
+
+    assert!(result.meta.swept);
+    assert_eq!(result.meta.guarantee, GraphGuarantee::Exact);
+    assert_eq!(dep_targets(&result), [b.as_str(), c.as_str()]);
+    assert!(
+        deps.edges
+            .iter()
+            .all(|edge| edge.guarantee == GraphGuarantee::Exact)
+    );
+}
+
+#[test]
+fn files_view_rdeps_excludes_out_of_view_importers_and_coverage_after_full_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let target = seed(&root, "src/target.ts", "export const targetValue = 1;\n");
+    let allowed = seed(
+        &root,
+        "src/allowed.ts",
+        "import { targetValue } from \"./target\";\nexport const allowed = targetValue;\n",
+    );
+    let excluded = seed(
+        &root,
+        "src/excluded.ts",
+        "import { targetValue } from \"./target\";\nexport const excluded = targetValue;\n",
+    );
+    let eng = engine(&root);
+    graph(
+        &eng,
+        &params(
+            &root,
+            GraphOp::Search {
+                query: String::new(),
+                limit: 20,
+            },
+        ),
+    )
+    .unwrap();
+
+    let mut query = params(
+        &root,
+        GraphOp::Rdeps {
+            path: target.clone(),
+            depth: 1,
+            verify: true,
+        },
+    );
+    query.files = vec![target.clone(), allowed.clone()];
+    query.include_basis = true;
+    let result = graph(&eng, &query).unwrap();
+    let GraphOutput::Rdeps(rdeps) = &result.output else {
+        panic!("expected rdeps");
+    };
+
+    let importer_paths: Vec<_> = rdeps
+        .importers
+        .iter()
+        .map(|entry| entry.node.path.as_str())
+        .collect();
+    assert_eq!(importer_paths, [allowed.as_str()]);
+    assert!(
+        rdeps
+            .importers
+            .iter()
+            .all(|entry| entry.node.path != excluded)
+    );
+    assert_eq!(result.meta.guarantee, GraphGuarantee::Approximate);
+    assert_eq!(rdeps.coverage.analyzed, 2);
+    assert_eq!(rdeps.coverage.stubs, 0);
+    let basis_paths: Vec<_> = rdeps
+        .coverage
+        .basis
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(basis_paths, [allowed.as_str(), target.as_str()]);
+}
+
+#[test]
+fn files_view_neighborhood_does_not_expand_through_an_out_of_view_bridge() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let center = seed(
+        &root,
+        "src/center.ts",
+        concat!(
+            "import { allowed } from \"./allowed\";\n",
+            "import { bridge } from \"./bridge\";\n",
+            "export const center = allowed + bridge;\n"
+        ),
+    );
+    let allowed = seed(&root, "src/allowed.ts", "export const allowed = 1;\n");
+    let bridge = seed(
+        &root,
+        "src/bridge.ts",
+        "import { distant } from \"./distant\";\nexport const bridge = distant;\n",
+    );
+    let distant = seed(&root, "src/distant.ts", "export const distant = 2;\n");
+    let eng = engine(&root);
+    graph(
+        &eng,
+        &params(
+            &root,
+            GraphOp::Search {
+                query: String::new(),
+                limit: 20,
+            },
+        ),
+    )
+    .unwrap();
+
+    let mut query = params(
+        &root,
+        GraphOp::Neighborhood {
+            path: center.clone(),
+            depth: 2,
+        },
+    );
+    query.files = vec![center.clone(), allowed.clone(), distant.clone()];
+    query.include_basis = true;
+    let result = graph(&eng, &query).unwrap();
+    let GraphOutput::Neighborhood(neighborhood) = &result.output else {
+        panic!("expected neighborhood");
+    };
+
+    let node_paths: Vec<_> = neighborhood
+        .nodes
+        .iter()
+        .map(|node| node.path.as_str())
+        .collect();
+    assert_eq!(node_paths, [allowed.as_str(), center.as_str()]);
+    assert!(neighborhood.nodes.iter().all(|node| node.path != bridge));
+    assert!(neighborhood.nodes.iter().all(|node| node.path != distant));
+    assert_eq!(neighborhood.edges.len(), 1);
+    assert_eq!(neighborhood.edges[0].from, center);
+    assert_eq!(neighborhood.edges[0].to, allowed);
+    assert_eq!(result.meta.guarantee, GraphGuarantee::Approximate);
+    assert_eq!(neighborhood.coverage.analyzed, 2);
+    assert_eq!(neighborhood.coverage.stubs, 0);
+    let basis_paths: Vec<_> = neighborhood
+        .coverage
+        .basis
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(basis_paths, [allowed.as_str(), center.as_str()]);
+}
+
+#[test]
 fn wipe_discards_all_stat_records_on_a_built_root() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path(), "src/a.rs", "pub fn wipe_alpha() {}\n");
@@ -712,6 +1084,215 @@ fn verification_11_unsupported_extensions_are_counted_without_error() {
 }
 
 #[test]
+fn files_entry_that_escapes_root_is_rejected_before_indexing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let outside = seed(
+        dir.path(),
+        "outside.rs",
+        "pub fn outside_root_symbol() {}\n",
+    );
+    let eng = engine(&root);
+    let mut query = params(
+        &root,
+        GraphOp::Search {
+            query: "outside_root_symbol".into(),
+            limit: 20,
+        },
+    );
+    query.files = vec!["../outside.rs".into()];
+
+    let error = graph(&eng, &query).unwrap_err();
+
+    assert_eq!(error.kind, ErrorKind::InvalidInput);
+    assert_eq!(
+        error.path.as_deref(),
+        Some(root.join("../outside.rs").display().to_string().as_str())
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside).unwrap(),
+        "pub fn outside_root_symbol() {}\n"
+    );
+    let current = graph(&eng, &params(&root, GraphOp::Status)).unwrap();
+    assert_eq!(current.meta.indexed_files, 0);
+    assert_eq!(status(&current).symbols, 0);
+}
+
+#[test]
+fn absolute_files_entry_outside_root_is_rejected_before_indexing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let outside = seed(
+        dir.path(),
+        "outside.rs",
+        "pub fn absolute_outside_root_symbol() {}\n",
+    );
+    let eng = engine(&root);
+    let mut query = params(
+        &root,
+        GraphOp::Search {
+            query: "absolute_outside_root_symbol".into(),
+            limit: 20,
+        },
+    );
+    query.files = vec![outside.clone()];
+
+    let error = graph(&eng, &query).unwrap_err();
+
+    assert_eq!(error.kind, ErrorKind::InvalidInput);
+    assert_eq!(error.path.as_deref(), Some(outside.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "pub fn absolute_outside_root_symbol() {}\n"
+    );
+    let current = graph(&eng, &params(&root, GraphOp::Status)).unwrap();
+    assert_eq!(current.meta.indexed_files, 0);
+    assert_eq!(status(&current).symbols, 0);
+}
+
+#[test]
+fn relative_and_absolute_query_paths_outside_root_are_rejected_before_indexing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let outside = seed(
+        dir.path(),
+        "outside.rs",
+        "pub fn escaped_query_symbol() {}\n",
+    );
+    let eng = engine(&root);
+
+    for requested in ["../outside.rs".to_owned(), outside.clone()] {
+        let error = graph(&eng, &params(&root, GraphOp::Symbols { path: requested })).unwrap_err();
+
+        assert_eq!(error.kind, ErrorKind::InvalidInput);
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(outside).unwrap(),
+        "pub fn escaped_query_symbol() {}\n"
+    );
+    let current = graph(&eng, &params(&root, GraphOp::Status)).unwrap();
+    assert_eq!(current.meta.indexed_files, 0);
+    assert_eq!(status(&current).symbols, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn files_entry_symlinks_must_resolve_inside_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let outside = seed(
+        dir.path(),
+        "outside/secret.ts",
+        "export function outsideRootSymbol() {}\n",
+    );
+    let escaping_link = root.join("inside.ts");
+    std::os::unix::fs::symlink("../outside/secret.ts", &escaping_link).unwrap();
+    let eng = engine(&root);
+    let mut query = params(
+        &root,
+        GraphOp::Search {
+            query: "outsideRootSymbol".into(),
+            limit: 20,
+        },
+    );
+    query.files = vec!["inside.ts".into()];
+
+    let error = graph(&eng, &query).unwrap_err();
+
+    assert_eq!(error.kind, ErrorKind::InvalidInput);
+    assert_eq!(
+        error.path.as_deref(),
+        Some(escaping_link.display().to_string().as_str())
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside).unwrap(),
+        "export function outsideRootSymbol() {}\n"
+    );
+
+    seed(
+        &root,
+        "src/real.ts",
+        "export function insideRootSymbol() {}\n",
+    );
+    std::os::unix::fs::symlink("src/real.ts", root.join("alias.ts")).unwrap();
+    query.files = vec!["alias.ts".into()];
+    query.op = GraphOp::Search {
+        query: "insideRootSymbol".into(),
+        limit: 20,
+    };
+
+    let result = graph(&eng, &query).unwrap();
+
+    assert_eq!(symbol_names(&result), ["insideRootSymbol"]);
+}
+
+#[test]
+fn absolute_files_entry_with_internal_parent_segment_stays_inside_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let file = seed(&root, "src/lib.rs", "pub fn normalized_symbol() {}\n");
+    let mut query = params(&root, GraphOp::Symbols { path: file });
+    query.files = vec![
+        root.join("src")
+            .join("..")
+            .join("src/lib.rs")
+            .display()
+            .to_string(),
+    ];
+
+    let result = graph(&engine(&root), &query).unwrap();
+
+    assert_eq!(symbol_names(&result), ["normalized_symbol"]);
+    assert_eq!(result.meta.indexed_files, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn supported_non_utf8_walk_entry_demotes_the_guarantee() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let source_dir = root.join("src");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    seed(&root, "src/a.ts", "export function validUtf8Symbol() {}\n");
+    let non_utf8 = source_dir.join(OsStr::from_bytes(b"\xff\xfe.ts"));
+    if std::fs::write(&non_utf8, "export function hiddenSymbol() {}\n").is_err() {
+        return;
+    }
+    let root = root.canonicalize().unwrap();
+    let eng = engine(&root);
+
+    let result = graph(
+        &eng,
+        &params(
+            &root,
+            GraphOp::Search {
+                query: "Symbol".into(),
+                limit: 20,
+            },
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(result.meta.guarantee, GraphGuarantee::Approximate);
+    assert_eq!(result.meta.unsupported_files, 0);
+    assert_eq!(result.meta.indexed_files, 1);
+    assert_eq!(symbol_names(&result), ["validUtf8Symbol"]);
+    let current = graph(&eng, &params(&root, GraphOp::Status)).unwrap();
+    assert_eq!(status(&current).failed_files, 1);
+    assert_eq!(status(&current).unsupported_files, 0);
+    assert_eq!(status(&current).symbols, 1);
+}
+
+#[test]
 fn verification_12_clear_caches_detaches_roots_and_the_next_query_rebuilds() {
     let dir = tempfile::tempdir().unwrap();
     let file = seed(dir.path(), "src/lib.rs", "pub fn rebuilt_symbol() {}\n");
@@ -773,8 +1354,8 @@ fn verification_13_rdeps_repair_excludes_comment_only_false_positive() {
     assert_eq!(repaired.meta.guarantee, GraphGuarantee::Approximate);
     assert_eq!(
         status(&graph(&eng, &params(&root, GraphOp::Status)).unwrap()).indexed_files,
-        3,
-        "the grep hit omitted from the subset must be analyzed by repair"
+        2,
+        "repair must not index a grep hit outside the files view"
     );
 
     let result = graph(&eng, &params(&root, op)).unwrap();
@@ -796,6 +1377,53 @@ fn verification_13_rdeps_repair_excludes_comment_only_false_positive() {
             .iter()
             .all(|entry| entry.node.path != comment_only)
     );
+}
+
+#[test]
+fn rdeps_grep_candidate_cap_marks_verification_incomplete() {
+    const GREP_CANDIDATES: usize = 1030;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let target = seed(&root, "src/target.ts", "export const targetValue = true;\n");
+    for index in 0..GREP_CANDIDATES {
+        let contents = if index == 0 {
+            "import \"./target\";\nexport const importer = true;\n"
+        } else {
+            "// target\n"
+        };
+        seed(&root, &format!("src/candidate-{index:04}.ts"), contents);
+    }
+    let eng = engine(&root);
+
+    graph(
+        &eng,
+        &params(
+            &root,
+            GraphOp::Search {
+                query: "target".into(),
+                limit: 10,
+            },
+        ),
+    )
+    .unwrap();
+
+    let mut query = params(
+        &root,
+        GraphOp::Rdeps {
+            path: target.clone(),
+            depth: 1,
+            verify: true,
+        },
+    );
+    query.files = vec![target];
+    let result = graph(&eng, &query).unwrap();
+    let GraphOutput::Rdeps(rdeps) = result.output else {
+        panic!("expected rdeps");
+    };
+
+    assert!(result.meta.repair_truncated);
+    assert!(!rdeps.verified);
 }
 
 #[test]
@@ -1141,6 +1769,73 @@ fn verification_17_tsconfig_paths_change_reresolves_unchanged_importer() {
             .iter()
             .all(|edge| edge.to != first_target)
     );
+}
+
+#[test]
+fn jsconfig_paths_resolve_and_root_config_transitions_invalidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let importer = seed(
+        &root,
+        "src/app.js",
+        "import { value } from \"@lib/x\";\nexport { value };\n",
+    );
+    let js_target = seed(&root, "src/x.js", "export const value = \"js\";\n");
+    let edited_target = seed(
+        &root,
+        "alternate/x.js",
+        "export const value = \"edited-jsconfig\";\n",
+    );
+    let ts_target = seed(
+        &root,
+        "typescript/x.js",
+        "export const value = \"tsconfig-wins\";\n",
+    );
+    let jsconfig = seed(
+        &root,
+        "jsconfig.json",
+        "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"src/*\"]}}}\n",
+    );
+    let eng = engine(&root);
+    let query = params(
+        &root,
+        GraphOp::Deps {
+            path: importer,
+            depth: 1,
+        },
+    );
+
+    let initial = graph(&eng, &query).unwrap();
+    assert_eq!(initial.meta.guarantee, GraphGuarantee::Exact);
+    assert!(dep_targets(&initial).contains(&js_target.as_str()));
+
+    let old_size = std::fs::metadata(&jsconfig).unwrap().len();
+    std::fs::write(
+        &jsconfig,
+        "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"alternate/*\"]}}}\n",
+    )
+    .unwrap();
+    assert_ne!(std::fs::metadata(&jsconfig).unwrap().len(), old_size);
+    let edited = graph(&eng, &query).unwrap();
+    assert!(dep_targets(&edited).contains(&edited_target.as_str()));
+    assert!(!dep_targets(&edited).contains(&js_target.as_str()));
+
+    let tsconfig = seed(
+        &root,
+        "tsconfig.json",
+        "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"typescript/*\"]}}}\n",
+    );
+    let preferred = graph(&eng, &query).unwrap();
+    assert!(dep_targets(&preferred).contains(&ts_target.as_str()));
+    assert!(!dep_targets(&preferred).contains(&edited_target.as_str()));
+
+    std::fs::remove_file(tsconfig).unwrap();
+    let fallback = graph(&eng, &query).unwrap();
+    assert!(dep_targets(&fallback).contains(&edited_target.as_str()));
+
+    std::fs::remove_file(jsconfig).unwrap();
+    let removed = graph(&eng, &query).unwrap();
+    assert!(dep_targets(&removed).is_empty());
 }
 
 #[test]

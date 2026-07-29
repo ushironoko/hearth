@@ -1,3 +1,9 @@
+#[cfg(all(
+    feature = "bundled-languages",
+    feature = "resolve-js",
+    feature = "resolve-rust"
+))]
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use compact_str::CompactString;
@@ -5,6 +11,15 @@ use hearth_graph::graph::{EdgeTargetOwned, Guarantee, ModuleGraph, NodeState, Up
 use hearth_graph::{
     FileAnalysis, ImportKind, RawImport, ResolutionCompleteness, ResolutionOutcome, Resolve,
     Resolved, ResolverSet, UnresolvedReason,
+};
+#[cfg(all(
+    feature = "bundled-languages",
+    feature = "resolve-js",
+    feature = "resolve-rust"
+))]
+use hearth_graph::{
+    JsResolveOptions, LanguageRegistry, ParserPool, RustResolveOptions, analyze_source,
+    js_resolver, rust_resolver,
 };
 use rustc_hash::FxHashMap;
 
@@ -236,6 +251,97 @@ fn resolved_paths_create_stubs_and_upsert_promotes_them_in_place() {
 }
 
 #[test]
+fn rdeps_exactness_stays_synced_across_node_mutations() {
+    let state = MockState::with_targets([
+        ("child", Resolved::Path("/repo/child.ts".into())),
+        ("orphan", Resolved::Path("/repo/orphan.ts".into())),
+    ]);
+    let resolvers = state.resolvers();
+    let mut graph = ModuleGraph::new();
+    graph.set_universe_complete(true);
+
+    graph.upsert_file(
+        &analysis("/repo/parent.ts", 1, &["child"], false),
+        &resolvers,
+        true,
+    );
+    assert_eq!(
+        graph.rdeps("/repo/child.ts").unwrap().guarantee,
+        Guarantee::Approximate,
+        "a newly resolved stub violates root-wide exactness"
+    );
+
+    graph.upsert_file(&analysis("/repo/child.ts", 2, &[], false), &resolvers, true);
+    assert_eq!(
+        graph.rdeps("/repo/child.ts").unwrap().guarantee,
+        Guarantee::Exact
+    );
+
+    assert!(graph.remove_file("/repo/child.ts"));
+    assert_eq!(
+        graph.rdeps("/repo/child.ts").unwrap().guarantee,
+        Guarantee::Approximate,
+        "demoting a referenced node must invalidate root-wide exactness"
+    );
+    graph.upsert_file(&analysis("/repo/child.ts", 3, &[], false), &resolvers, true);
+    assert_eq!(
+        graph.rdeps("/repo/child.ts").unwrap().guarantee,
+        Guarantee::Exact
+    );
+
+    graph.upsert_file(
+        &analysis("/repo/parent.ts", 4, &["child"], true),
+        &resolvers,
+        true,
+    );
+    assert_eq!(
+        graph.rdeps("/repo/child.ts").unwrap().guarantee,
+        Guarantee::Approximate
+    );
+    graph.upsert_file(
+        &analysis("/repo/parent.ts", 5, &["child"], false),
+        &resolvers,
+        true,
+    );
+    assert_eq!(
+        graph.rdeps("/repo/child.ts").unwrap().guarantee,
+        Guarantee::Exact
+    );
+
+    graph.upsert_file(
+        &analysis("/repo/parent.ts", 6, &["orphan"], false),
+        &resolvers,
+        true,
+    );
+    assert_eq!(
+        graph.rdeps("/repo/parent.ts").unwrap().guarantee,
+        Guarantee::Approximate
+    );
+    graph.upsert_file(
+        &analysis("/repo/parent.ts", 7, &[], false),
+        &resolvers,
+        true,
+    );
+    assert!(graph.node("/repo/orphan.ts").is_none());
+    assert_eq!(
+        graph.rdeps("/repo/parent.ts").unwrap().guarantee,
+        Guarantee::Exact,
+        "pruning the last inexact stub must restore exactness"
+    );
+
+    graph.bump_resolver_generation();
+    assert_eq!(
+        graph.rdeps("/repo/parent.ts").unwrap().guarantee,
+        Guarantee::Approximate
+    );
+    graph.reresolve_all(&resolvers);
+    assert_eq!(
+        graph.rdeps("/repo/parent.ts").unwrap().guarantee,
+        Guarantee::Exact
+    );
+}
+
+#[test]
 fn guarantee_matrix_covers_node_resolver_opaque_and_universe_state() {
     let live_state = MockState::with_targets([("query", Resolved::Path("/repo/query.ts".into()))]);
     let live_resolvers = live_state.resolvers();
@@ -306,6 +412,56 @@ fn guarantee_matrix_covers_node_resolver_opaque_and_universe_state() {
     assert_eq!(
         graph.rdeps("/repo/no-import-spec.go").unwrap().guarantee,
         Guarantee::Approximate
+    );
+}
+
+#[cfg(all(
+    feature = "bundled-languages",
+    feature = "resolve-js",
+    feature = "resolve-rust"
+))]
+#[test]
+fn resolver_baseline_controls_zero_import_guarantees() {
+    let registry = LanguageRegistry::bundled();
+    let mut pool = ParserPool::new(&registry);
+    let rust_path = "/repo/src/lib.rs";
+    let rust_analysis = analyze_source(
+        r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#,
+        rust_path,
+        1,
+        &mut pool,
+    );
+    let typescript_path = "/repo/src/app.ts";
+    let typescript_analysis =
+        analyze_source("export function main() {}\n", typescript_path, 2, &mut pool);
+    assert!(rust_analysis.imports.is_empty());
+    assert!(typescript_analysis.imports.is_empty());
+
+    let resolvers = ResolverSet {
+        js: Some(js_resolver(JsResolveOptions::default())),
+        rust: Some(rust_resolver(RustResolveOptions {
+            crate_roots: vec![rust_path.into()],
+        })),
+    };
+    let mut graph = ModuleGraph::new();
+    graph.upsert_file(
+        &rust_analysis,
+        &resolvers,
+        registry.supports_imports(Path::new(rust_path)),
+    );
+    graph.upsert_file(
+        &typescript_analysis,
+        &resolvers,
+        registry.supports_imports(Path::new(typescript_path)),
+    );
+
+    assert_eq!(
+        graph.deps(rust_path).unwrap().guarantee,
+        Guarantee::Approximate
+    );
+    assert_eq!(
+        graph.deps(typescript_path).unwrap().guarantee,
+        Guarantee::Exact
     );
 }
 

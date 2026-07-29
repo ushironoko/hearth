@@ -235,67 +235,43 @@ impl SymbolIndex {
                 .as_ref()
                 .filter(|cached| cached.needle == needle && cached.limit == limit)
             {
-                return cached
-                    .hits
-                    .iter()
-                    .filter_map(|(slot, symbol_index)| self.symbol_ref(*slot, *symbol_index))
-                    .collect();
+                return self.symbol_refs(&cached.hits);
             }
         }
 
         // Do not hold the memo lock while scoring. Concurrent readers should
         // not form a convoy that delays an external index write lock.
-        //
-        // Do not reserve from the caller-controlled `limit`: the vector grows
-        // only for actual matches, keeping `usize::MAX` safe.
-        let mut candidates = Vec::new();
-        for (slot, (file, lowered_names)) in self.files.iter().zip(&self.lowered_names).enumerate()
-        {
-            let Some(file) = file else {
-                continue;
-            };
-            for (symbol_index, (symbol, lowered_name)) in
-                file.symbols.iter().zip(lowered_names).enumerate()
-            {
-                let lowered_name = lowered_name.as_deref().unwrap_or(&symbol.name);
-                if let Some(score) = fuzzy_score_lowered(lowered_name, &needle) {
-                    candidates.push(SearchCandidate {
-                        score,
-                        name_len: symbol.name.len(),
-                        path: &file.path,
-                        line: symbol.line,
-                        symbol_index: symbol_index as u32,
-                        slot: slot as u32,
-                    });
-                }
-            }
-        }
-
-        let compare = |a: &SearchCandidate<'_>, b: &SearchCandidate<'_>| {
-            #[cfg(test)]
-            self.search_comparisons.fetch_add(1, Ordering::Relaxed);
-            compare_search_candidates(a, b)
-        };
-        if candidates.len() > limit {
-            candidates.select_nth_unstable_by(limit, &compare);
-            candidates.truncate(limit);
-        }
-        // The partition discarded every candidate outside the top N, so this
-        // full ordering never handles more than `limit` entries.
-        candidates.sort_by(&compare);
-
-        let hits: Vec<_> = candidates
-            .into_iter()
-            .map(|candidate| (candidate.slot, candidate.symbol_index))
-            .collect();
+        let hits = self.search_hits(&needle, limit, |_| true);
         *self.memo.lock() = Some(CachedSearch {
             needle,
             limit,
             hits: hits.clone(),
         });
-        hits.iter()
-            .filter_map(|(slot, symbol_index)| self.symbol_ref(*slot, *symbol_index))
-            .collect()
+        self.symbol_refs(&hits)
+    }
+
+    /// Fuzzy-searches symbols in allowed files without populating the global
+    /// search memo.
+    ///
+    /// The predicate is evaluated once per occupied file before any of its
+    /// symbols are scored.
+    #[must_use]
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        allowed: impl Fn(&str) -> bool,
+    ) -> Vec<SymbolRef<'_>> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let needle = LoweredNeedle::new(query);
+        #[cfg(test)]
+        self.search_comparisons.store(0, Ordering::Relaxed);
+
+        let hits = self.search_hits(&needle, limit, allowed);
+        self.symbol_refs(&hits)
     }
 
     /// Returns the number of indexed symbols.
@@ -340,6 +316,65 @@ impl SymbolIndex {
             path: &file.path,
             symbol,
         })
+    }
+
+    fn symbol_refs(&self, hits: &[(u32, u32)]) -> Vec<SymbolRef<'_>> {
+        hits.iter()
+            .filter_map(|(slot, symbol_index)| self.symbol_ref(*slot, *symbol_index))
+            .collect()
+    }
+
+    fn search_hits(
+        &self,
+        needle: &LoweredNeedle,
+        limit: usize,
+        allowed: impl Fn(&str) -> bool,
+    ) -> Vec<(u32, u32)> {
+        // Do not reserve from the caller-controlled `limit`: the vector grows
+        // only for actual matches, keeping `usize::MAX` safe.
+        let mut candidates = Vec::new();
+        for (slot, (file, lowered_names)) in self.files.iter().zip(&self.lowered_names).enumerate()
+        {
+            let Some(file) = file else {
+                continue;
+            };
+            if !allowed(file.path.as_str()) {
+                continue;
+            }
+            for (symbol_index, (symbol, lowered_name)) in
+                file.symbols.iter().zip(lowered_names).enumerate()
+            {
+                let lowered_name = lowered_name.as_deref().unwrap_or(&symbol.name);
+                if let Some(score) = fuzzy_score_lowered(lowered_name, needle) {
+                    candidates.push(SearchCandidate {
+                        score,
+                        name_len: symbol.name.len(),
+                        path: &file.path,
+                        line: symbol.line,
+                        symbol_index: symbol_index as u32,
+                        slot: slot as u32,
+                    });
+                }
+            }
+        }
+
+        let compare = |a: &SearchCandidate<'_>, b: &SearchCandidate<'_>| {
+            #[cfg(test)]
+            self.search_comparisons.fetch_add(1, Ordering::Relaxed);
+            compare_search_candidates(a, b)
+        };
+        if candidates.len() > limit {
+            candidates.select_nth_unstable_by(limit, &compare);
+            candidates.truncate(limit);
+        }
+        // The partition discarded every candidate outside the top N, so this
+        // full ordering never handles more than `limit` entries.
+        candidates.sort_by(&compare);
+
+        candidates
+            .into_iter()
+            .map(|candidate| (candidate.slot, candidate.symbol_index))
+            .collect()
     }
 
     fn add_name_entries(&mut self, slot: u32, symbols: &[Symbol]) -> Vec<Option<Box<str>>> {
@@ -701,6 +736,110 @@ mod tests {
             let expected = full_sort_search_reference(&index, "sym", limit);
             assert_eq!(index.search("sym", limit), expected, "limit {limit}");
         }
+    }
+
+    #[test]
+    fn test_filtered_search_matches_materialize_then_filter_and_preserves_memo() {
+        let index = SymbolIndex::from_files(
+            vec![
+                file_fixture(
+                    "src/allowed-a.rs",
+                    1,
+                    vec![
+                        test_symbol("sym", SymbolKind::Function, 50, 0),
+                        test_symbol("sym_long", SymbolKind::Function, 2, 0),
+                        test_symbol("do_sym", SymbolKind::Method, 1, 0),
+                    ],
+                ),
+                file_fixture(
+                    "src/disallowed.rs",
+                    2,
+                    vec![
+                        test_symbol("sym_a", SymbolKind::Function, 12, 0),
+                        test_symbol("symbol", SymbolKind::Function, 8, 0),
+                        test_symbol("asym", SymbolKind::Class, 5, 0),
+                    ],
+                ),
+                file_fixture(
+                    "src/allowed-b.rs",
+                    3,
+                    vec![
+                        test_symbol("sym_b", SymbolKind::Method, 12, 0),
+                        test_symbol("my_sym", SymbolKind::Constant, 4, 0),
+                    ],
+                ),
+            ],
+            0,
+        );
+        let allowed = |path: &str| path != "src/disallowed.rs";
+        let expected_all: Vec<_> = index
+            .search("sym", usize::MAX)
+            .into_iter()
+            .filter(|hit| allowed(hit.path))
+            .collect();
+        let expected = expected_all[..4].to_vec();
+        let memo_before = {
+            let memo = index.memo.lock();
+            let memo = memo.as_ref().unwrap();
+            (memo.needle.clone(), memo.limit, memo.hits.clone())
+        };
+
+        let actual = index.search_filtered("sym", 4, allowed);
+
+        assert_eq!(actual, expected);
+        let memo = index.memo.lock();
+        let memo = memo.as_ref().unwrap();
+        assert_eq!(
+            (&memo.needle, memo.limit, &memo.hits),
+            (&memo_before.0, memo_before.1, &memo_before.2)
+        );
+        assert!(index.search_filtered("sym", 0, |_| true).is_empty());
+        assert_eq!(
+            index.search_filtered("sym", usize::MAX, allowed),
+            expected_all
+        );
+        assert!(index.search_filtered("sym", 10, |_| false).is_empty());
+    }
+
+    #[test]
+    fn test_filtered_search_top_n_does_not_sort_disallowed_matches() {
+        let disallowed = (0..4_900)
+            .map(|index| {
+                test_symbol(
+                    &format!("matching_symbol_{index:04}"),
+                    SymbolKind::Function,
+                    ((index * 7_919) % 5_000 + 1) as u32,
+                    0,
+                )
+            })
+            .collect();
+        let allowed = (4_900..5_000)
+            .map(|index| {
+                test_symbol(
+                    &format!("matching_symbol_{index:04}"),
+                    SymbolKind::Function,
+                    ((index * 7_919) % 5_000 + 1) as u32,
+                    0,
+                )
+            })
+            .collect();
+        let index = SymbolIndex::from_files(
+            vec![
+                file_fixture("src/disallowed.rs", 1, disallowed),
+                file_fixture("src/allowed.rs", 2, allowed),
+            ],
+            0,
+        );
+
+        let hits = index.search_filtered("matching", 10, |path| path == "src/allowed.rs");
+
+        assert_eq!(hits.len(), 10);
+        let comparisons = index.search_comparisons();
+        assert!(
+            comparisons < 1_000,
+            "ordering 10 allowed matches took {comparisons} comparisons; \
+             disallowed files appear to have reached the global sort"
+        );
     }
 
     #[test]

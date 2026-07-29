@@ -15,82 +15,141 @@ pub(crate) fn extract(source: &str, tree: &tree_sitter::Tree) -> Vec<RawImport> 
 }
 
 fn visit(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) {
-    match node.kind() {
-        "use_declaration" => {
-            if let Some(argument) = node.child_by_field_name("argument") {
-                expand_use_tree(argument, "", source, imports);
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "use_declaration" => {
+                if let Some(argument) = node.child_by_field_name("argument") {
+                    expand_use_tree(argument, source, imports);
+                }
             }
-        }
-        "mod_item" => {
-            if node.child_by_field_name("body").is_none()
-                && let Some(name) = node.child_by_field_name("name")
-            {
-                let specifier = node_text(name, source);
-                push_import(name, specifier, ImportKind::RustMod, imports);
+            "mod_item" => {
+                if node.child_by_field_name("body").is_none()
+                    && let Some(name) = node.child_by_field_name("name")
+                {
+                    let specifier = node_text(name, source);
+                    push_import(name, specifier, ImportKind::RustMod, imports);
+                }
             }
+            _ => {}
         }
-        _ => {}
-    }
 
-    visit_children(node, source, imports);
-}
-
-fn visit_children(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit(child, source, imports);
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        pending.extend(children.into_iter().rev());
     }
 }
 
-fn expand_use_tree(node: Node<'_>, prefix: &str, source: &[u8], imports: &mut Vec<RawImport>) {
-    match node.kind() {
-        "scoped_use_list" => {
-            let path = node
-                .child_by_field_name("path")
-                .and_then(|path| normalized_path(path, source));
-            let next_prefix = path
-                .as_deref()
-                .map_or_else(|| prefix.to_owned(), |path| join_path(prefix, path));
-            if let Some(list) = node.child_by_field_name("list") {
-                expand_use_tree(list, &next_prefix, source, imports);
+#[derive(Clone, Copy, Default)]
+struct UsePrefix(Option<usize>);
+
+struct UsePrefixPart {
+    parent: UsePrefix,
+    segment: String,
+    rendered_len: usize,
+}
+
+fn expand_use_tree(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) {
+    let mut prefixes = Vec::new();
+    let mut pending = vec![(node, UsePrefix::default())];
+    while let Some((node, prefix)) = pending.pop() {
+        match node.kind() {
+            "scoped_use_list" => {
+                let next_prefix = node
+                    .child_by_field_name("path")
+                    .and_then(|path| normalized_path(path, source))
+                    .map_or(prefix, |path| extend_prefix(prefix, path, &mut prefixes));
+                if let Some(list) = node.child_by_field_name("list") {
+                    pending.push((list, next_prefix));
+                }
             }
-        }
-        "use_list" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                expand_use_tree(child, prefix, source, imports);
+            "use_list" => {
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.named_children(&mut cursor).collect();
+                pending.extend(children.into_iter().rev().map(|child| (child, prefix)));
             }
-        }
-        "use_as_clause" => {
-            if let Some(path) = node.child_by_field_name("path")
-                && let Some(segment) = normalized_path(path, source)
-            {
-                push_use_leaf(path, prefix, &segment, imports);
+            "use_as_clause" => {
+                if let Some(path) = node.child_by_field_name("path")
+                    && let Some(segment) = normalized_path(path, source)
+                {
+                    push_use_leaf(path, prefix, &prefixes, &segment, imports);
+                }
             }
-        }
-        "use_wildcard" => {
-            let segment = node
-                .named_child(0)
-                .and_then(|path| normalized_path(path, source))
-                .map_or_else(|| "*".to_owned(), |path| format!("{path}::*"));
-            push_use_leaf(node, prefix, &segment, imports);
-        }
-        "identifier" | "scoped_identifier" | "crate" | "self" | "super" | "metavariable" => {
-            if let Some(segment) = normalized_path(node, source) {
-                push_use_leaf(node, prefix, &segment, imports);
+            "use_wildcard" => {
+                let segment = node
+                    .named_child(0)
+                    .and_then(|path| normalized_path(path, source))
+                    .map_or_else(|| "*".to_owned(), |path| format!("{path}::*"));
+                push_use_leaf(node, prefix, &prefixes, &segment, imports);
             }
+            "identifier" | "scoped_identifier" | "crate" | "self" | "super" | "metavariable" => {
+                if let Some(segment) = normalized_path(node, source) {
+                    push_use_leaf(node, prefix, &prefixes, &segment, imports);
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
 }
 
-fn push_use_leaf(node: Node<'_>, prefix: &str, segment: &str, imports: &mut Vec<RawImport>) {
-    let specifier = if segment == "self" && !prefix.is_empty() {
-        prefix.to_owned()
-    } else {
-        join_path(prefix, segment)
-    };
+fn extend_prefix(
+    prefix: UsePrefix,
+    segment: String,
+    prefixes: &mut Vec<UsePrefixPart>,
+) -> UsePrefix {
+    if segment.is_empty() {
+        return prefix;
+    }
+    let rendered_len = prefix.0.map_or(segment.len(), |index| {
+        prefixes[index].rendered_len + 2 + segment.len()
+    });
+    prefixes.push(UsePrefixPart {
+        parent: prefix,
+        segment,
+        rendered_len,
+    });
+    UsePrefix(Some(prefixes.len() - 1))
+}
+
+fn push_use_leaf(
+    node: Node<'_>,
+    prefix: UsePrefix,
+    prefixes: &[UsePrefixPart],
+    segment: &str,
+    imports: &mut Vec<RawImport>,
+) {
+    let specifier = render_use_path(prefix, prefixes, segment);
     push_import(node, Some(specifier), ImportKind::RustUse, imports);
+}
+
+fn render_use_path(prefix: UsePrefix, prefixes: &[UsePrefixPart], segment: &str) -> String {
+    let prefix_len = prefix.0.map_or(0, |index| prefixes[index].rendered_len);
+    let append_segment = segment != "self" || prefix.0.is_none();
+    let mut specifier = String::with_capacity(
+        prefix_len
+            + usize::from(prefix.0.is_some() && append_segment) * 2
+            + append_segment as usize * segment.len(),
+    );
+    let mut parts = Vec::new();
+    let mut current = prefix;
+    while let Some(index) = current.0 {
+        let part = &prefixes[index];
+        parts.push(part.segment.as_str());
+        current = part.parent;
+    }
+    for part in parts.into_iter().rev() {
+        if !specifier.is_empty() {
+            specifier.push_str("::");
+        }
+        specifier.push_str(part);
+    }
+    if append_segment {
+        if !specifier.is_empty() {
+            specifier.push_str("::");
+        }
+        specifier.push_str(segment);
+    }
+    specifier
 }
 
 fn push_import(
@@ -120,16 +179,43 @@ fn push_import(
 }
 
 fn normalized_path(node: Node<'_>, source: &[u8]) -> Option<String> {
-    if node.kind() == "scoped_identifier" {
-        let name = node
-            .child_by_field_name("name")
-            .and_then(|name| normalized_path(name, source))?;
-        return node
-            .child_by_field_name("path")
-            .and_then(|path| normalized_path(path, source))
-            .map_or(Some(name.clone()), |path| Some(join_path(&path, &name)));
+    enum Frame<'tree> {
+        Visit(Node<'tree>),
+        JoinScoped { has_path: bool },
     }
-    node_text(node, source)
+
+    let mut pending = vec![Frame::Visit(node)];
+    let mut values = Vec::new();
+    while let Some(frame) = pending.pop() {
+        match frame {
+            Frame::Visit(node) if node.kind() == "scoped_identifier" => {
+                let Some(name) = node.child_by_field_name("name") else {
+                    values.push(None);
+                    continue;
+                };
+                let path = node.child_by_field_name("path");
+                pending.push(Frame::JoinScoped {
+                    has_path: path.is_some(),
+                });
+                if let Some(path) = path {
+                    pending.push(Frame::Visit(path));
+                }
+                pending.push(Frame::Visit(name));
+            }
+            Frame::Visit(node) => values.push(node_text(node, source)),
+            Frame::JoinScoped { has_path } => {
+                let path = has_path.then(|| values.pop().flatten()).flatten();
+                let Some(name) = values.pop().flatten() else {
+                    values.push(None);
+                    continue;
+                };
+                values.push(Some(
+                    path.map_or(name.clone(), |path| join_path(&path, &name)),
+                ));
+            }
+        }
+    }
+    values.pop().flatten()
 }
 
 fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {

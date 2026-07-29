@@ -38,6 +38,10 @@ struct RustResolver {
 }
 
 impl Resolve for RustResolver {
+    fn baseline_completeness(&self) -> ResolutionCompleteness {
+        COMPLETENESS
+    }
+
     fn resolve(&self, from_file: &str, import: &RawImport) -> ResolutionOutcome {
         let from_path = Path::new(from_file);
         debug_assert!(

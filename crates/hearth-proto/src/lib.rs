@@ -666,8 +666,11 @@ pub struct GraphParams {
     /// Follow symbolic links while walking.
     #[serde(default)]
     pub follow_symlinks: bool,
-    /// Caller-supplied universe (view filter). Empty means a walk-derived
-    /// universe.
+    /// Caller-supplied query view and revalidation set. Empty means a
+    /// walk-derived universe. Dependency, reverse-dependency, and neighborhood
+    /// traversal is confined to listed files. External dependency packages are
+    /// not files and remain visible from listed importers. Excluding a file
+    /// endpoint from a traversal downgrades the result to `Approximate`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     /// Reuse window for the revalidation sweep, in milliseconds.
@@ -801,8 +804,8 @@ pub struct GraphMeta {
     pub sweep_age_ms: u64,
     /// Whether the universe walk came from the walk cache.
     pub walk_cache_hit: bool,
-    /// Whether the rdeps repair pass stopped at its per-query cap, leaving
-    /// grep hits unexamined.
+    /// Whether the rdeps repair pass stopped at its per-query repair cap or
+    /// the bounded grep candidate set overflowed, leaving hits unexamined.
     #[serde(default)]
     pub repair_truncated: bool,
 }
@@ -852,9 +855,13 @@ pub struct GraphNode {
     /// Absolute path of the file.
     pub path: String,
     /// Stable node identifier in the form
-    /// `"{root-relative path}@{xxh3 16-digit lowercase hex}"`. The relative
-    /// path may itself contain `@`, so clients must split on the last `@`
-    /// (`rsplit`).
+    /// `"{path prefix}@{xxh3 16-digit lowercase hex}"`. For an indexed node,
+    /// the prefix is the root-relative path and the hash is the xxh3 of the
+    /// file content. A stub node (`indexed == false`) whose content hash is
+    /// unknown uses the sentinel `0000000000000000` and has path-based rather
+    /// than content-based identity. A node outside the root uses its absolute
+    /// path as the prefix. The prefix may itself contain `@`, so clients must
+    /// split on the last `@` (`rsplit`).
     pub node_id: String,
     /// Frozen lowercase language vocabulary: `rust`, `typescript`, `tsx`,
     /// `javascript`, `jsx`, `go`, `python`, `ruby`, `c`, `cpp`, `java`,
@@ -871,10 +878,22 @@ pub struct GraphNode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphDepEdge {
-    /// Source node identifier.
+    /// Absolute path of the importing file, joinable to [`GraphNode::path`];
+    /// this is not a node identifier.
     pub from: String,
-    /// Destination node identifier.
+    /// Node identifier of the importing file, using exactly the same
+    /// path-prefix and content-hash convention as [`GraphNode::node_id`].
+    pub from_node_id: String,
+    /// Absolute path of the resolved target file, or the bare package name
+    /// when the target is an external package.
     pub to: String,
+    /// Node identifier of a workspace-file target, using exactly the same
+    /// convention as [`GraphNode::node_id`]. External packages have no file
+    /// node and omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_node_id: Option<String>,
+    /// Frozen lowercase target vocabulary: `path` or `external`.
+    pub to_kind: String,
     /// Import specifier exactly as written in the source.
     pub specifier: String,
     /// Frozen lowercase edge vocabulary: `import`, `reexport`, `dynamic`,

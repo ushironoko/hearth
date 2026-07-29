@@ -7,8 +7,11 @@ use std::{
 };
 
 use hearth_graph::{
-    ImportKind, JsResolveOptions, RawImport, ResolutionOutcome, Resolved, ResolverSet,
-    UnresolvedReason, js_resolver, js_resolver_with_fs, resolve::FailedKind,
+    FileAnalysis, ImportKind, JsResolveOptions, RawImport, ResolutionCompleteness,
+    ResolutionOutcome, Resolved, ResolverSet, UnresolvedReason,
+    graph::{Guarantee, ModuleGraph},
+    js_resolver, js_resolver_with_fs,
+    resolve::FailedKind,
 };
 use oxc_resolver::{FileMetadata, FileSystem, ResolveError};
 use tempfile::TempDir;
@@ -213,6 +216,229 @@ fn diamond_tsconfig_extends_is_not_reported_as_a_cycle() {
         outcome.notes.iter().all(|note| !note.contains("cycle")),
         "{outcome:?}"
     );
+}
+
+#[test]
+fn tsconfig_extends_visit_budget_truncates_tracking() {
+    let test = std::thread::Builder::new()
+        .name("tsconfig-extends-visit-budget".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            const EXTENDED_CONFIGS: usize = 257;
+            let fixture = Fixture::new();
+            let mut chain = Vec::with_capacity(EXTENDED_CONFIGS);
+            for level in 0..EXTENDED_CONFIGS {
+                let contents = if level + 1 == EXTENDED_CONFIGS {
+                    r#"{"compilerOptions":{"strict":true}}"#.to_owned()
+                } else {
+                    format!(r#"{{"extends":"./level{}.json"}}"#, level + 1)
+                };
+                chain.push(fixture.write(&format!("configs/level{level}.json"), &contents));
+            }
+            let tsconfig = fixture.write("tsconfig.json", r#"{"extends":"./configs/level0.json"}"#);
+            let importer = fixture.write("src/app.ts", "");
+            let expected = fixture.write("src/local.ts", "export const local = true;");
+            let resolver = js_resolver(JsResolveOptions {
+                tsconfig: Some(tsconfig.clone()),
+                ..JsResolveOptions::default()
+            });
+
+            for _ in 0..2 {
+                let outcome = resolver.resolve(
+                    path_str(&importer),
+                    &raw_import("./local", ImportKind::EsStatic),
+                );
+
+                assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+                assert_eq!(outcome.completeness, ResolutionCompleteness::Partial);
+                assert!(
+                    outcome
+                        .notes
+                        .iter()
+                        .any(|note| note.contains("tsconfig extends visit budget")),
+                    "{outcome:?}"
+                );
+                assert_dependency(&outcome, &tsconfig);
+                assert_dependency(&outcome, &chain[254]);
+            }
+        })
+        .expect("spawn tsconfig visit-budget test");
+    test.join().expect("tsconfig visit-budget test panicked");
+}
+
+#[test]
+fn oversized_tsconfig_extends_file_truncates_tracking() {
+    let fixture = Fixture::new();
+    let tsconfig = fixture.write("tsconfig.json", r#"{"extends":"./config/oversized.json"}"#);
+    let mut oversized = r#"{"compilerOptions":{"strict":true}}"#.to_owned();
+    oversized.push_str(&" ".repeat(1024 * 1024));
+    let oversized = fixture.write("config/oversized.json", &oversized);
+    let importer = fixture.write("src/app.ts", "");
+    let expected = fixture.write("src/local.ts", "export const local = true;");
+    let resolver = js_resolver(JsResolveOptions {
+        tsconfig: Some(tsconfig),
+        ..JsResolveOptions::default()
+    });
+
+    let outcome = resolver.resolve(
+        path_str(&importer),
+        &raw_import("./local", ImportKind::EsStatic),
+    );
+
+    assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+    assert_eq!(outcome.completeness, ResolutionCompleteness::Partial);
+    assert_dependency(&outcome, &oversized);
+    assert!(
+        outcome
+            .notes
+            .iter()
+            .any(|note| note.contains("size limit of 1048576 bytes")),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn tsconfig_extends_entry_limit_tracks_the_bounded_prefix() {
+    const EXTENDS_ENTRY_LIMIT: usize = 32;
+
+    let fixture = Fixture::new();
+    let mut specifiers = Vec::new();
+    let mut configs = Vec::new();
+    for index in 0..=EXTENDS_ENTRY_LIMIT {
+        specifiers.push(format!("./config/base-{index}.json"));
+        configs.push(fixture.write(
+            &format!("config/base-{index}.json"),
+            r#"{"compilerOptions":{"strict":true}}"#,
+        ));
+    }
+    let tsconfig = fixture.write(
+        "tsconfig.json",
+        &serde_json::json!({"extends": specifiers}).to_string(),
+    );
+    let importer = fixture.write("src/app.ts", "");
+    let expected = fixture.write("src/local.ts", "export const local = true;");
+    let resolver = js_resolver(JsResolveOptions {
+        tsconfig: Some(tsconfig),
+        ..JsResolveOptions::default()
+    });
+
+    let outcome = resolver.resolve(
+        path_str(&importer),
+        &raw_import("./local", ImportKind::EsStatic),
+    );
+
+    assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+    assert_eq!(outcome.completeness, ResolutionCompleteness::Partial);
+    assert!(
+        outcome
+            .notes
+            .iter()
+            .any(|note| note.contains("tsconfig extends entry limit of 32")),
+        "{outcome:?}"
+    );
+    for config in &configs[..EXTENDS_ENTRY_LIMIT] {
+        assert_dependency(&outcome, config);
+    }
+}
+
+#[test]
+fn shared_tsconfig_diamond_consumes_one_visit_per_unique_config() {
+    const DIAMOND_LAYERS: usize = 9;
+
+    let fixture = Fixture::new();
+    let mut configs = Vec::new();
+    for layer in 0..DIAMOND_LAYERS {
+        let contents = if layer + 1 == DIAMOND_LAYERS {
+            r#"{"compilerOptions":{"strict":true}}"#.to_owned()
+        } else {
+            format!(
+                r#"{{"extends":["./left-{}.json","./right-{}.json"]}}"#,
+                layer + 1,
+                layer + 1
+            )
+        };
+        configs.push(fixture.write(&format!("config/left-{layer}.json"), &contents));
+        configs.push(fixture.write(&format!("config/right-{layer}.json"), &contents));
+    }
+    let tsconfig = fixture.write(
+        "tsconfig.json",
+        r#"{"extends":["./config/left-0.json","./config/right-0.json"]}"#,
+    );
+    let importer = fixture.write("src/app.ts", "");
+    let expected = fixture.write("src/local.ts", "export const local = true;");
+    let resolver = js_resolver(JsResolveOptions {
+        tsconfig: Some(tsconfig.clone()),
+        ..JsResolveOptions::default()
+    });
+
+    let outcome = resolver.resolve(
+        path_str(&importer),
+        &raw_import("./local", ImportKind::EsStatic),
+    );
+
+    assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+    assert_eq!(outcome.completeness, ResolutionCompleteness::Complete);
+    assert!(
+        outcome
+            .notes
+            .iter()
+            .all(|note| !note.contains("tsconfig extends visit budget")),
+        "{outcome:?}"
+    );
+    for config in std::iter::once(&tsconfig).chain(&configs) {
+        assert_eq!(
+            outcome
+                .dependencies
+                .iter()
+                .filter(|dependency| dependency.as_str() == path_str(config))
+                .count(),
+            1,
+            "duplicate dependency for {} in {:?}",
+            config.display(),
+            outcome.dependencies
+        );
+    }
+}
+
+#[test]
+fn short_tsconfig_extends_chain_stays_complete_without_budget_note() {
+    let fixture = Fixture::new();
+    let tsconfig = fixture.write(
+        "tsconfig.json",
+        r#"{"extends":"./config/base.json","include":["src/**/*"]}"#,
+    );
+    let base = fixture.write(
+        "config/base.json",
+        r#"{"extends":"./shared.json","compilerOptions":{"strict":true}}"#,
+    );
+    let shared = fixture.write(
+        "config/shared.json",
+        r#"{"compilerOptions":{"allowJs":true}}"#,
+    );
+    let importer = fixture.write("src/app.ts", "");
+    let expected = fixture.write("src/local.ts", "export const local = true;");
+    let resolver = js_resolver(JsResolveOptions {
+        tsconfig: Some(tsconfig.clone()),
+        ..JsResolveOptions::default()
+    });
+
+    let outcome = resolver.resolve(
+        path_str(&importer),
+        &raw_import("./local", ImportKind::EsStatic),
+    );
+
+    assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+    assert_eq!(outcome.completeness, ResolutionCompleteness::Complete);
+    assert!(
+        outcome
+            .notes
+            .iter()
+            .all(|note| !note.contains("tsconfig extends visit budget")),
+        "{outcome:?}"
+    );
+    for config in [tsconfig, base, shared] {
+        assert_dependency(&outcome, &config);
+    }
 }
 
 #[test]
@@ -449,6 +675,11 @@ fn reports_missing_relative_and_bare_specifiers() {
             Resolved::Unresolved(UnresolvedReason::NotFound),
             "{specifier}"
         );
+        assert_eq!(
+            outcome.completeness,
+            ResolutionCompleteness::Complete,
+            "{specifier}"
+        );
     }
 }
 
@@ -469,6 +700,7 @@ fn malformed_tsconfig_and_invalid_exports_are_failed_not_not_found() {
 
     assert_dependency(&malformed, &malformed_tsconfig);
     assert_eq!(failed_kind(&malformed), FailedKind::Config);
+    assert_eq!(malformed.completeness, ResolutionCompleteness::Partial);
 
     let package_json = fixture.write(
         "node_modules/invalid-exports/package.json",
@@ -490,6 +722,10 @@ fn malformed_tsconfig_and_invalid_exports_are_failed_not_not_found() {
 
     assert_dependency(&invalid_exports, &package_json);
     assert_eq!(failed_kind(&invalid_exports), FailedKind::Config);
+    assert_eq!(
+        invalid_exports.completeness,
+        ResolutionCompleteness::Partial
+    );
 }
 
 #[test]
@@ -509,6 +745,7 @@ fn missing_tsconfig_and_undefined_package_import_are_failed_not_not_found() {
 
     assert_dependency(&missing_config, &missing_tsconfig);
     assert_eq!(failed_kind(&missing_config), FailedKind::Config);
+    assert_eq!(missing_config.completeness, ResolutionCompleteness::Partial);
 
     let package_json = fixture.write(
         "package.json",
@@ -584,6 +821,58 @@ fn empty_specifier_is_an_invalid_specifier_failure() {
     let outcome = resolver.resolve(path_str(&importer), &raw_import("", ImportKind::EsStatic));
 
     assert_eq!(failed_kind(&outcome), FailedKind::InvalidSpecifier);
+    assert_eq!(outcome.completeness, ResolutionCompleteness::Partial);
+}
+
+#[test]
+fn filesystem_errors_are_partial_io_failures() {
+    let root = Path::new("/virtual-hearth-io-error-root");
+    let importer = root.join("src/app.ts");
+    let broken_link = root.join("src/blocked.ts");
+    let filesystem = MemoryFileSystem::with_files([
+        (importer.clone(), String::new()),
+        (broken_link.clone(), String::new()),
+    ])
+    .with_broken_symlink(broken_link);
+    let resolver = js_resolver_with_fs(filesystem, JsResolveOptions::default());
+
+    let outcome = resolver.resolve(
+        path_str(&importer),
+        &raw_import("./blocked", ImportKind::EsStatic),
+    );
+
+    assert_eq!(failed_kind(&outcome), FailedKind::Io);
+    assert_eq!(outcome.completeness, ResolutionCompleteness::Partial);
+}
+
+#[test]
+fn failed_js_resolution_downgrades_graph_deps_guarantee() {
+    let fixture = Fixture::new();
+    let tsconfig = fixture.write("tsconfig.json", r#"{"compilerOptions":"#);
+    let importer = fixture.write("src/app.ts", "");
+    let resolvers = ResolverSet {
+        js: Some(js_resolver(JsResolveOptions {
+            tsconfig: Some(tsconfig),
+            ..JsResolveOptions::default()
+        })),
+        rust: None,
+    };
+    let mut graph = ModuleGraph::new();
+    let analysis = FileAnalysis {
+        path: compact_path(&importer),
+        content_hash: 1,
+        language: Some("typescript".into()),
+        symbols: Vec::new(),
+        imports: vec![raw_import("./local", ImportKind::EsStatic)],
+        has_opaque_imports: false,
+    };
+
+    graph.upsert_file(&analysis, &resolvers, true);
+
+    assert_eq!(
+        graph.deps(path_str(&importer)).unwrap().guarantee,
+        Guarantee::Approximate
+    );
 }
 
 #[test]
@@ -735,6 +1024,7 @@ fn failed_kind(outcome: &ResolutionOutcome) -> FailedKind {
 struct MemoryFileSystem {
     files: HashMap<PathBuf, String>,
     directories: HashSet<PathBuf>,
+    broken_symlinks: HashSet<PathBuf>,
 }
 
 impl MemoryFileSystem {
@@ -744,7 +1034,16 @@ impl MemoryFileSystem {
             .keys()
             .flat_map(|path| path.ancestors().skip(1).map(Path::to_path_buf))
             .collect();
-        Self { files, directories }
+        Self {
+            files,
+            directories,
+            broken_symlinks: HashSet::new(),
+        }
+    }
+
+    fn with_broken_symlink(mut self, path: PathBuf) -> Self {
+        self.broken_symlinks.insert(path);
+        self
     }
 
     fn metadata_for(&self, path: &Path) -> io::Result<FileMetadata> {
@@ -779,7 +1078,11 @@ impl FileSystem for MemoryFileSystem {
     }
 
     fn symlink_metadata(&self, path: &Path) -> io::Result<FileMetadata> {
-        self.metadata_for(path)
+        if self.broken_symlinks.contains(path) {
+            Ok(FileMetadata::new(false, false, true))
+        } else {
+            self.metadata_for(path)
+        }
     }
 
     fn read_link(&self, path: &Path) -> Result<PathBuf, ResolveError> {
@@ -787,6 +1090,12 @@ impl FileSystem for MemoryFileSystem {
     }
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        if self.broken_symlinks.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("virtual symlink target is unreadable: {}", path.display()),
+            ));
+        }
         self.metadata_for(path)?;
         Ok(path.to_path_buf())
     }

@@ -520,31 +520,92 @@ test("invalidateRoot covers what a shell command did", async () => {
 // ---------------------------------------------------------------------------
 suite("graph");
 
-test("keeps sync and async symbol results in parity", async () => {
-  const dir = tempDir();
-  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+test("keeps all graph operations in sync and async parity", async () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
   const path = seed(
-    dir,
+    root,
     "a.ts",
-    "export function alpha() {}\nexport function beta() {}\n",
+    'import { beta } from "./b";\nexport function alpha() { return beta(); }\n',
   );
+  const dependency = seed(root, "b.ts", "export function beta() { return 42; }\n");
+  const outputFields = [
+    "symbols",
+    "outline",
+    "search",
+    "definitions",
+    "deps",
+    "rdeps",
+    "neighborhood",
+    "status",
+  ];
+  const operations = [
+    {
+      field: "status",
+      syncMethod: "graphStatus",
+      asyncMethod: "graphStatusAsync",
+      params: { root },
+    },
+    {
+      field: "symbols",
+      syncMethod: "graphSymbols",
+      asyncMethod: "graphSymbolsAsync",
+      params: { root, path },
+    },
+    {
+      field: "outline",
+      syncMethod: "graphOutline",
+      asyncMethod: "graphOutlineAsync",
+      params: { root, path },
+    },
+    {
+      field: "search",
+      syncMethod: "graphSearch",
+      asyncMethod: "graphSearchAsync",
+      params: { root, query: "alpha", limit: 10 },
+    },
+    {
+      field: "definitions",
+      syncMethod: "graphDefinitions",
+      asyncMethod: "graphDefinitionsAsync",
+      params: { root, name: "alpha", limit: 10 },
+    },
+    {
+      field: "deps",
+      syncMethod: "graphDeps",
+      asyncMethod: "graphDepsAsync",
+      params: { root, path },
+    },
+    {
+      field: "rdeps",
+      syncMethod: "graphRdeps",
+      asyncMethod: "graphRdepsAsync",
+      params: { root, path: dependency, verify: true },
+    },
+    {
+      field: "neighborhood",
+      syncMethod: "graphNeighborhood",
+      asyncMethod: "graphNeighborhoodAsync",
+      params: { root, path, depth: 1 },
+    },
+  ];
 
-  const sync = engine.graphSymbols({ root: dir, path });
-  const asyncResult = await engine.graphSymbolsAsync({ root: dir, path });
-  assert.deepEqual(sync.symbols.symbols, asyncResult.symbols.symbols);
+  for (const { field, syncMethod, asyncMethod, params } of operations) {
+    const sync = engine[syncMethod]({ ...params });
+    const asyncResult = await engine[asyncMethod]({ ...params });
+    assert.deepStrictEqual(
+      sync[field],
+      asyncResult[field],
+      `${syncMethod} and ${asyncMethod} return the same ${field} payload`,
+    );
 
-  for (const result of [sync, asyncResult]) {
-    assert.ok(result.symbols);
-    for (const field of [
-      "outline",
-      "search",
-      "definitions",
-      "deps",
-      "rdeps",
-      "neighborhood",
-      "status",
-    ]) {
-      assert.equal(result[field], undefined);
+    for (const result of [sync, asyncResult]) {
+      assert.notEqual(result[field], undefined, `${field} output is present`);
+      for (const otherField of outputFields) {
+        if (otherField !== field) {
+          assert.equal(result[otherField], undefined, `${otherField} output is absent`);
+        }
+      }
     }
   }
 });
@@ -655,9 +716,23 @@ test("returns dependency edges in sync and async queries", async () => {
     assert.ok(edge, "a.ts has an edge to b.ts");
     assert.deepEqual(
       Object.keys(edge).sort(),
-      ["from", "guarantee", "kind", "line", "specifier", "to"],
+      [
+        "from",
+        "fromNodeId",
+        "guarantee",
+        "kind",
+        "line",
+        "specifier",
+        "to",
+        "toKind",
+        "toNodeId",
+      ],
     );
     assert.equal(edge.from, a);
+    assert.equal(edge.from, result.deps.node.path);
+    assert.equal(edge.fromNodeId, result.deps.node.nodeId);
+    assert.equal(typeof edge.toNodeId, "string");
+    assert.equal(edge.toKind, "path");
     assert.equal(edge.specifier, "./b");
     assert.equal(edge.kind, "import");
     assert.equal(edge.line, 1);
@@ -668,6 +743,29 @@ test("returns dependency edges in sync and async queries", async () => {
     assert.deepEqual(Object.keys(basis).sort(), ["contentHashHex", "path"]);
     assert.match(basis.contentHashHex, /^[0-9a-f]{16}$/);
   }
+});
+
+test("uses bare package names for external dependency targets", () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const packageDir = join(root, "node_modules", "react");
+  mkdirSync(packageDir, { recursive: true });
+  seed(packageDir, "package.json", '{"name":"react","main":"index.js"}\n');
+  seed(packageDir, "index.js", "export default {};\n");
+  const importer = seed(
+    root,
+    "external.ts",
+    'import React from "react";\nexport const element = React;\n',
+  );
+
+  const result = engine.graphDeps({ root, path: importer });
+  const edge = result.deps.edges.find((candidate) => candidate.specifier === "react");
+  assert.ok(edge, "external package import produces an edge");
+  assert.equal(edge.fromNodeId, result.deps.node.nodeId);
+  assert.equal(edge.to, "react");
+  assert.equal(edge.toNodeId, undefined);
+  assert.equal(edge.toKind, "external");
+  assert.equal(edge.to.startsWith("/"), false);
 });
 
 test("returns verified reverse dependencies in sync and async queries", async () => {
@@ -694,6 +792,24 @@ test("returns verified reverse dependencies in sync and async queries", async ()
   }
 });
 
+test("files views omit out-of-view reverse dependencies", () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const a = seed(
+    root,
+    "a.ts",
+    'import { value } from "./b";\nexport const doubled = value * 2;\n',
+  );
+  const b = seed(root, "b.ts", "export const value = 21;\n");
+
+  engine.graphRdeps({ root, path: b, verify: true });
+  const result = engine.graphRdeps({ root, path: b, files: [b], verify: true });
+  const importer = result.rdeps.importers.find((entry) => entry.node.path === a);
+
+  assert.equal(importer, undefined);
+  assert.equal(result.meta.guarantee, "approximate");
+});
+
 test("returns neighborhood nodes and edges in sync and async queries", async () => {
   const root = realpathSync(tempDir());
   const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
@@ -713,10 +829,15 @@ test("returns neighborhood nodes and edges in sync and async queries", async () 
       result.neighborhood.nodes.map((node) => node.path).sort(),
       [a, b].sort(),
     );
-    assert.ok(
-      result.neighborhood.edges.some((edge) => edge.from === a && edge.to === b),
-      "the neighborhood connects a.ts to b.ts",
+    const edge = result.neighborhood.edges.find(
+      (candidate) => candidate.from === a && candidate.to === b,
     );
+    assert.ok(edge, "the neighborhood connects a.ts to b.ts");
+    const fromNode = result.neighborhood.nodes.find((node) => node.path === edge.from);
+    const toNode = result.neighborhood.nodes.find((node) => node.path === edge.to);
+    assert.equal(edge.fromNodeId, fromNode.nodeId);
+    assert.equal(edge.toNodeId, toNode.nodeId);
+    assert.equal(edge.toKind, "path");
   }
 });
 

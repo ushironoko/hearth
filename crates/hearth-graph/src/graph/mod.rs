@@ -211,6 +211,7 @@ pub struct ModuleGraph {
     nodes: Vec<Option<ModuleNode>>,
     by_path: FxHashMap<CompactString, u32>,
     free: Vec<u32>,
+    inexact_nodes: usize,
     generation: u64,
     universe_complete: bool,
     resolver_generation: u64,
@@ -312,9 +313,16 @@ impl ModuleGraph {
         };
         let slot =
             existing.unwrap_or_else(|| self.allocate(ModuleNode::stub(analysis.path.clone())));
+        let was_exact = self.node_is_rdeps_exact(slot);
         let old_targets = self.node_targets(slot);
+        let baseline_completeness = analysis
+            .language
+            .as_deref()
+            .map_or(ResolutionCompleteness::Complete, |language| {
+                resolvers.baseline_completeness(language)
+            });
         let (edges, config_dependencies, resolution_complete) =
-            self.materialize_resolutions(resolutions);
+            self.materialize_resolutions(resolutions, baseline_completeness);
         let new_targets = targets_from_edges(&edges);
 
         self.update_rdeps(slot, &old_targets, &new_targets);
@@ -331,6 +339,8 @@ impl ModuleGraph {
         node.resolver_live = resolver_live;
         node.resolution_complete = resolution_complete;
         node.resolved_at = resolved_at;
+        let is_exact = self.node_is_rdeps_exact(slot);
+        self.record_exactness_transition(was_exact, is_exact);
         self.record_mutation();
         outcome
     }
@@ -350,6 +360,7 @@ impl ModuleGraph {
             return true;
         }
 
+        let was_exact = self.node_is_rdeps_exact(slot);
         let old_targets = self.node_targets(slot);
         self.update_rdeps(slot, &old_targets, &FxHashSet::default());
 
@@ -364,6 +375,7 @@ impl ModuleGraph {
             node.resolver_live = false;
             node.resolution_complete = false;
             node.resolved_at = 0;
+            self.record_exactness_transition(was_exact, false);
         }
         self.record_mutation();
         true
@@ -375,6 +387,7 @@ impl ModuleGraph {
     /// they are never rebuilt globally.
     pub fn reresolve_all(&mut self, resolvers: &ResolverSet) {
         self.resolver_generation += 1;
+        self.inexact_nodes = self.by_path.len();
         let current_generation = self.resolver_generation;
         let jobs: Vec<_> = self
             .nodes
@@ -401,8 +414,13 @@ impl ModuleGraph {
             let resolutions = resolve_imports(resolvers, &path, &imports);
             let resolver_live = resolver_is_live(language.as_deref(), &imports, resolvers);
             let old_targets = self.node_targets(slot);
+            let baseline_completeness = language
+                .as_deref()
+                .map_or(ResolutionCompleteness::Complete, |language| {
+                    resolvers.baseline_completeness(language)
+                });
             let (edges, config_dependencies, resolution_complete) =
-                self.materialize_resolutions(resolutions);
+                self.materialize_resolutions(resolutions, baseline_completeness);
             let new_targets = targets_from_edges(&edges);
             self.update_rdeps(slot, &old_targets, &new_targets);
 
@@ -412,6 +430,8 @@ impl ModuleGraph {
             node.resolver_live = resolver_live;
             node.resolution_complete = resolution_complete;
             node.resolved_at = current_generation;
+            let is_exact = self.node_is_rdeps_exact(slot);
+            self.record_exactness_transition(false, is_exact);
         }
         self.record_mutation();
     }
@@ -419,6 +439,7 @@ impl ModuleGraph {
     /// Advances only the resolver generation, leaving current edges stale.
     pub fn bump_resolver_generation(&mut self) {
         self.resolver_generation += 1;
+        self.inexact_nodes = self.by_path.len();
         self.record_mutation();
     }
 
@@ -608,19 +629,7 @@ impl ModuleGraph {
     }
 
     fn rdeps_guarantee(&self) -> Guarantee {
-        let exact = self.universe_complete
-            && self.nodes.iter().flatten().all(|node| {
-                matches!(
-                    node.state,
-                    NodeState::Analyzed {
-                        has_opaque_imports: false,
-                        ..
-                    }
-                ) && node.imports_supported
-                    && node.resolver_live
-                    && node.resolution_complete
-                    && node.resolved_at == self.resolver_generation
-            });
+        let exact = self.universe_complete && self.inexact_nodes == 0;
         if exact {
             Guarantee::Exact
         } else {
@@ -653,9 +662,10 @@ impl ModuleGraph {
     fn materialize_resolutions(
         &mut self,
         resolutions: Vec<(RawImport, ResolutionOutcome)>,
+        baseline_completeness: ResolutionCompleteness,
     ) -> (Vec<ImportEdge>, Vec<CompactString>, bool) {
         let mut dependencies = FxHashSet::default();
-        let mut resolution_complete = true;
+        let mut resolution_complete = baseline_completeness == ResolutionCompleteness::Complete;
         let edges = resolutions
             .into_iter()
             .map(|(raw, outcome)| {
@@ -682,6 +692,7 @@ impl ModuleGraph {
     }
 
     fn allocate(&mut self, node: ModuleNode) -> u32 {
+        let exact = rdeps_node_is_exact(&node, self.resolver_generation);
         let path = node.path.clone();
         let slot = if let Some(slot) = self.free.pop() {
             debug_assert!(self.nodes[slot as usize].is_none());
@@ -694,6 +705,7 @@ impl ModuleGraph {
             slot
         };
         self.by_path.insert(path, slot);
+        self.inexact_nodes += usize::from(!exact);
         slot
     }
 
@@ -701,6 +713,9 @@ impl ModuleGraph {
         let node = self.nodes[slot as usize]
             .take()
             .expect("slot to free must be occupied");
+        if !rdeps_node_is_exact(&node, self.resolver_generation) {
+            self.inexact_nodes -= 1;
+        }
         let removed = self.by_path.remove(node.path.as_str());
         debug_assert_eq!(removed, Some(slot));
         self.free.push(slot);
@@ -766,9 +781,34 @@ impl ModuleGraph {
             .expect("graph edge must reference an occupied slot")
     }
 
+    fn node_is_rdeps_exact(&self, slot: u32) -> bool {
+        rdeps_node_is_exact(self.occupied(slot), self.resolver_generation)
+    }
+
+    fn record_exactness_transition(&mut self, was_exact: bool, is_exact: bool) {
+        match (was_exact, is_exact) {
+            (false, true) => self.inexact_nodes -= 1,
+            (true, false) => self.inexact_nodes += 1,
+            (false, false) | (true, true) => {}
+        }
+    }
+
     fn record_mutation(&mut self) {
         self.generation += 1;
     }
+}
+
+fn rdeps_node_is_exact(node: &ModuleNode, resolver_generation: u64) -> bool {
+    matches!(
+        node.state,
+        NodeState::Analyzed {
+            has_opaque_imports: false,
+            ..
+        }
+    ) && node.imports_supported
+        && node.resolver_live
+        && node.resolution_complete
+        && node.resolved_at == resolver_generation
 }
 
 fn resolve_imports(

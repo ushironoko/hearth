@@ -282,13 +282,14 @@ matching sweep key inside the caller's explicit window.
 
 `Exact` means exact for the verified snapshot identified by the result's basis
 and `sweep_age_ms`, scoped to supported languages; reuse explicitly allowed by
-`max_stale_ms` stays exact. A non-voluntary stale answer caused by sweep-lock
-contention is `Approximate`, and so is any answer from a root with known
-unindexable files (`failedFiles` or `oversizeFiles` above zero) — those files
-may hold symbols the answer cannot see. The stat gate shares grep's trust
-contract: an out-of-band edit that preserves both size and mtime stays
-invisible until an invalidation arrives. The result meta reports the weakest
-guarantee for the complete answer.
+`max_stale_ms` stays exact, with `sweep_age_ms` taken from that matching sweep
+key's stamp rather than a newer sweep of another view. A non-voluntary stale
+answer caused by sweep-lock contention is `Approximate`, and so is any answer
+from a root with known unindexable files (`failedFiles` or `oversizeFiles` above
+zero) — those files may hold symbols the answer cannot see. The stat gate shares
+grep's trust contract: an out-of-band edit that preserves both size and mtime
+stays invisible until an invalidation arrives. The result meta reports the
+weakest guarantee for the complete answer.
 
 The dependency layer extracts imports during the same parse that feeds the
 symbol index, then resolves JavaScript and TypeScript specifiers through
@@ -306,13 +307,15 @@ Multi-hop traversal composes them by taking the weakest guarantee, and
 freshness, and unindexable files.
 
 Resolver configuration is part of that generation boundary. A root begins with
-a tracked optional stat record for `tsconfig.json`, including `None` when the
-file is missing. Resolution adds the selected config and every tracked
-`extends` dependency, including missing relative targets, and every sweep
-compares fresh optional `(mtime_ns, size)` records with the previous set. A
-change, including a missing-to-present transition, replaces the resolver,
-advances its generation, and re-resolves all analyzed imports before publishing
-the sweep, so callers do not observe edges from the old configuration.
+tracked optional stat records for both `tsconfig.json` and `jsconfig.json`,
+including `None` when either file is missing. `tsconfig.json` takes precedence
+when both exist; otherwise `jsconfig.json` is used as the root tsconfig-format
+configuration. Resolution adds the selected config and every tracked `extends`
+dependency, including missing relative targets, and every sweep compares fresh
+optional `(mtime_ns, size)` records with the previous set. A change, including a
+missing-to-present transition, replaces the resolver, advances its generation,
+and re-resolves all analyzed imports before publishing the sweep, so callers do
+not observe edges from the old configuration.
 
 Verified rdeps has a source-text backstop for cases where structural exactness
 cannot be established. It greps the whole root for needles derived from the
@@ -323,25 +326,46 @@ Hits that are already analyzed but structurally incomplete are reported as
 `Approximate` importer entries without re-analysis; stale or unknown candidates
 are re-analyzed so comment-only hits can be rejected and newly discovered
 imports can repair the graph. At most `MAX_RDEPS_REPAIR` such candidates are re-analyzed
-per query; stopping at that cap sets `repair_truncated`. Files that cannot be
-analyzed, including oversized files, and analyzed files with opaque imports
-remain `Approximate` importer entries rather than being silently discarded.
-Concurrent identical repairs collapse into a single flight keyed by the target,
-the graph and resolver generations, and the hidden/ignore/symlink parameters
-that affect the grep.
+per query; stopping at that cap sets `repair_truncated`. The grep candidate set
+is also bounded, and overflow reports `repair_truncated` rather than claiming
+complete verification. Files that cannot be analyzed, including oversized
+files, and analyzed files with opaque imports remain `Approximate` importer
+entries rather than being silently discarded. Concurrent identical repairs
+collapse into a single flight keyed by the target, the graph and resolver
+generations, and the hidden/ignore/symlink parameters that affect the grep.
 
 Rust resolution v1 keeps best-effort filesystem edges for the standard `src/`
 layout and direct `src/bin/*.rs`, `examples/*.rs`, and `tests/*.rs` crate roots,
-but every Rust resolver outcome is `Partial`: Rust edges and any graph result
-containing them are always `Approximate`. `Exact` Rust resolution would require
-Cargo target metadata plus a declaration-tree model for inline modules,
-`#[path]`, `cfg`, macros, and `mod` ambiguity; that remains future work.
+but its resolver baseline and every outcome are `Partial`: Rust nodes remain
+`Approximate` even when import extraction finds no imports. `Exact` Rust
+resolution would require Cargo target metadata plus a declaration-tree model
+for inline modules, `#[path]`, `cfg`, macros, and `mod` ambiguity; that remains
+future work.
 
-Node IDs are `<root-relative-path>@<xxh3-hex>`. Because a path may contain `@`,
-clients must split on the last delimiter (`rsplit`), not the first. With no
-`files` list the cached walk is the universe and may drive deletion from the
-index. A supplied `files` list is only a query view and revalidation set; it
-never removes other files from the shared per-root index.
+Node IDs are `<path-prefix>@<xxh3-hex>`. For indexed nodes the prefix is the
+root-relative path and the hash is the xxh3 of the file content. A stub node
+(`indexed == false`) whose content hash is unknown uses the
+`0000000000000000` sentinel and has path-based rather than content-based
+identity. Nodes outside the root, reachable through resolver aliases or
+relative escapes, use their absolute path as the prefix. Because a path may
+contain `@`, clients must split on the last delimiter (`rsplit`), not the first.
+The legacy dependency edge endpoints remain paths: `from` is the importing
+file's absolute path, while `to` is the resolved target's absolute path or an
+external package's bare name. `fromNodeId` is always the byte-for-byte
+`GraphNode.nodeId` of that importing file. `toKind` is the frozen vocabulary
+`path | external`; path targets carry a joinable `toNodeId`, while external
+targets omit it.
+
+With no `files` list the cached walk is the universe and may drive deletion from
+the index. A supplied `files` list is only a query view and revalidation set; it
+never removes other files from the shared per-root index. Dependency, reverse
+dependency, and neighborhood starts must be inside the view. Their traversals
+still use the shared graph, but returned file nodes, importers, and edge
+endpoints are confined to the view. External-package edges from in-view owners
+remain visible because their targets are not files. Encountering an out-of-view
+endpoint or verified-rdeps grep candidate downgrades the result to
+`Approximate`; repair skips such candidates before file loading, parsing,
+budget accounting, or graph publication.
 
 All eight operations share one `Request::Graph(GraphParams)` wire variant.
 `GraphOp` is externally tagged and the transport carries no protocol version,

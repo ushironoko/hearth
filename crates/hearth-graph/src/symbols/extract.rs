@@ -63,6 +63,10 @@ pub(crate) fn extract_symbols_from_tree(
     pool: &mut ParserPool<'_>,
 ) -> Vec<Symbol> {
     const _: () = assert!(MAX_SYMBOLS_PER_FILE <= u16::MAX as usize);
+    let merge_adjacent_same_name_definitions = pool
+        .registry()
+        .get(id)
+        .is_some_and(|spec| spec.merge_adjacent_same_name_definitions);
     let Some(query) = pool.tags_query(id) else {
         return Vec::new();
     };
@@ -133,9 +137,11 @@ pub(crate) fn extract_symbols_from_tree(
         let depth = enclosing.len();
         enclosing.push(tag.end_byte);
 
-        // Some queries emit repeated declarations. Collapse only adjacent
-        // repeats so same-named symbols in distinct definitions survive.
-        if let Some(previous) = symbols.last()
+        // Some grammars emit one definition per equation of the same logical
+        // symbol. Only languages that explicitly opt in merge those adjacent
+        // definitions; ordinary sibling definitions may be overloads.
+        if merge_adjacent_same_name_definitions
+            && let Some(previous) = symbols.last()
             && previous.name.as_str() == tag.name
             && previous.kind == tag.kind
             && usize::from(previous.depth) == depth

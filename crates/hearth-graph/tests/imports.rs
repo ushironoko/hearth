@@ -1,5 +1,7 @@
 #![cfg(feature = "bundled-languages")]
 
+use std::fmt::Write as _;
+
 use hearth_graph::{
     FileAnalysis, ImportKind, LanguageRegistry, ParserPool, RawImport, analyze_source,
 };
@@ -209,6 +211,47 @@ fn rust_import_line_and_leaf_spans_are_exact() {
             },
         ]
     );
+}
+
+#[test]
+fn extracts_rust_import_with_one_hundred_thousand_nested_blocks() {
+    const DEPTH: usize = 100_000;
+    let mut source = String::with_capacity(DEPTH * 2 + 64);
+    source.push_str("use foo::bar;\nfn deeply_nested() {");
+    source.extend(std::iter::repeat_n('{', DEPTH));
+    source.extend(std::iter::repeat_n('}', DEPTH));
+    source.push_str("}\n");
+    assert!(source.len() < 2 * 1024 * 1024);
+
+    assert_eq!(
+        imports(&source, "src/deep_blocks.rs"),
+        [("foo::bar".to_owned(), ImportKind::RustUse)]
+    );
+}
+
+#[test]
+fn extracts_leaf_from_deeply_nested_rust_use_tree() {
+    const DEPTH: usize = 30_000;
+    let mut source = String::with_capacity(DEPTH * 12);
+    let mut expected = String::with_capacity(DEPTH * 8);
+    source.push_str("use ");
+    for level in 0..DEPTH {
+        write!(source, "a{level}::{{").unwrap();
+        if level > 0 {
+            expected.push_str("::");
+        }
+        write!(expected, "a{level}").unwrap();
+    }
+    source.push_str("leaf");
+    source.extend(std::iter::repeat_n('}', DEPTH));
+    source.push_str(";\n");
+    expected.push_str("::leaf");
+    assert!(source.len() < 2 * 1024 * 1024);
+
+    let analysis = analyze(&source, "src/deep_use_tree.rs");
+    assert_eq!(analysis.imports.len(), 1);
+    assert_eq!(analysis.imports[0].kind, ImportKind::RustUse);
+    assert_eq!(analysis.imports[0].specifier.as_str(), expected);
 }
 
 #[test]

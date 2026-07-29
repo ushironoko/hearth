@@ -1,5 +1,6 @@
+#![cfg(feature = "bundled-languages")]
+
 use hearth_graph::{LanguageRegistry, ParserPool, SymbolKind, extract_symbols};
-#[cfg(feature = "bundled-languages")]
 use std::path::Path;
 
 const RUST_SOURCE: &str = "\
@@ -53,6 +54,26 @@ namespace Demo {
 }
 ";
 
+const C_SHARP_OVERLOAD_SOURCE: &str = "\
+class Service {
+    void Run(int x) {}
+    void Run(string x) {}
+}
+";
+
+const HASKELL_SOURCE: &str = "\
+module Fixture where
+
+data Payload = Payload Int
+newtype UserId = UserId Int
+type Label = String
+class Renderable a where
+  render :: a -> String
+
+describe 0 = \"zero\"
+describe value = show value
+";
+
 const ZIG_SOURCE: &str = "\
 const Point = struct { x: i32 };
 pub fn add(a: i32, b: i32) i32 { return a + b; }
@@ -104,6 +125,14 @@ fn names(source: &str, path: &str) -> Vec<String> {
         .into_iter()
         .map(|symbol| symbol.name.to_string())
         .collect()
+}
+
+fn byte_range(source: &str, definition: &str) -> (u32, u32) {
+    let start = source.find(definition).expect("definition is in fixture");
+    (
+        u32::try_from(start).expect("fixture offset fits u32"),
+        u32::try_from(start + definition.len()).expect("fixture offset fits u32"),
+    )
 }
 
 #[test]
@@ -180,6 +209,140 @@ fn extract_c_sharp_uses_bundled_query() {
     assert_eq!(
         names(C_SHARP_SOURCE, "Service.cs"),
         ["Demo", "Service", "Run", "Count", "IThing"]
+    );
+}
+
+#[test]
+fn extract_c_sharp_preserves_overloaded_sibling_methods() {
+    let registry = LanguageRegistry::bundled();
+    let mut pool = ParserPool::new(&registry);
+    let symbols = extract_symbols(C_SHARP_OVERLOAD_SOURCE, "Service.cs", &mut pool);
+    let runs: Vec<_> = symbols
+        .iter()
+        .filter(|symbol| symbol.name == "Run")
+        .map(|symbol| {
+            (
+                symbol.name.as_str(),
+                symbol.kind,
+                symbol.line,
+                symbol.column,
+                symbol.depth,
+                symbol.name_start,
+                symbol.def_start,
+                symbol.def_end,
+            )
+        })
+        .collect();
+    let first_definition = "void Run(int x) {}";
+    let second_definition = "void Run(string x) {}";
+    let (first_start, first_end) = byte_range(C_SHARP_OVERLOAD_SOURCE, first_definition);
+    let (second_start, second_end) = byte_range(C_SHARP_OVERLOAD_SOURCE, second_definition);
+
+    assert_eq!(
+        runs,
+        [
+            (
+                "Run",
+                SymbolKind::Method,
+                2,
+                9,
+                1,
+                first_start + 5,
+                first_start,
+                first_end,
+            ),
+            (
+                "Run",
+                SymbolKind::Method,
+                3,
+                9,
+                1,
+                second_start + 5,
+                second_start,
+                second_end,
+            ),
+        ]
+    );
+    assert_ne!(runs[0].6..runs[0].7, runs[1].6..runs[1].7);
+}
+
+#[test]
+fn extract_haskell_declarations_and_merges_function_equations() {
+    let registry = LanguageRegistry::bundled();
+    let mut pool = ParserPool::new(&registry);
+    let symbols = extract_symbols(HASKELL_SOURCE, "Fixture.hs", &mut pool);
+    let actual: Vec<_> = symbols
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.name.as_str(),
+                symbol.kind,
+                symbol.line,
+                symbol.column,
+                symbol.depth,
+                symbol.name_start,
+                symbol.def_start,
+                symbol.def_end,
+            )
+        })
+        .collect();
+    let declarations = [
+        ("module Fixture where", "Fixture", SymbolKind::Module, 1, 7),
+        (
+            "data Payload = Payload Int",
+            "Payload",
+            SymbolKind::Class,
+            3,
+            5,
+        ),
+        (
+            "newtype UserId = UserId Int",
+            "UserId",
+            SymbolKind::Class,
+            4,
+            8,
+        ),
+        ("type Label = String", "Label", SymbolKind::Type, 5, 5),
+        (
+            "class Renderable a where\n  render :: a -> String",
+            "Renderable",
+            SymbolKind::Interface,
+            6,
+            6,
+        ),
+        (
+            "describe 0 = \"zero\"",
+            "describe",
+            SymbolKind::Function,
+            9,
+            0,
+        ),
+    ];
+    let expected: Vec<_> = declarations
+        .into_iter()
+        .map(|(definition, name, kind, line, column)| {
+            let (def_start, def_end) = byte_range(HASKELL_SOURCE, definition);
+            (
+                name,
+                kind,
+                line,
+                column,
+                0,
+                def_start + column,
+                def_start,
+                def_end,
+            )
+        })
+        .collect();
+
+    assert_eq!(actual, expected);
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|symbol| symbol.name == "describe")
+            .count(),
+        1,
+        "two Haskell equations should produce one function symbol"
     );
 }
 
@@ -281,6 +444,8 @@ fn extracted_byte_ranges_are_coherent() {
         (PYTHON_SOURCE, "loader.py"),
         (GO_SOURCE, "main.go"),
         (C_SHARP_SOURCE, "Service.cs"),
+        (C_SHARP_OVERLOAD_SOURCE, "Overloads.cs"),
+        (HASKELL_SOURCE, "Fixture.hs"),
         (ZIG_SOURCE, "point.zig"),
         (BASH_SOURCE, "deploy.sh"),
         (MARKDOWN_SOURCE, "README.md"),
@@ -311,7 +476,6 @@ fn extracted_byte_ranges_are_coherent() {
     }
 }
 
-#[cfg(feature = "bundled-languages")]
 #[test]
 fn bundled_registry_does_not_include_host_injected_moonbit() {
     assert!(!LanguageRegistry::bundled().supports_symbols(Path::new("foo.mbt")));

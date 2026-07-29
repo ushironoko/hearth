@@ -512,7 +512,8 @@ fn render_graph(result: &GraphResult) -> i32 {
         }
         GraphOutput::Deps(result) => {
             render_graph_edges(&mut out, &result.edges);
-            result.edges.is_empty()
+            render_graph_unresolved(&mut out, &result.unresolved);
+            result.edges.is_empty() && result.unresolved.is_empty()
         }
         GraphOutput::Rdeps(result) => {
             render_graph_rdeps(&mut out, result);
@@ -580,15 +581,34 @@ fn render_graph_edges(out: &mut String, edges: &[GraphDepEdge]) {
     }
 }
 
+fn render_graph_unresolved(out: &mut String, unresolved: &[GraphUnresolvedImport]) {
+    let mut lines: Vec<_> = unresolved
+        .iter()
+        .map(|entry| {
+            format!(
+                "unresolved --[{:?}]--> ? line {} ({})",
+                entry.specifier, entry.line, entry.reason
+            )
+        })
+        .collect();
+    lines.sort();
+    for line in lines {
+        let _ = writeln!(out, "{line}");
+    }
+}
+
 fn render_graph_rdeps(out: &mut String, result: &GraphRdepsResult) {
     let mut lines: Vec<_> = result
         .importers
         .iter()
         .map(|entry| {
+            let evidence = entry.specifier.as_deref().map_or_else(
+                || "grep".to_owned(),
+                |specifier| format!("import {specifier:?}"),
+            );
             format!(
-                "{} --[import {:?}]--> {} [{}]",
+                "{} --[{evidence}]--> {} [{}]",
                 entry.node.node_id,
-                entry.specifier.as_deref().unwrap_or_default(),
                 result.node.node_id,
                 graph_guarantee_label(entry.guarantee)
             )
@@ -603,7 +623,7 @@ fn render_graph_rdeps(out: &mut String, result: &GraphRdepsResult) {
 fn graph_guarantee_label(guarantee: GraphGuarantee) -> &'static str {
     match guarantee {
         GraphGuarantee::Exact => "exact",
-        GraphGuarantee::Approximate => "approx",
+        GraphGuarantee::Approximate => "approximate",
     }
 }
 
@@ -651,4 +671,125 @@ fn render_graph_status(out: &mut String, status: &GraphStatusResult) {
             .build_duration_us
             .map_or_else(|| "none".to_owned(), |value| value.to_string())
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn graph_node(path: &str, node_id: &str) -> GraphNode {
+        GraphNode {
+            path: path.into(),
+            node_id: node_id.into(),
+            language: Some("typescript".into()),
+            indexed: true,
+        }
+    }
+
+    fn coverage() -> GraphCoverage {
+        GraphCoverage {
+            analyzed: 1,
+            stubs: 0,
+            basis: Vec::new(),
+        }
+    }
+
+    fn meta(guarantee: GraphGuarantee) -> GraphMeta {
+        GraphMeta {
+            guarantee,
+            root: "/tmp/root".into(),
+            universe_files: 1,
+            indexed_files: 1,
+            unsupported_files: 0,
+            oversize_files: 0,
+            revalidated_files: 1,
+            reindexed_files: 0,
+            swept: true,
+            sweep_age_ms: 0,
+            walk_cache_hit: false,
+            repair_truncated: false,
+        }
+    }
+
+    #[test]
+    fn unresolved_only_deps_render_details_and_exit_successfully() {
+        let unresolved = GraphUnresolvedImport {
+            specifier: "missing-package".into(),
+            line: 7,
+            reason: "package not found".into(),
+        };
+        let mut out = String::new();
+        render_graph_unresolved(&mut out, std::slice::from_ref(&unresolved));
+        assert!(!out.is_empty());
+        assert!(out.contains("\"missing-package\""));
+        assert!(out.contains("package not found"));
+
+        let result = GraphResult {
+            meta: meta(GraphGuarantee::Exact),
+            output: GraphOutput::Deps(GraphDepsResult {
+                node: graph_node("/tmp/root/a.ts", "a.ts@0000000000000001"),
+                edges: Vec::new(),
+                unresolved: vec![unresolved],
+                coverage: coverage(),
+            }),
+        };
+        assert_eq!(render_graph(&result), 0);
+    }
+
+    #[test]
+    fn edge_guarantee_labels_match_the_wire_vocabulary() {
+        let mut out = String::new();
+        render_graph_edges(
+            &mut out,
+            &[GraphDepEdge {
+                from: "/tmp/root/a.ts".into(),
+                from_node_id: "a.ts@0000000000000001".into(),
+                to: "/tmp/root/b.ts".into(),
+                to_node_id: Some("b.ts@0000000000000002".into()),
+                to_kind: "path".into(),
+                specifier: "./b".into(),
+                kind: "import".into(),
+                line: 1,
+                guarantee: GraphGuarantee::Approximate,
+            }],
+        );
+        assert!(out.trim_end().ends_with("[approximate]"));
+
+        let labels: BTreeSet<_> = [GraphGuarantee::Exact, GraphGuarantee::Approximate]
+            .map(graph_guarantee_label)
+            .into_iter()
+            .collect();
+        assert_eq!(labels, BTreeSet::from(["approximate", "exact"]));
+    }
+
+    #[test]
+    fn rdeps_distinguish_import_specifiers_from_grep_evidence() {
+        let target = graph_node("/tmp/root/b.ts", "b.ts@0000000000000002");
+        let result = GraphRdepsResult {
+            node: target,
+            importers: vec![
+                GraphRdepEntry {
+                    node: graph_node("/tmp/root/a.ts", "a.ts@0000000000000001"),
+                    specifier: Some("./b".into()),
+                    line: 1,
+                    guarantee: GraphGuarantee::Exact,
+                },
+                GraphRdepEntry {
+                    node: graph_node("/tmp/root/grep.ts", "grep.ts@0000000000000003"),
+                    specifier: None,
+                    line: 4,
+                    guarantee: GraphGuarantee::Approximate,
+                },
+            ],
+            verified: false,
+            coverage: coverage(),
+        };
+        let mut out = String::new();
+        render_graph_rdeps(&mut out, &result);
+
+        assert!(out.contains("--[import \"./b\"]-->"));
+        assert!(out.contains("--[grep]-->"));
+        assert!(!out.contains("--[import \"\"]-->"));
+    }
 }

@@ -64,9 +64,10 @@ pub struct ResolutionOutcome {
     pub resolved: Resolved,
     /// Absolute paths of found and missing dependencies consulted during resolution.
     ///
-    /// JavaScript outcomes retain both the configured root tsconfig and the
-    /// config selected for an importing file, then follow the selected config's
-    /// `extends` chain. Traversing every project reference is out of scope for v1.
+    /// JavaScript outcomes retain both the configured root tsconfig-format file
+    /// and the config selected for an importing file, then follow the selected
+    /// config's `extends` chain. Traversing every project reference is out of
+    /// scope for v1.
     pub dependencies: Vec<CompactString>,
     /// Non-fatal observations made while collecting resolution dependencies.
     pub notes: Vec<CompactString>,
@@ -76,6 +77,14 @@ pub struct ResolutionOutcome {
 
 /// A type-erased module resolver.
 pub trait Resolve: Send + Sync {
+    /// Baseline completeness for files handled by this resolver.
+    ///
+    /// This applies even when import extraction yields no imports, so a
+    /// best-effort resolver cannot become exact through an empty fold.
+    fn baseline_completeness(&self) -> ResolutionCompleteness {
+        ResolutionCompleteness::Complete
+    }
+
     /// Resolve an import relative to its importing file.
     ///
     /// `from_file` must be an absolute path. Relative inputs return
@@ -100,6 +109,20 @@ pub struct ResolverSet {
 }
 
 impl ResolverSet {
+    /// Return the baseline completeness for a registered language name.
+    #[must_use]
+    pub fn baseline_completeness(&self, language: &str) -> ResolutionCompleteness {
+        let resolver = match language {
+            "rust" => self.rust.as_deref(),
+            "typescript" | "tsx" | "javascript" | "jsx" => self.js.as_deref(),
+            _ => None,
+        };
+        resolver.map_or(
+            ResolutionCompleteness::Complete,
+            Resolve::baseline_completeness,
+        )
+    }
+
     /// Dispatch an import to its language-specific resolver.
     pub fn resolve(&self, from_file: &str, import: &RawImport) -> ResolutionOutcome {
         let resolver = match import.kind {

@@ -36,8 +36,11 @@ fn node(language: Option<&str>) -> GraphNode {
 
 fn edge(kind: &str) -> GraphDepEdge {
     GraphDepEdge {
-        from: "src/a.ts@8000000000000001".into(),
-        to: "src/b.ts@00000000000000ab".into(),
+        from: "/tmp/r/src/a.ts".into(),
+        from_node_id: "src/a.ts@8000000000000001".into(),
+        to: "/tmp/r/src/b.ts".into(),
+        to_node_id: Some("src/b.ts@00000000000000ab".into()),
+        to_kind: "path".into(),
         specifier: "./b".into(),
         kind: kind.into(),
         line: 7,
@@ -332,6 +335,29 @@ fn missing_optional_graph_fields_stay_off_the_wire() {
 }
 
 #[test]
+fn dependency_edge_node_ids_and_target_kind_use_the_additive_camel_case_shape() {
+    let path_edge = serde_json::to_value(edge("import")).unwrap();
+    assert_eq!(path_edge["fromNodeId"], "src/a.ts@8000000000000001");
+    assert_eq!(path_edge["toNodeId"], "src/b.ts@00000000000000ab");
+    assert_eq!(path_edge["toKind"], "path");
+    assert!(path_edge.get("from_node_id").is_none());
+    assert!(path_edge.get("to_node_id").is_none());
+    assert!(path_edge.get("to_kind").is_none());
+
+    let mut external_edge = edge("import");
+    external_edge.to = "react".into();
+    external_edge.to_node_id = None;
+    external_edge.to_kind = "external".into();
+    let external_edge = serde_json::to_value(external_edge).unwrap();
+    assert_eq!(external_edge["fromNodeId"], "src/a.ts@8000000000000001");
+    assert_eq!(external_edge["toKind"], "external");
+    assert!(
+        external_edge.get("toNodeId").is_none(),
+        "an external package must not serialize a file node id"
+    );
+}
+
+#[test]
 fn frozen_graph_vocabularies_serialize_exactly() {
     const SYMBOL_KINDS: [&str; 11] = [
         "function",
@@ -384,6 +410,12 @@ fn frozen_graph_vocabularies_serialize_exactly() {
     for kind in EDGE_KINDS {
         let value = serde_json::to_value(edge(kind)).unwrap();
         assert_eq!(value["kind"], kind);
+    }
+    for kind in ["path", "external"] {
+        let mut edge = edge("import");
+        edge.to_kind = kind.into();
+        let value = serde_json::to_value(edge).unwrap();
+        assert_eq!(value["toKind"], kind);
     }
     for language in LANGUAGES {
         let value = serde_json::to_value(node(Some(language))).unwrap();

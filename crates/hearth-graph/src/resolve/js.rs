@@ -3,7 +3,7 @@
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, io,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -22,10 +22,15 @@ use super::{
 };
 use crate::imports::{ImportKind, RawImport};
 
+const MAX_TSCONFIG_BYTES: usize = 1024 * 1024;
+const MAX_TSCONFIG_EXTENDS_ENTRIES: usize = 32;
+const MAX_TSCONFIG_EXTENDS_VISITS: usize = 256;
+
 /// Configuration for JavaScript and TypeScript module resolution.
 #[derive(Debug, Clone)]
 pub struct JsResolveOptions {
-    /// An optional manually selected `tsconfig.json`.
+    /// An optional manually selected tsconfig-format file, such as
+    /// `tsconfig.json` or `jsconfig.json`.
     pub tsconfig: Option<PathBuf>,
     /// Conditions accepted while resolving package `exports`.
     pub condition_names: Vec<String>,
@@ -145,25 +150,31 @@ impl Resolve for JsResolver {
 
         let mut dependency_paths: Vec<PathBuf> = self.configured_tsconfig.iter().cloned().collect();
         let mut notes = Vec::new();
+        let mut tsconfig_tracking_truncated = false;
         let tsconfig = match resolver.find_tsconfig(from_path) {
             Ok(tsconfig) => tsconfig,
             Err(error) => {
                 if let Some(configured_tsconfig) = &self.configured_tsconfig {
                     let tracking = self.track_tsconfig_chain(configured_tsconfig);
+                    tsconfig_tracking_truncated |= tracking.truncated;
                     dependency_paths.extend(tracking.dependencies);
                     notes.extend(tracking.notes);
                 }
                 dependency_paths.extend(error_dependency_paths(&error));
-                let outcome = unresolved(
+                let mut outcome = unresolved(
                     classify_error(error),
                     collect_dependencies(ResolveContext::default(), dependency_paths),
                     notes,
                 );
+                if tsconfig_tracking_truncated {
+                    outcome.completeness = ResolutionCompleteness::Partial;
+                }
                 return self.replay_dependencies(memo_key, outcome);
             }
         };
         if let Some(tsconfig) = &tsconfig {
             let tracking = self.track_tsconfig_chain(tsconfig.path());
+            tsconfig_tracking_truncated |= tracking.truncated;
             dependency_paths.extend(tracking.dependencies);
             notes.extend(tracking.notes);
         }
@@ -176,7 +187,7 @@ impl Resolve for JsResolver {
             &mut context,
         );
 
-        let outcome = match resolution {
+        let mut outcome = match resolution {
             Ok(resolution) => {
                 let package_json = resolution.package_json();
                 dependency_paths
@@ -201,6 +212,9 @@ impl Resolve for JsResolver {
                 )
             }
         };
+        if tsconfig_tracking_truncated {
+            outcome.completeness = ResolutionCompleteness::Partial;
+        }
         self.replay_dependencies(memo_key, outcome)
     }
 
@@ -245,6 +259,7 @@ impl JsResolver {
             .clone_with_options(tsconfig_extends_options());
         let mut tracking = TsconfigTracking::default();
         let mut pending = VecDeque::from([(absolute_path(leaf), Vec::new())]);
+        let mut visited = HashSet::new();
 
         while let Some((config_path, mut ancestry)) = pending.pop_front() {
             if ancestry.contains(&config_path) {
@@ -257,6 +272,22 @@ impl JsResolver {
                 );
                 continue;
             }
+            if visited.contains(&config_path) {
+                continue;
+            }
+            if visited.len() == MAX_TSCONFIG_EXTENDS_VISITS {
+                tracking.truncated = true;
+                tracking.notes.push(
+                    format!(
+                        "tsconfig extends visit budget of {MAX_TSCONFIG_EXTENDS_VISITS} configs \
+                         exhausted while tracking dependencies; {} configs remain pending",
+                        pending.len() + 1
+                    )
+                    .into(),
+                );
+                break;
+            }
+            visited.insert(config_path.clone());
             ancestry.push(config_path.clone());
             tracking.dependencies.push(config_path.clone());
 
@@ -273,6 +304,19 @@ impl JsResolver {
                     continue;
                 }
             };
+            if source.len() > MAX_TSCONFIG_BYTES {
+                tracking.truncated = true;
+                tracking.notes.push(
+                    format!(
+                        "tsconfig extends file {} exceeds the size limit of \
+                         {MAX_TSCONFIG_BYTES} bytes ({} bytes)",
+                        config_path.display(),
+                        source.len()
+                    )
+                    .into(),
+                );
+                continue;
+            }
             if let Err(error) = json_strip_comments::strip(&mut source) {
                 tracking.notes.push(
                     format!(
@@ -309,6 +353,21 @@ impl JsResolver {
                     continue;
                 }
             };
+            let mut specifiers = specifiers;
+            if specifiers.len() > MAX_TSCONFIG_EXTENDS_ENTRIES {
+                tracking.truncated = true;
+                tracking.notes.push(
+                    format!(
+                        "tsconfig extends entry limit of {MAX_TSCONFIG_EXTENDS_ENTRIES} exceeded \
+                         in {}; only the first {MAX_TSCONFIG_EXTENDS_ENTRIES} of {} entries were \
+                         tracked",
+                        config_path.display(),
+                        specifiers.len()
+                    )
+                    .into(),
+                );
+                specifiers.truncate(MAX_TSCONFIG_EXTENDS_ENTRIES);
+            }
             if specifiers.is_empty() {
                 continue;
             }
@@ -609,11 +668,16 @@ fn unresolved(
     dependencies: Vec<CompactString>,
     notes: Vec<CompactString>,
 ) -> ResolutionOutcome {
+    let completeness = if matches!(&reason, UnresolvedReason::Failed { .. }) {
+        ResolutionCompleteness::Partial
+    } else {
+        ResolutionCompleteness::Complete
+    };
     ResolutionOutcome {
         resolved: Resolved::Unresolved(reason),
         dependencies,
         notes,
-        completeness: ResolutionCompleteness::Complete,
+        completeness,
     }
 }
 
@@ -633,6 +697,7 @@ fn normalize_dependencies(dependencies: &mut Vec<CompactString>) {
 struct TsconfigTracking {
     dependencies: Vec<PathBuf>,
     notes: Vec<CompactString>,
+    truncated: bool,
 }
 
 #[derive(Clone)]

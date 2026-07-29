@@ -340,7 +340,10 @@ export interface GraphDefinitionsResult {
 
 export interface GraphDepEdge {
   from: string
+  fromNodeId: string
   to: string
+  toNodeId?: string
+  toKind: string
   specifier: string
   kind: string
   line: number

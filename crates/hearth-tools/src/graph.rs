@@ -28,7 +28,7 @@ use hearth_proto::{
 use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -39,6 +39,8 @@ use xxhash_rust::xxh3::Xxh3;
 const MAX_GRAPH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_GRAPH_ROOTS: usize = 16;
 const MAX_RDEPS_REPAIR: usize = 256;
+const MAX_RDEPS_GREP_CANDIDATES: u64 = 1024;
+const MAX_SWEEP_PUBLISH_REBUILDS: usize = 3;
 
 /// Run a graph query without a live cancellation token.
 pub fn graph(engine: &Engine, params: &GraphParams) -> ToolResult<GraphResult> {
@@ -65,12 +67,13 @@ pub fn graph_cancellable(
         }
 
         let graph_state = engine.extension::<GraphState>();
-        let root = graph_state.root(&root_path);
+        let pin = graph_state.root(&root_path);
+        let root = &pin.root;
         if matches!(params.op, GraphOp::Status) {
-            return Ok(status_query(engine, &root_path, &root));
+            return Ok(status_query(engine, &root_path, root));
         }
 
-        let answer = query_ready_root(engine, &graph_state, &root_path, &root, params, cancel)?;
+        let answer = query_ready_root(engine, &graph_state, &root_path, root, params, cancel)?;
         if let GraphOp::Rdeps {
             path,
             depth,
@@ -85,7 +88,7 @@ pub fn graph_cancellable(
                 engine,
                 &graph_state,
                 &root_path,
-                &root,
+                root,
                 params,
                 path,
                 *depth,
@@ -127,16 +130,20 @@ impl Default for GraphState {
 }
 
 impl GraphState {
-    fn root(&self, path: &Path) -> Arc<RootGraph> {
-        let root = Arc::clone(
-            self.roots
+    fn root(&self, path: &Path) -> RootQueryPin {
+        let root = {
+            let entry = self
+                .roots
                 .entry(path.to_path_buf())
-                .or_insert_with(|| Arc::new(RootGraph::new(path)))
-                .value(),
-        );
+                .or_insert_with(|| Arc::new(RootGraph::new(path)));
+            let root = Arc::clone(entry.value());
+            root.active_queries.fetch_add(1, Ordering::SeqCst);
+            root
+        };
         self.touch(&root);
+        run_graph_test_hook(path, GraphTestPoint::RootPinned);
         self.evict_roots(path, &root);
-        root
+        RootQueryPin { root }
     }
 
     fn touch(&self, root: &RootGraph) {
@@ -156,6 +163,7 @@ impl GraphState {
                 .filter(|entry| {
                     entry.key().as_path() != current_path
                         && !Arc::ptr_eq(entry.value(), current_root)
+                        && entry.value().active_queries.load(Ordering::SeqCst) == 0
                 })
                 .filter_map(|entry| {
                     let last_access = entry.value().sweep.try_lock()?.last_access;
@@ -165,16 +173,34 @@ impl GraphState {
             let Some((path, root, _)) = victim else {
                 break;
             };
-            self.roots
-                .remove_if(&path, |_, candidate| Arc::ptr_eq(candidate, &root));
+            let removed = self.roots.remove_if(&path, |_, candidate| {
+                Arc::ptr_eq(candidate, &root)
+                    && candidate.active_queries.load(Ordering::SeqCst) == 0
+            });
+            if removed.is_none() {
+                break;
+            }
         }
+    }
+}
+
+struct RootQueryPin {
+    root: Arc<RootGraph>,
+}
+
+impl Drop for RootQueryPin {
+    fn drop(&mut self) {
+        self.root.active_queries.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 struct RootGraph {
     state: RwLock<RootState>,
     sweep: Mutex<SweepMeta>,
+    // Flights only merge concurrent verifiers of the same key. They are a
+    // rendezvous and must never serve as a result cache.
     rdeps_flights: Mutex<FxHashMap<RdepsFlightKey, Arc<RdepsFlight>>>,
+    active_queries: AtomicU64,
 }
 
 impl RootGraph {
@@ -183,6 +209,7 @@ impl RootGraph {
             state: RwLock::new(RootState::new(root)),
             sweep: Mutex::new(SweepMeta::default()),
             rdeps_flights: Mutex::new(FxHashMap::default()),
+            active_queries: AtomicU64::new(0),
         }
     }
 }
@@ -208,16 +235,19 @@ struct RootState {
 impl RootState {
     fn new(root: &Path) -> Self {
         let tsconfig = root.join("tsconfig.json");
+        let jsconfig = root.join("jsconfig.json");
         let mut config_records = FxHashMap::default();
-        config_records.insert(
-            CompactString::from(tsconfig.to_string_lossy().as_ref()),
-            stat_record(&tsconfig),
-        );
+        for config in [&tsconfig, &jsconfig] {
+            config_records.insert(
+                CompactString::from(config.to_string_lossy().as_ref()),
+                stat_record(config),
+            );
+        }
         Self {
             phase: RootPhase::Uninitialized,
             index: SymbolIndex::new(),
             graph: ModuleGraph::new(),
-            resolvers: root_resolvers(&tsconfig, &[]),
+            resolvers: root_resolvers(root, &[]),
             records: FxHashMap::default(),
             config_records,
             supported_universe: FxHashSet::default(),
@@ -238,6 +268,7 @@ struct RdepsFlightKey {
     target: CompactString,
     resolver_generation: u64,
     graph_generation: u64,
+    caller_view: Option<Arc<Vec<CompactString>>>,
     hidden: bool,
     respect_gitignore: bool,
     follow_symlinks: bool,
@@ -249,6 +280,30 @@ struct RdepsRepairOutcome {
     completed: bool,
     repair_truncated: bool,
     generation_changed: bool,
+    view_excluded: bool,
+}
+
+struct RdepsGrepCandidates {
+    candidates: Vec<RdepsGrepCandidate>,
+    limit_reached: bool,
+}
+
+struct RdepsGrepCandidate {
+    path: PathBuf,
+    line: u64,
+}
+
+struct PreparedRdepsRepair {
+    candidate: RdepsGrepCandidate,
+    relative: CompactString,
+    analysis: FileAnalysis,
+    record: StatRecord,
+}
+
+struct PublishedRdepsRepair {
+    candidate: RdepsGrepCandidate,
+    absolute: CompactString,
+    outcome: RepairPublish,
 }
 
 struct RdepsFlight {
@@ -341,6 +396,7 @@ struct RootCounters {
 struct Freshness {
     swept: bool,
     guarantee: GraphGuarantee,
+    sweep_at: Option<Instant>,
 }
 
 struct ReadyAnswer {
@@ -364,13 +420,15 @@ fn query_ready_root(
 
     if ready {
         let Some(mut sweep) = root.sweep.try_lock() else {
+            let state = root.state.read();
             return ready_answer(
                 root_path,
-                &root.state.read(),
+                &state,
                 params,
                 Freshness {
                     swept: false,
                     guarantee: GraphGuarantee::Approximate,
+                    sweep_at: state.last_sweep_at,
                 },
                 None,
             );
@@ -381,17 +439,17 @@ fn query_ready_root(
             let state = root.state.read();
             matches!(state.phase, RootPhase::Ready { .. })
         };
-        let reusable_excluded = still_ready
+        let reusable_stamp = still_ready
             .then(|| {
                 params.max_stale_ms.and_then(|max_stale_ms| {
                     sweep
                         .stamp(&sweep_key)
                         .filter(|stamp| elapsed_ms(stamp.at.elapsed()) <= max_stale_ms)
-                        .map(|stamp| stamp.excluded.clone())
+                        .map(|stamp| (stamp.excluded.clone(), stamp.at))
                 })
             })
             .flatten();
-        if let Some(excluded) = reusable_excluded {
+        if let Some((excluded, sweep_at)) = reusable_stamp {
             return ready_answer(
                 root_path,
                 &root.state.read(),
@@ -399,6 +457,7 @@ fn query_ready_root(
                 Freshness {
                     swept: false,
                     guarantee: GraphGuarantee::Exact,
+                    sweep_at: Some(sweep_at),
                 },
                 Some(&excluded),
             );
@@ -442,7 +501,9 @@ fn query_ready_root(
         }
     };
     if phase_after_wait == 0
-        && let Some(excluded) = sweep.stamp(&sweep_key).map(|stamp| stamp.excluded.clone())
+        && let Some((excluded, sweep_at)) = sweep
+            .stamp(&sweep_key)
+            .map(|stamp| (stamp.excluded.clone(), stamp.at))
     {
         return ready_answer(
             root_path,
@@ -451,6 +512,7 @@ fn query_ready_root(
             Freshness {
                 swept: false,
                 guarantee: GraphGuarantee::Exact,
+                sweep_at: Some(sweep_at),
             },
             Some(&excluded),
         );
@@ -484,81 +546,117 @@ fn sweep_and_answer(
     if cold {
         run_graph_test_hook(root_path, GraphTestPoint::ColdBuildStarted);
     }
-
-    let snapshot = sweep_snapshot(root_path, &root.state.read());
-    let delta = match build_sweep_delta(
-        engine,
-        &graph_state.registry,
-        root_path,
-        params,
-        cancel,
-        snapshot,
-    ) {
-        Ok(delta) => delta,
-        Err(error) => {
-            if let Some(guard) = cold_guard.as_mut() {
-                guard.fail(&error);
+    let mut rebuilds = 0;
+    let (excluded, published_at) = loop {
+        let snapshot = sweep_snapshot(root_path, &root.state.read());
+        let snapshot_epoch = snapshot.graph_generation;
+        let delta = match build_sweep_delta(
+            engine,
+            &graph_state.registry,
+            root_path,
+            params,
+            cancel,
+            snapshot,
+        ) {
+            Ok(delta) => delta,
+            Err(error) => {
+                if let Some(guard) = cold_guard.as_mut() {
+                    guard.fail(&error);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
-    cancel.check()?;
+        };
+        cancel.check()?;
 
-    run_graph_test_hook(root_path, GraphTestPoint::BeforePublish);
-    let Some(attached_root) = graph_state.roots.get(root_path) else {
-        if cold {
-            return Err(ToolError::internal(
-                "graph root was cleared or evicted during its initial build; retry",
-            ));
+        run_graph_test_hook(root_path, GraphTestPoint::BeforePublish);
+        let Some(attached_root) = graph_state.roots.get(root_path) else {
+            if cold {
+                return Err(ToolError::internal(
+                    "graph root was cleared or evicted during its initial build; retry",
+                ));
+            }
+            let state = root.state.read();
+            return ready_answer(
+                root_path,
+                &state,
+                params,
+                Freshness {
+                    swept: false,
+                    guarantee: GraphGuarantee::Approximate,
+                    sweep_at: state.last_sweep_at,
+                },
+                None,
+            );
+        };
+        if !Arc::ptr_eq(attached_root.value(), root) {
+            if cold {
+                return Err(ToolError::internal(
+                    "graph root was replaced during its initial build; retry",
+                ));
+            }
+            let state = root.state.read();
+            return ready_answer(
+                root_path,
+                &state,
+                params,
+                Freshness {
+                    swept: false,
+                    guarantee: GraphGuarantee::Approximate,
+                    sweep_at: state.last_sweep_at,
+                },
+                None,
+            );
         }
-        return ready_answer(
-            root_path,
-            &root.state.read(),
-            params,
-            Freshness {
-                swept: false,
-                guarantee: GraphGuarantee::Approximate,
-            },
-            None,
-        );
-    };
-    if !Arc::ptr_eq(attached_root.value(), root) {
-        if cold {
-            return Err(ToolError::internal(
-                "graph root was replaced during its initial build; retry",
-            ));
-        }
-        return ready_answer(
-            root_path,
-            &root.state.read(),
-            params,
-            Freshness {
-                swept: false,
-                guarantee: GraphGuarantee::Approximate,
-            },
-            None,
-        );
-    }
 
-    let published_at = Instant::now();
-    let SweepDelta {
-        upserts,
-        removes,
-        records,
-        mut config_records,
-        config_changed,
-        supported_universe,
-        universe_complete,
-        invalidation_revision,
-        counters,
-        excluded,
-    } = delta;
-    let rust_crate_roots = rust_crate_roots(root_path, &supported_universe);
-    {
+        let published_at = Instant::now();
+        let SweepDelta {
+            upserts,
+            removes,
+            records,
+            mut config_records,
+            config_changed,
+            supported_universe,
+            universe_complete,
+            invalidation_revision,
+            counters,
+            excluded,
+        } = delta;
+        let rust_crate_roots = rust_crate_roots(root_path, &supported_universe);
+
         // The map guard fences graph_clear/eviction through the complete
         // publication. Readers see either the old or the new generation.
         let mut state = root.state.write();
+        if state.graph_generation != snapshot_epoch {
+            // A concurrent rdeps repair published between our snapshot and
+            // now, so the delta was computed against a stale world.
+            drop(state);
+            drop(attached_root);
+            rebuilds += 1;
+            if rebuilds > MAX_SWEEP_PUBLISH_REBUILDS {
+                if cold {
+                    return Err(ToolError::internal(
+                        "graph sweep publication kept losing the rebase race; retry",
+                    ));
+                }
+                let state = root.state.read();
+                return ready_answer(
+                    root_path,
+                    &state,
+                    params,
+                    Freshness {
+                        swept: false,
+                        guarantee: GraphGuarantee::Approximate,
+                        sweep_at: state.last_sweep_at,
+                    },
+                    None,
+                );
+            }
+            continue;
+        }
+
         let resolver_inputs_changed = config_changed || state.rust_crate_roots != rust_crate_roots;
+        let index_changed = !upserts.is_empty() || !removes.is_empty();
+        let topology_changed = index_changed || resolver_inputs_changed;
         {
             let RootState {
                 graph,
@@ -586,7 +684,7 @@ fn sweep_and_answer(
                 );
             }
             if resolver_inputs_changed {
-                *resolvers = root_resolvers(&root_path.join("tsconfig.json"), &rust_crate_roots);
+                *resolvers = root_resolvers(root_path, &rust_crate_roots);
                 graph.bump_resolver_generation();
                 graph.reresolve_all(resolvers);
             }
@@ -608,19 +706,29 @@ fn sweep_and_answer(
         state.counters = counters;
         state.graph_generation = state.graph_generation.saturating_add(1);
         let generation = state.graph_generation;
-        let components = component_count(root_path, &state.index, &state.graph);
+        let components = if topology_changed || state.components.graph_generation != snapshot_epoch
+        {
+            component_count(root_path, &state.index, &state.graph)
+        } else {
+            state.components.components
+        };
         state.components = ComponentsCache {
             graph_generation: generation,
             components,
         };
-        state.languages = language_statuses(&state.index, &graph_state.registry);
+        if index_changed {
+            state.languages = language_statuses(&state.index, &graph_state.registry);
+        }
         state.last_sweep_at = Some(published_at);
         if cold {
             state.build_duration_us = Some(saturating_u64(started.elapsed().as_micros()));
         }
         state.phase = RootPhase::Ready { generation };
-    }
-    drop(attached_root);
+        drop(state);
+        drop(attached_root);
+        break (excluded, published_at);
+    };
+
     if let Some(guard) = cold_guard.as_mut() {
         guard.finish();
     }
@@ -638,6 +746,7 @@ fn sweep_and_answer(
         Freshness {
             swept: true,
             guarantee: GraphGuarantee::Exact,
+            sweep_at: Some(published_at),
         },
         Some(excluded),
     )
@@ -681,6 +790,7 @@ struct SweepSnapshot {
     config_records: FxHashMap<CompactString, Option<StatRecord>>,
     config_dependencies: Vec<CompactString>,
     last_seen_invalidation: u64,
+    graph_generation: u64,
     indexed_hashes: FxHashMap<CompactString, u64>,
     indexed_paths: FxHashSet<CompactString>,
 }
@@ -702,6 +812,7 @@ fn sweep_snapshot(root: &Path, state: &RootState) -> SweepSnapshot {
         config_records: state.config_records.clone(),
         config_dependencies: tracked_config_dependencies(root, &state.graph),
         last_seen_invalidation: state.last_seen_invalidation,
+        graph_generation: state.graph_generation,
         indexed_hashes,
         indexed_paths,
     }
@@ -773,15 +884,8 @@ fn build_sweep_delta(
         let mut paths: Vec<PathBuf> = params
             .files
             .iter()
-            .map(|path| {
-                let path = Path::new(path);
-                if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    root.join(path)
-                }
-            })
-            .collect();
+            .map(|path| caller_universe_path(root, path).map(|(path, _)| path))
+            .collect::<ToolResult<_>>()?;
         paths.sort_unstable();
         paths.dedup();
         (paths, false)
@@ -811,16 +915,21 @@ fn build_sweep_delta(
 
     for path in &universe {
         cancel.check()?;
-        let relative = relative_path(root, path).ok_or_else(|| {
-            ToolError::invalid(format!(
-                "graph universe path is outside root: {}",
-                path.display()
-            ))
-            .with_path(path.display().to_string())
-        })?;
+        let (path, relative) = match classify_relative_path(root, path) {
+            RelativePath::Inside { path, relative } => (path, relative),
+            RelativePath::OutsideRoot => return Err(graph_universe_outside_root(path)),
+            RelativePath::NonUtf8 => {
+                if registry.supports_symbols(path) {
+                    counters.failed_files += 1;
+                } else {
+                    counters.unsupported_files += 1;
+                }
+                continue;
+            }
+        };
         relative_universe.insert(relative.clone());
 
-        if !registry.supports_symbols(path) {
+        if !registry.supports_symbols(&path) {
             counters.unsupported_files += 1;
             records.remove(relative.as_str());
             if caller_universe {
@@ -833,7 +942,7 @@ fn build_sweep_delta(
 
         let loaded = engine
             .files()
-            .get_bounded_trusting(path, MAX_GRAPH_FILE_BYTES, trust);
+            .get_bounded_trusting(&path, MAX_GRAPH_FILE_BYTES, trust);
         let entry = match loaded {
             Ok(Some((entry, _))) if entry.size <= MAX_GRAPH_FILE_BYTES => entry,
             Ok(Some(_)) | Ok(None) => {
@@ -890,7 +999,10 @@ fn build_sweep_delta(
         if CancelSignal::is_cancelled(&cancel_signal) {
             return Err(ToolError::cancelled());
         }
-        let absolute = CompactString::from(path.to_string_lossy().as_ref());
+        let absolute = CompactString::from(
+            path.to_str()
+                .expect("classified graph universe paths are UTF-8"),
+        );
         let analysis = analyze_source(source, absolute.as_str(), hash, &mut parser_pool);
         if CancelSignal::is_cancelled(&cancel_signal) {
             return Err(ToolError::cancelled());
@@ -937,6 +1049,7 @@ fn answer_query(
             return Err(ToolError::internal("graph root is not initialized"));
         }
     }
+    let caller_view = query_filter(root, &params.files, None)?;
     let filter = query_filter(root, &params.files, excluded)?;
     let (output, graph_guarantee) = match &params.op {
         GraphOp::Symbols { path } => (
@@ -956,8 +1069,15 @@ fn answer_query(
             None,
         ),
         GraphOp::Deps { path, depth } => {
-            let (result, guarantee) =
-                deps_result(root, state, path, *depth, params.include_basis, &filter)?;
+            let (result, guarantee) = deps_result(
+                root,
+                state,
+                path,
+                *depth,
+                params.include_basis,
+                &filter,
+                caller_view.as_ref(),
+            )?;
             (GraphOutput::Deps(result), Some(guarantee))
         }
         GraphOp::Rdeps {
@@ -965,16 +1085,30 @@ fn answer_query(
             depth,
             verify: _,
         } => {
-            let (mut result, guarantee) =
-                rdeps_result(root, state, path, *depth, params.include_basis, &filter)?;
+            let (mut result, guarantee) = rdeps_result(
+                root,
+                state,
+                path,
+                *depth,
+                params.include_basis,
+                &filter,
+                caller_view.as_ref(),
+            )?;
             let freshness_guarantee = graph_meta(root, state, freshness).guarantee;
             result.verified =
                 guarantee == Guarantee::Exact && freshness_guarantee == GraphGuarantee::Exact;
             (GraphOutput::Rdeps(result), Some(guarantee))
         }
         GraphOp::Neighborhood { path, depth } => {
-            let (result, guarantee) =
-                neighborhood_result(root, state, path, *depth, params.include_basis, &filter)?;
+            let (result, guarantee) = neighborhood_result(
+                root,
+                state,
+                path,
+                *depth,
+                params.include_basis,
+                &filter,
+                caller_view.as_ref(),
+            )?;
             (GraphOutput::Neighborhood(result), Some(guarantee))
         }
         GraphOp::Status => {
@@ -1008,6 +1142,13 @@ struct TraversedEdges {
     coverage: Coverage,
 }
 
+struct TraversedNeighborhood {
+    nodes: Vec<CompactString>,
+    edges: Vec<(DepEdge, Guarantee)>,
+    guarantee: Guarantee,
+    coverage: Coverage,
+}
+
 fn deps_result(
     root: &Path,
     state: &RootState,
@@ -1015,14 +1156,15 @@ fn deps_result(
     depth: u32,
     include_basis: bool,
     filter: &Option<FxHashSet<CompactString>>,
+    caller_view: Option<&FxHashSet<CompactString>>,
 ) -> ToolResult<(GraphDepsResult, Guarantee)> {
     let (absolute, node) = query_graph_node(root, state, requested_path, filter)?;
-    let traversed = traverse_deps(&state.graph, absolute.as_str(), depth)
+    let traversed = traverse_deps(&state.graph, root, absolute.as_str(), depth, caller_view)
         .ok_or_else(|| ToolError::not_found(absolute.to_string()))?;
     let mut edges = Vec::new();
     let mut unresolved = Vec::new();
     for (edge, guarantee) in traversed.edges {
-        match map_dep_edge(root, edge, guarantee) {
+        match map_dep_edge(root, state, edge, guarantee) {
             MappedDepEdge::Resolved(edge) => edges.push(edge),
             MappedDepEdge::Unresolved(import) => unresolved.push(import),
         }
@@ -1045,9 +1187,10 @@ fn rdeps_result(
     depth: u32,
     include_basis: bool,
     filter: &Option<FxHashSet<CompactString>>,
+    caller_view: Option<&FxHashSet<CompactString>>,
 ) -> ToolResult<(GraphRdepsResult, Guarantee)> {
     let (absolute, node) = query_graph_node(root, state, requested_path, filter)?;
-    let traversed = traverse_rdeps(&state.graph, absolute.as_str(), depth)
+    let traversed = traverse_rdeps(&state.graph, root, absolute.as_str(), depth, caller_view)
         .ok_or_else(|| ToolError::not_found(absolute.to_string()))?;
     let mut importers = Vec::with_capacity(traversed.edges.len());
     for (edge, guarantee) in traversed.edges {
@@ -1082,44 +1225,46 @@ fn neighborhood_result(
     depth: u32,
     include_basis: bool,
     filter: &Option<FxHashSet<CompactString>>,
+    caller_view: Option<&FxHashSet<CompactString>>,
 ) -> ToolResult<(GraphNeighborhoodResult, Guarantee)> {
     let (absolute, center) = query_graph_node(root, state, requested_path, filter)?;
-    let result = state
-        .graph
-        .neighborhood(absolute.as_str(), depth)
-        .ok_or_else(|| ToolError::not_found(absolute.to_string()))?;
-    let nodes = result
+    let traversed =
+        traverse_neighborhood(&state.graph, root, absolute.as_str(), depth, caller_view)
+            .ok_or_else(|| ToolError::not_found(absolute.to_string()))?;
+    let nodes = traversed
         .nodes
         .iter()
         .filter_map(|path| state.graph.node(path))
         .filter_map(|node| graph_node(root, &state.index, node))
         .collect();
-    let edges = result
+    let edges = traversed
         .edges
         .into_iter()
-        .filter_map(|edge| {
-            let owner_guarantee = state
-                .graph
-                .deps(edge.from.as_str())
-                .map_or(result.guarantee, |deps| deps.guarantee);
-            match map_dep_edge(root, edge, owner_guarantee) {
+        .filter_map(
+            |(edge, guarantee)| match map_dep_edge(root, state, edge, guarantee) {
                 MappedDepEdge::Resolved(edge) => Some(edge),
                 MappedDepEdge::Unresolved(_) => None,
-            }
-        })
+            },
+        )
         .collect();
     Ok((
         GraphNeighborhoodResult {
             center,
             nodes,
             edges,
-            coverage: graph_coverage(root, result.coverage, include_basis),
+            coverage: graph_coverage(root, traversed.coverage, include_basis),
         },
-        result.guarantee,
+        traversed.guarantee,
     ))
 }
 
-fn traverse_deps(graph: &ModuleGraph, path: &str, depth: u32) -> Option<TraversedEdges> {
+fn traverse_deps(
+    graph: &ModuleGraph,
+    root: &Path,
+    path: &str,
+    depth: u32,
+    caller_view: Option<&FxHashSet<CompactString>>,
+) -> Option<TraversedEdges> {
     graph.node(path)?;
     let mut reached = FxHashSet::default();
     reached.insert(CompactString::from(path));
@@ -1138,14 +1283,23 @@ fn traverse_deps(graph: &ModuleGraph, path: &str, depth: u32) -> Option<Traverse
     let mut expanded = FxHashSet::default();
     let mut edges = Vec::new();
     let mut guarantee = Guarantee::Exact;
+    let mut escaped_view = false;
     while let Some((current, distance)) = queue.pop_front() {
         if !expanded.insert(current.clone()) {
+            continue;
+        }
+        if graph_path_escapes_view(root, current.as_str(), caller_view) {
+            escaped_view = true;
             continue;
         }
         let deps = graph.deps(current.as_str())?;
         guarantee = weakest_guarantee(guarantee, deps.guarantee);
         for edge in deps.edges {
             if let EdgeTargetOwned::Path(target) = &edge.to {
+                if graph_path_escapes_view(root, target.as_str(), caller_view) {
+                    escaped_view = true;
+                    continue;
+                }
                 reached.insert(target.clone());
                 if distance + 1 < depth {
                     queue.push_back((target.clone(), distance + 1));
@@ -1154,6 +1308,9 @@ fn traverse_deps(graph: &ModuleGraph, path: &str, depth: u32) -> Option<Traverse
             edges.push((edge, deps.guarantee));
         }
     }
+    if escaped_view {
+        guarantee = Guarantee::Approximate;
+    }
     Some(TraversedEdges {
         edges,
         guarantee,
@@ -1161,7 +1318,13 @@ fn traverse_deps(graph: &ModuleGraph, path: &str, depth: u32) -> Option<Traverse
     })
 }
 
-fn traverse_rdeps(graph: &ModuleGraph, path: &str, depth: u32) -> Option<TraversedEdges> {
+fn traverse_rdeps(
+    graph: &ModuleGraph,
+    root: &Path,
+    path: &str,
+    depth: u32,
+    caller_view: Option<&FxHashSet<CompactString>>,
+) -> Option<TraversedEdges> {
     graph.node(path)?;
     let mut reached = FxHashSet::default();
     reached.insert(CompactString::from(path));
@@ -1180,13 +1343,22 @@ fn traverse_rdeps(graph: &ModuleGraph, path: &str, depth: u32) -> Option<Travers
     let mut expanded = FxHashSet::default();
     let mut edges = Vec::new();
     let mut guarantee = Guarantee::Exact;
+    let mut escaped_view = false;
     while let Some((current, distance)) = queue.pop_front() {
         if !expanded.insert(current.clone()) {
+            continue;
+        }
+        if graph_path_escapes_view(root, current.as_str(), caller_view) {
+            escaped_view = true;
             continue;
         }
         let rdeps = graph.rdeps(current.as_str())?;
         guarantee = weakest_guarantee(guarantee, rdeps.guarantee);
         for edge in rdeps.edges {
+            if graph_path_escapes_view(root, edge.from.as_str(), caller_view) {
+                escaped_view = true;
+                continue;
+            }
             reached.insert(edge.from.clone());
             if distance + 1 < depth {
                 queue.push_back((edge.from.clone(), distance + 1));
@@ -1194,7 +1366,92 @@ fn traverse_rdeps(graph: &ModuleGraph, path: &str, depth: u32) -> Option<Travers
             edges.push((edge, rdeps.guarantee));
         }
     }
+    if escaped_view {
+        guarantee = Guarantee::Approximate;
+    }
     Some(TraversedEdges {
+        edges,
+        guarantee,
+        coverage: coverage_for_paths(graph, &reached),
+    })
+}
+
+fn traverse_neighborhood(
+    graph: &ModuleGraph,
+    root: &Path,
+    path: &str,
+    depth: u32,
+    caller_view: Option<&FxHashSet<CompactString>>,
+) -> Option<TraversedNeighborhood> {
+    graph.node(path)?;
+    let mut reached = FxHashSet::default();
+    reached.insert(CompactString::from(path));
+    let mut queue = VecDeque::from([(CompactString::from(path), 0_u32)]);
+    let mut escaped_view = false;
+
+    while let Some((current, distance)) = queue.pop_front() {
+        if distance == depth {
+            continue;
+        }
+        if graph_path_escapes_view(root, current.as_str(), caller_view) {
+            escaped_view = true;
+            continue;
+        }
+
+        let deps = graph.deps(current.as_str())?;
+        for edge in deps.edges {
+            let EdgeTargetOwned::Path(target) = edge.to else {
+                continue;
+            };
+            if graph_path_escapes_view(root, target.as_str(), caller_view) {
+                escaped_view = true;
+                continue;
+            }
+            if reached.insert(target.clone()) {
+                queue.push_back((target, distance + 1));
+            }
+        }
+
+        let rdeps = graph.rdeps(current.as_str())?;
+        for edge in rdeps.edges {
+            if graph_path_escapes_view(root, edge.from.as_str(), caller_view) {
+                escaped_view = true;
+                continue;
+            }
+            if reached.insert(edge.from.clone()) {
+                queue.push_back((edge.from, distance + 1));
+            }
+        }
+    }
+
+    let mut nodes: Vec<_> = reached.iter().cloned().collect();
+    nodes.sort_unstable();
+    let mut edges = Vec::new();
+    let mut guarantee = Guarantee::Exact;
+    for source in &nodes {
+        let deps = graph.deps(source.as_str())?;
+        guarantee = weakest_guarantee(guarantee, deps.guarantee);
+        if depth == 0 {
+            continue;
+        }
+        edges.extend(deps.edges.into_iter().filter_map(|edge| {
+            let EdgeTargetOwned::Path(target) = &edge.to else {
+                return None;
+            };
+            reached
+                .contains(target.as_str())
+                .then_some((edge, deps.guarantee))
+        }));
+    }
+    if depth != 0 {
+        guarantee = weakest_guarantee(guarantee, graph.rdeps(path)?.guarantee);
+    }
+    if escaped_view {
+        guarantee = Guarantee::Approximate;
+    }
+
+    Some(TraversedNeighborhood {
+        nodes,
         edges,
         guarantee,
         coverage: coverage_for_paths(graph, &reached),
@@ -1257,7 +1514,11 @@ fn query_graph_node(
     {
         return Err(ToolError::not_found(absolute.display().to_string()));
     }
-    let absolute = CompactString::from(absolute.to_string_lossy().as_ref());
+    let absolute = CompactString::from(
+        absolute
+            .to_str()
+            .expect("classified graph query paths are UTF-8"),
+    );
     let module = state
         .graph
         .node(absolute.as_str())
@@ -1308,10 +1569,24 @@ enum MappedDepEdge {
     Unresolved(GraphUnresolvedImport),
 }
 
-fn map_dep_edge(root: &Path, edge: DepEdge, guarantee: Guarantee) -> MappedDepEdge {
-    let to = match edge.to {
-        EdgeTargetOwned::Path(path) => absolute_graph_path(root, path.as_str()).to_string(),
-        EdgeTargetOwned::External(package) => package.to_string(),
+fn map_dep_edge(
+    root: &Path,
+    state: &RootState,
+    edge: DepEdge,
+    guarantee: Guarantee,
+) -> MappedDepEdge {
+    let from_node_id = graph_node_id(root, state, edge.from.as_str())
+        .expect("dependency edge source must refer to a graph node");
+    let (to, to_node_id, to_kind) = match edge.to {
+        EdgeTargetOwned::Path(path) => (
+            absolute_graph_path(root, path.as_str()).to_string(),
+            Some(
+                graph_node_id(root, state, path.as_str())
+                    .expect("dependency edge target must refer to a graph node"),
+            ),
+            "path",
+        ),
+        EdgeTargetOwned::External(package) => (package.to_string(), None, "external"),
         EdgeTargetOwned::Unresolved(reason) => {
             return MappedDepEdge::Unresolved(GraphUnresolvedImport {
                 specifier: edge.specifier.to_string(),
@@ -1322,12 +1597,23 @@ fn map_dep_edge(root: &Path, edge: DepEdge, guarantee: Guarantee) -> MappedDepEd
     };
     MappedDepEdge::Resolved(GraphDepEdge {
         from: absolute_graph_path(root, edge.from.as_str()).to_string(),
+        from_node_id,
         to,
+        to_node_id,
+        to_kind: to_kind.to_owned(),
         specifier: edge.specifier.to_string(),
         kind: import_kind(edge.kind).to_owned(),
         line: u64::from(edge.line),
         guarantee: wire_guarantee(guarantee),
     })
+}
+
+fn graph_node_id(root: &Path, state: &RootState, path: &str) -> Option<String> {
+    state
+        .graph
+        .node(path)
+        .and_then(|node| graph_node(root, &state.index, node))
+        .map(|node| node.node_id)
 }
 
 fn unresolved_reason(reason: &UnresolvedReason) -> String {
@@ -1365,6 +1651,18 @@ fn weakest_guarantee(left: Guarantee, right: Guarantee) -> Guarantee {
     }
 }
 
+fn graph_path_escapes_view(
+    root: &Path,
+    path: &str,
+    caller_view: Option<&FxHashSet<CompactString>>,
+) -> bool {
+    let Some(caller_view) = caller_view else {
+        return false;
+    };
+    relative_path(root, Path::new(path))
+        .is_none_or(|relative| !caller_view.contains(relative.as_str()))
+}
+
 fn wire_guarantee(guarantee: Guarantee) -> GraphGuarantee {
     match guarantee {
         Guarantee::Exact => GraphGuarantee::Exact,
@@ -1384,13 +1682,18 @@ fn rdeps_flight_key(
     state: &RootState,
     target: CompactString,
     params: &GraphParams,
+    caller_view: Option<&FxHashSet<CompactString>>,
 ) -> RdepsFlightKey {
-    // `files` scopes the final graph query, but repair always greps the whole
-    // root and approximate_rdep_entry searches only the individual hit path.
+    let caller_view = caller_view.map(|view| {
+        let mut paths: Vec<_> = view.iter().cloned().collect();
+        paths.sort_unstable();
+        Arc::new(paths)
+    });
     RdepsFlightKey {
         target,
         resolver_generation: state.graph.resolver_generation(),
         graph_generation: state.graph.generation(),
+        caller_view,
         hidden: params.hidden,
         respect_gitignore: params.respect_gitignore,
         follow_symlinks: params.follow_symlinks,
@@ -1435,52 +1738,73 @@ fn verify_rdeps_query(
     freshness: Freshness,
     cancel: &CancelToken,
 ) -> ToolResult<GraphResult> {
-    let (target, _) = query_path(root_path, requested_path)?;
+    let caller_view = query_filter(root_path, &params.files, None)?;
+    let (target, target_relative) = query_path(root_path, requested_path)?;
+    if caller_view
+        .as_ref()
+        .is_some_and(|allowed| !allowed.contains(target_relative.as_str()))
+    {
+        return Err(ToolError::not_found(target.display().to_string()));
+    }
     let target = CompactString::from(target.to_string_lossy().as_ref());
-    let key = rdeps_flight_key(&root.state.read(), target.clone(), params);
-    let (flight, leader) = {
-        let mut flights = root.rdeps_flights.lock();
-        if let Some(flight) = flights.get(&key) {
-            (Arc::clone(flight), false)
-        } else {
-            let flight = Arc::new(RdepsFlight::new());
-            flights.insert(key.clone(), Arc::clone(&flight));
-            (flight, true)
-        }
-    };
-
-    let outcome = if leader {
-        let outcome = run_rdeps_repair(
-            engine,
-            graph_state,
-            root_path,
-            root,
+    let mut outcome = loop {
+        let key = rdeps_flight_key(
+            &root.state.read(),
+            target.clone(),
             params,
-            target.as_str(),
-            cancel,
+            caller_view.as_ref(),
         );
-        *flight.result.lock() = Some(outcome.clone());
-        flight.ready.notify_all();
-        if outcome.is_err() {
+        let (flight, leader) = {
             let mut flights = root.rdeps_flights.lock();
-            if flights
-                .get(&key)
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &flight))
+            if let Some(flight) = flights.get(&key) {
+                (Arc::clone(flight), false)
+            } else {
+                let flight = Arc::new(RdepsFlight::new());
+                flights.insert(key.clone(), Arc::clone(&flight));
+                (flight, true)
+            }
+        };
+
+        if leader {
+            let outcome = run_rdeps_repair(
+                engine,
+                graph_state,
+                root_path,
+                root,
+                params,
+                target.as_str(),
+                caller_view.as_ref(),
+                cancel,
+            );
             {
-                flights.remove(&key);
+                let mut flights = root.rdeps_flights.lock();
+                if flights
+                    .get(&key)
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &flight))
+                {
+                    flights.remove(&key);
+                }
             }
-        }
-        outcome?
-    } else {
-        let mut result = flight.result.lock();
-        loop {
-            if let Some(outcome) = result.as_ref() {
-                break outcome.clone()?;
+            *flight.result.lock() = Some(outcome.clone());
+            flight.ready.notify_all();
+            break outcome?;
+        } else {
+            run_graph_test_hook(root_path, GraphTestPoint::RdepsFollowerWaiting);
+            let mut result = flight.result.lock();
+            let outcome = loop {
+                if let Some(outcome) = result.as_ref() {
+                    break outcome.clone();
+                }
+                flight
+                    .ready
+                    .wait_for(&mut result, Duration::from_millis(10));
+                cancel.check()?;
+            };
+            drop(result);
+            match outcome {
+                Err(error) if error.is_cancelled() => continue,
+                outcome => break outcome?,
             }
-            flight
-                .ready
-                .wait_for(&mut result, Duration::from_millis(10));
-            cancel.check()?;
         }
     };
     if outcome.generation_changed {
@@ -1488,15 +1812,18 @@ fn verify_rdeps_query(
     }
 
     let state = root.state.read();
-    let filter = query_filter(root_path, &params.files, None)?;
     let (mut result, guarantee) = rdeps_result(
         root_path,
         &state,
         requested_path,
         depth,
         params.include_basis,
-        &filter,
+        &caller_view,
+        caller_view.as_ref(),
     )?;
+    outcome.approximate_entries.retain(|entry| {
+        !graph_path_escapes_view(root_path, entry.node.path.as_str(), caller_view.as_ref())
+    });
     let approximate_paths: FxHashSet<_> = outcome
         .approximate_entries
         .iter()
@@ -1517,6 +1844,9 @@ fn verify_rdeps_query(
     {
         meta.guarantee = GraphGuarantee::Approximate;
     }
+    if outcome.view_excluded {
+        meta.guarantee = GraphGuarantee::Approximate;
+    }
     meta.repair_truncated = outcome.repair_truncated;
     let structural_exact = guarantee == Guarantee::Exact && meta.guarantee == GraphGuarantee::Exact;
     result.verified = structural_exact || outcome.completed;
@@ -1527,6 +1857,7 @@ fn verify_rdeps_query(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_rdeps_repair(
     engine: &Engine,
     graph_state: &GraphState,
@@ -1534,44 +1865,43 @@ fn run_rdeps_repair(
     root: &Arc<RootGraph>,
     params: &GraphParams,
     target: &str,
+    caller_view: Option<&FxHashSet<CompactString>>,
     cancel: &CancelToken,
 ) -> ToolResult<RdepsRepairOutcome> {
-    let needles = rdeps_needles(Path::new(target));
-    let pattern = needles
-        .iter()
-        .map(|needle| regex::escape(needle))
-        .collect::<Vec<_>>()
-        .join("|");
-    let globs = registry_globs(&graph_state.registry);
-    let grep_params = GrepParams {
-        pattern: format!("(?:{pattern})"),
-        path: root_path.display().to_string(),
-        mode: GrepMode::FilesWithMatches,
-        globs,
-        max_count: Some(1),
-        hidden: params.hidden,
-        respect_gitignore: params.respect_gitignore,
-        follow_symlinks: params.follow_symlinks,
-        ..GrepParams::default()
-    };
-    let grep = grep_cancellable(engine, &grep_params, cancel)?;
+    run_graph_test_hook(root_path, GraphTestPoint::RdepsRepairStarted);
+    let RdepsGrepCandidates {
+        candidates,
+        limit_reached,
+    } = rdeps_grep_candidates(engine, graph_state, root_path, params, target, cancel)?;
     let mut parser_pool = ParserPool::new(&graph_state.registry);
     let mut approximate_entries = Vec::new();
+    let mut prepared = Vec::new();
     let mut repaired = 0_usize;
-    let mut repair_truncated = grep.limit_reached;
+    let mut repair_truncated = limit_reached;
     let mut generation_changed = false;
+    let mut view_excluded = false;
     let trust = engine.stat_free(root_path);
 
-    for hit in grep.files {
+    for candidate in candidates {
         cancel.check()?;
-        let path = PathBuf::from(&hit.path);
-        let Some(relative) = relative_path(root_path, &path) else {
+        let Some(relative) = relative_path(root_path, &candidate.path) else {
             continue;
         };
-        let absolute = absolute_graph_path(root_path, path.to_string_lossy().as_ref());
-        let loaded = engine
-            .files()
-            .get_bounded_trusting(&path, MAX_GRAPH_FILE_BYTES, trust);
+        if caller_view.is_some_and(|allowed| !allowed.contains(relative.as_str())) {
+            view_excluded = true;
+            continue;
+        }
+        let absolute = absolute_graph_path(
+            root_path,
+            candidate
+                .path
+                .to_str()
+                .expect("relative graph repair paths are UTF-8"),
+        );
+        let loaded =
+            engine
+                .files()
+                .get_bounded_trusting(&candidate.path, MAX_GRAPH_FILE_BYTES, trust);
         let current_hash = match &loaded {
             Ok(Some((entry, _))) if entry.size <= MAX_GRAPH_FILE_BYTES => {
                 Some(entry.content_hash())
@@ -1597,15 +1927,7 @@ fn run_rdeps_repair(
             Some(false) => {
                 // Re-publishing identical non-exact analysis cannot improve
                 // it, so preserve the repair budget and surface grep evidence.
-                approximate_entries.push(approximate_rdep_entry(
-                    engine,
-                    root_path,
-                    root,
-                    &grep_params.pattern,
-                    &path,
-                    params,
-                    cancel,
-                )?);
+                approximate_entries.push(approximate_rdep_entry(root_path, root, &candidate));
                 continue;
             }
             None => {}
@@ -1619,28 +1941,12 @@ fn run_rdeps_repair(
         let entry = match loaded {
             Ok(Some((entry, _))) if entry.size <= MAX_GRAPH_FILE_BYTES => entry,
             Ok(Some(_)) | Ok(None) | Err(_) => {
-                approximate_entries.push(approximate_rdep_entry(
-                    engine,
-                    root_path,
-                    root,
-                    &grep_params.pattern,
-                    &path,
-                    params,
-                    cancel,
-                )?);
+                approximate_entries.push(approximate_rdep_entry(root_path, root, &candidate));
                 continue;
             }
         };
         let Some(source) = entry.as_str() else {
-            approximate_entries.push(approximate_rdep_entry(
-                engine,
-                root_path,
-                root,
-                &grep_params.pattern,
-                &path,
-                params,
-                cancel,
-            )?);
+            approximate_entries.push(approximate_rdep_entry(root_path, root, &candidate));
             continue;
         };
         let analysis = analyze_source(
@@ -1650,38 +1956,41 @@ fn run_rdeps_repair(
             &mut parser_pool,
         );
         if analysis.language.is_none() {
-            approximate_entries.push(approximate_rdep_entry(
-                engine,
-                root_path,
-                root,
-                &grep_params.pattern,
-                &path,
-                params,
-                cancel,
-            )?);
+            approximate_entries.push(approximate_rdep_entry(root_path, root, &candidate));
             continue;
         }
-        generation_changed |= publish_rdeps_repair(
-            graph_state,
-            root_path,
-            root,
+        prepared.push(PreparedRdepsRepair {
+            candidate,
             relative,
             analysis,
-            StatRecord {
+            record: StatRecord {
                 mtime_ns: entry.mtime_ns,
                 size: entry.size,
             },
-        )?;
+        });
+    }
+
+    let published = publish_rdeps_repairs(graph_state, root_path, root, prepared)?;
+    for PublishedRdepsRepair {
+        candidate,
+        absolute,
+        outcome,
+    } in published
+    {
+        match outcome {
+            RepairPublish::Published => generation_changed = true,
+            RepairPublish::AlreadyCurrent => {}
+            RepairPublish::InputStale => {
+                // The analyzed bytes no longer describe the on-disk file.
+                // Publishing them could insert a node no sweep is obliged to
+                // remove. Skip grep evidence for a file that may be gone and
+                // report the repair as incomplete.
+                repair_truncated = true;
+                continue;
+            }
+        }
         if !rdeps_node_is_structurally_exact(&root.state.read().graph, absolute.as_str()) {
-            approximate_entries.push(approximate_rdep_entry(
-                engine,
-                root_path,
-                root,
-                &grep_params.pattern,
-                &path,
-                params,
-                cancel,
-            )?);
+            approximate_entries.push(approximate_rdep_entry(root_path, root, &candidate));
         }
     }
 
@@ -1690,6 +1999,61 @@ fn run_rdeps_repair(
         completed: !repair_truncated,
         repair_truncated,
         generation_changed,
+        view_excluded,
+    })
+}
+
+fn rdeps_grep_candidates(
+    engine: &Engine,
+    graph_state: &GraphState,
+    root_path: &Path,
+    params: &GraphParams,
+    target: &str,
+    cancel: &CancelToken,
+) -> ToolResult<RdepsGrepCandidates> {
+    let needles = rdeps_needles(Path::new(target));
+    let pattern = needles
+        .iter()
+        .map(|needle| regex::escape(needle))
+        .collect::<Vec<_>>()
+        .join("|");
+    let pattern = format!("(?:{pattern})");
+    let globs = registry_globs(&graph_state.registry);
+
+    let grep = grep_cancellable(
+        engine,
+        &GrepParams {
+            pattern,
+            path: root_path.display().to_string(),
+            mode: GrepMode::Content,
+            globs,
+            max_count: Some(1),
+            max_total_count: Some(MAX_RDEPS_GREP_CANDIDATES),
+            hidden: params.hidden,
+            respect_gitignore: params.respect_gitignore,
+            follow_symlinks: params.follow_symlinks,
+            ..GrepParams::default()
+        },
+        cancel,
+    )?;
+    Ok(RdepsGrepCandidates {
+        candidates: grep
+            .files
+            .into_iter()
+            .map(|hit| {
+                let line = hit
+                    .lines
+                    .iter()
+                    .find(|line| line.is_match)
+                    .expect("content-mode grep hits contain a matching line")
+                    .line_number;
+                RdepsGrepCandidate {
+                    path: PathBuf::from(hit.path),
+                    line,
+                }
+            })
+            .collect(),
+        limit_reached: grep.limit_reached,
     })
 }
 
@@ -1722,25 +2086,25 @@ fn registry_globs(registry: &LanguageRegistry) -> Vec<String> {
     globs
 }
 
-#[allow(clippy::too_many_arguments)]
 fn approximate_rdep_entry(
-    engine: &Engine,
     root_path: &Path,
     root: &RootGraph,
-    pattern: &str,
-    path: &Path,
-    params: &GraphParams,
-    cancel: &CancelToken,
-) -> ToolResult<GraphRdepEntry> {
-    let line = first_grep_hit_line(engine, pattern, path, params, cancel)?;
+    candidate: &RdepsGrepCandidate,
+) -> GraphRdepEntry {
     let state = root.state.read();
-    let absolute = absolute_graph_path(root_path, path.to_string_lossy().as_ref());
+    let absolute = absolute_graph_path(
+        root_path,
+        candidate
+            .path
+            .to_str()
+            .expect("relative graph repair paths are UTF-8"),
+    );
     let node = state
         .graph
         .node(absolute.as_str())
         .and_then(|node| graph_node(root_path, &state.index, node))
         .unwrap_or_else(|| {
-            let relative = relative_path(root_path, path);
+            let relative = relative_path(root_path, &candidate.path);
             let hash = relative
                 .as_ref()
                 .and_then(|relative| state.index.file_hash(relative.as_str()))
@@ -1755,51 +2119,29 @@ fn approximate_rdep_entry(
                 indexed: false,
             }
         });
-    Ok(GraphRdepEntry {
+    GraphRdepEntry {
         node,
         specifier: None,
-        line,
+        line: candidate.line,
         guarantee: GraphGuarantee::Approximate,
-    })
+    }
 }
 
-fn first_grep_hit_line(
-    engine: &Engine,
-    pattern: &str,
-    path: &Path,
-    params: &GraphParams,
-    cancel: &CancelToken,
-) -> ToolResult<u64> {
-    let grep = grep_cancellable(
-        engine,
-        &GrepParams {
-            pattern: pattern.to_owned(),
-            path: path.display().to_string(),
-            mode: GrepMode::Content,
-            max_count: Some(1),
-            hidden: params.hidden,
-            respect_gitignore: params.respect_gitignore,
-            follow_symlinks: params.follow_symlinks,
-            ..GrepParams::default()
-        },
-        cancel,
-    )?;
-    Ok(grep
-        .files
-        .iter()
-        .flat_map(|file| file.lines.iter())
-        .find(|line| line.is_match)
-        .map_or(0, |line| line.line_number))
+enum RepairPublish {
+    Published,
+    AlreadyCurrent,
+    InputStale,
 }
 
-fn publish_rdeps_repair(
+fn publish_rdeps_repairs(
     graph_state: &GraphState,
     root_path: &Path,
     root: &Arc<RootGraph>,
-    relative: CompactString,
-    analysis: FileAnalysis,
-    record: StatRecord,
-) -> ToolResult<bool> {
+    repairs: Vec<PreparedRdepsRepair>,
+) -> ToolResult<Vec<PublishedRdepsRepair>> {
+    if repairs.is_empty() {
+        return Ok(Vec::new());
+    }
     let Some(attached_root) = graph_state.roots.get(root_path) else {
         return Err(ToolError::internal(
             "graph root was cleared or evicted during rdeps repair; retry",
@@ -1811,45 +2153,68 @@ fn publish_rdeps_repair(
         ));
     }
 
-    let hash = analysis.content_hash;
     let mut state = root.state.write();
-    if state
-        .index
-        .contains(relative.as_str(), hash, graph_state.registry.generation())
-        && state.graph.contains(analysis.path.as_str(), hash)
-    {
-        return Ok(false);
+    let mut published = Vec::with_capacity(repairs.len());
+    let mut generation_changed = false;
+    for repair in repairs {
+        let PreparedRdepsRepair {
+            candidate,
+            relative,
+            analysis,
+            record,
+        } = repair;
+        let absolute = analysis.path.clone();
+        let hash = analysis.content_hash;
+        let outcome = if stat_record(Path::new(analysis.path.as_str())) != Some(record) {
+            RepairPublish::InputStale
+        } else if state
+            .index
+            .contains(relative.as_str(), hash, graph_state.registry.generation())
+            && state.graph.contains(analysis.path.as_str(), hash)
+        {
+            RepairPublish::AlreadyCurrent
+        } else {
+            {
+                let RootState {
+                    graph,
+                    resolvers,
+                    index,
+                    ..
+                } = &mut *state;
+                let imports_supported = graph_state
+                    .registry
+                    .supports_imports(Path::new(analysis.path.as_str()));
+                graph.upsert_file(&analysis, resolvers, imports_supported);
+                index.upsert(
+                    FileSymbols {
+                        path: relative.clone(),
+                        content_hash: hash,
+                        symbols: analysis.symbols,
+                    },
+                    graph_state.registry.generation(),
+                );
+            }
+            state.records.insert(relative, record);
+            state.graph_generation = state.graph_generation.saturating_add(1);
+            generation_changed = true;
+            RepairPublish::Published
+        };
+        published.push(PublishedRdepsRepair {
+            candidate,
+            absolute,
+            outcome,
+        });
     }
-    {
-        let RootState {
-            graph,
-            resolvers,
-            index,
-            ..
-        } = &mut *state;
-        let imports_supported = graph_state
-            .registry
-            .supports_imports(Path::new(analysis.path.as_str()));
-        graph.upsert_file(&analysis, resolvers, imports_supported);
-        index.upsert(
-            FileSymbols {
-                path: relative.clone(),
-                content_hash: hash,
-                symbols: analysis.symbols,
-            },
-            graph_state.registry.generation(),
-        );
+    if generation_changed {
+        let generation = state.graph_generation;
+        state.components = ComponentsCache {
+            graph_generation: generation,
+            components: component_count(root_path, &state.index, &state.graph),
+        };
+        state.languages = language_statuses(&state.index, &graph_state.registry);
+        state.phase = RootPhase::Ready { generation };
     }
-    state.records.insert(relative, record);
-    state.graph_generation = state.graph_generation.saturating_add(1);
-    let generation = state.graph_generation;
-    state.components = ComponentsCache {
-        graph_generation: generation,
-        components: component_count(root_path, &state.index, &state.graph),
-    };
-    state.languages = language_statuses(&state.index, &graph_state.registry);
-    state.phase = RootPhase::Ready { generation };
-    Ok(true)
+    Ok(published)
 }
 
 fn file_symbols_result(
@@ -1908,20 +2273,15 @@ fn search_result(
     filter: &Option<FxHashSet<CompactString>>,
 ) -> GraphSearchResult {
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let fetch_limit = if filter.is_some() {
-        usize::MAX
-    } else {
-        limit.saturating_add(1)
+    let fetch_limit = limit.saturating_add(1);
+    let found = match filter {
+        Some(allowed) => state
+            .index
+            .search_filtered(query, fetch_limit, |path| allowed.contains(path)),
+        None => state.index.search(query, fetch_limit),
     };
-    let mut symbols: Vec<GraphSymbol> = state
-        .index
-        .search(query, fetch_limit)
+    let mut symbols: Vec<GraphSymbol> = found
         .into_iter()
-        .filter(|found| {
-            filter
-                .as_ref()
-                .is_none_or(|allowed| allowed.contains(found.path))
-        })
         .filter_map(|found| {
             let hash = state.index.file_hash(found.path)?;
             Some(graph_symbol(root, found.path, hash, found.symbol))
@@ -2011,10 +2371,19 @@ fn absolute_graph_path(root: &Path, path: &str) -> CompactString {
     CompactString::from(absolute.to_string_lossy().as_ref())
 }
 
-fn root_resolvers(tsconfig: &Path, rust_crate_roots: &[CompactString]) -> ResolverSet {
+fn root_resolvers(root: &Path, rust_crate_roots: &[CompactString]) -> ResolverSet {
+    let tsconfig = root.join("tsconfig.json");
+    let jsconfig = root.join("jsconfig.json");
+    let configured_js = if tsconfig.is_file() {
+        Some(tsconfig)
+    } else if jsconfig.is_file() {
+        Some(jsconfig)
+    } else {
+        None
+    };
     ResolverSet {
         js: Some(js_resolver(JsResolveOptions {
-            tsconfig: tsconfig.is_file().then(|| tsconfig.to_path_buf()),
+            tsconfig: configured_js,
             ..JsResolveOptions::default()
         })),
         rust: Some(rust_resolver(RustResolveOptions {
@@ -2054,9 +2423,10 @@ fn rust_crate_roots(
 
 fn tracked_config_dependencies(root: &Path, graph: &ModuleGraph) -> Vec<CompactString> {
     let mut dependencies = graph.config_dependencies();
-    dependencies.push(CompactString::from(
-        root.join("tsconfig.json").to_string_lossy().as_ref(),
-    ));
+    dependencies.extend(
+        ["tsconfig.json", "jsconfig.json"]
+            .map(|name| CompactString::from(root.join(name).to_string_lossy().as_ref())),
+    );
     dependencies.sort_unstable();
     dependencies.dedup();
     dependencies
@@ -2157,7 +2527,7 @@ fn graph_meta(root: &Path, state: &RootState, freshness: Freshness) -> GraphMeta
         revalidated_files: state.counters.revalidated_files,
         reindexed_files: state.counters.reindexed_files,
         swept: freshness.swept,
-        sweep_age_ms: sweep_age(state.last_sweep_at).unwrap_or(0),
+        sweep_age_ms: sweep_age(freshness.sweep_at).unwrap_or(0),
         walk_cache_hit: state.counters.walk_cache_hit,
         repair_truncated: false,
     }
@@ -2221,6 +2591,7 @@ fn status_query(engine: &Engine, root_path: &Path, root: &RootGraph) -> GraphRes
             Freshness {
                 swept: false,
                 guarantee,
+                sweep_at: state.last_sweep_at,
             },
         ),
         output: GraphOutput::Status(status),
@@ -2320,21 +2691,7 @@ fn query_filter(
     }
     files
         .iter()
-        .map(|path| {
-            let path = Path::new(path);
-            let absolute = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                root.join(path)
-            };
-            relative_path(root, &absolute).ok_or_else(|| {
-                ToolError::invalid(format!(
-                    "graph universe path is outside root: {}",
-                    absolute.display()
-                ))
-                .with_path(absolute.display().to_string())
-            })
-        })
+        .map(|path| caller_universe_path(root, path).map(|(_, relative)| relative))
         .collect::<ToolResult<FxHashSet<_>>>()
         .map(|mut allowed| {
             if let Some(excluded) = excluded {
@@ -2386,6 +2743,9 @@ enum GraphTestPoint {
     ColdWaitObserved,
     ColdWaitLockAcquired,
     BeforePublish,
+    RootPinned,
+    RdepsRepairStarted,
+    RdepsFollowerWaiting,
 }
 
 #[cfg(test)]
@@ -2430,21 +2790,110 @@ fn query_path(root: &Path, requested: &str) -> ToolResult<(PathBuf, CompactStrin
     } else {
         root.join(path)
     };
-    let relative = relative_path(root, &absolute).ok_or_else(|| {
-        ToolError::invalid(format!(
+    match classify_relative_path(root, &absolute) {
+        RelativePath::Inside { path, relative } => Ok((path, relative)),
+        RelativePath::OutsideRoot | RelativePath::NonUtf8 => Err(ToolError::invalid(format!(
             "graph query path is outside root: {}",
             absolute.display()
         ))
-        .with_path(absolute.display().to_string())
-    })?;
-    Ok((absolute, relative))
+        .with_path(absolute.display().to_string())),
+    }
 }
 
 fn relative_path(root: &Path, path: &Path) -> Option<CompactString> {
-    path.strip_prefix(root)
-        .ok()
-        .filter(|relative| !relative.as_os_str().is_empty())
-        .map(|relative| CompactString::from(relative.to_string_lossy().as_ref()))
+    match classify_relative_path(root, path) {
+        RelativePath::Inside { relative, .. } => Some(relative),
+        RelativePath::OutsideRoot | RelativePath::NonUtf8 => None,
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RelativePath {
+    OutsideRoot,
+    NonUtf8,
+    Inside {
+        path: PathBuf,
+        relative: CompactString,
+    },
+}
+
+fn classify_relative_path(root: &Path, path: &Path) -> RelativePath {
+    let Some(root) = lexical_normalize(root) else {
+        return RelativePath::OutsideRoot;
+    };
+    let Some(path) = lexical_normalize(path) else {
+        return RelativePath::OutsideRoot;
+    };
+    let Ok(relative) = path.strip_prefix(&root) else {
+        return RelativePath::OutsideRoot;
+    };
+    if relative.as_os_str().is_empty() {
+        return RelativePath::OutsideRoot;
+    }
+    let (Some(_), Some(relative)) = (path.to_str(), relative.to_str()) else {
+        return RelativePath::NonUtf8;
+    };
+    let relative = CompactString::from(relative);
+    RelativePath::Inside { path, relative }
+}
+
+fn lexical_normalize(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    return None;
+                }
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    Some(normalized)
+}
+
+fn caller_universe_path(root: &Path, supplied: &str) -> ToolResult<(PathBuf, CompactString)> {
+    let supplied = Path::new(supplied);
+    let candidate = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        root.join(supplied)
+    };
+    match classify_relative_path(root, &candidate) {
+        RelativePath::Inside { path, relative } => {
+            if let Ok(canonical_path) = std::fs::canonicalize(&path) {
+                let canonical_root = std::fs::canonicalize(root).map_err(|error| {
+                    ToolError::internal(format!(
+                        "could not canonicalize graph root {}: {error}",
+                        root.display()
+                    ))
+                    .with_path(root.display().to_string())
+                })?;
+                if !canonical_path.starts_with(&canonical_root) {
+                    return Err(graph_universe_outside_root(&candidate));
+                }
+            }
+            Ok((path, relative))
+        }
+        RelativePath::OutsideRoot | RelativePath::NonUtf8 => {
+            Err(graph_universe_outside_root(&candidate))
+        }
+    }
+}
+
+fn graph_universe_outside_root(path: &Path) -> ToolError {
+    ToolError::invalid(format!(
+        "graph universe path is outside root: {}",
+        path.display()
+    ))
+    .with_path(path.display().to_string())
 }
 
 fn sweep_age(last_sweep: Option<Instant>) -> Option<u64> {
@@ -2462,16 +2911,22 @@ fn saturating_u64(value: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphTestHook, GraphTestPoint, MAX_GRAPH_ROOTS, RootState, SweepKey, SweepMeta, graph,
-        graph_cancellable, graph_clear, graph_test_root_count, graph_test_set_hook,
+        GraphState, GraphTestHook, GraphTestPoint, MAX_GRAPH_ROOTS, RootState, SweepKey, SweepMeta,
+        graph, graph_cancellable, graph_clear, graph_test_root_count, graph_test_set_hook,
         rdeps_flight_key,
     };
+    #[cfg(unix)]
+    use super::{RelativePath, classify_relative_path};
     use compact_str::CompactString;
     use hearth_core::{CancelToken, Engine, EngineConfig};
-    use hearth_proto::{ErrorKind, GraphOp, GraphOutput, GraphParams};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use hearth_proto::{ErrorKind, GraphGuarantee, GraphOp, GraphOutput, GraphParams, GraphResult};
+    #[cfg(unix)]
+    use std::ffi::OsStr;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, mpsc};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn engine() -> Engine {
         Engine::new(EngineConfig {
@@ -2497,7 +2952,52 @@ mod tests {
         )
     }
 
+    fn rdeps_query(root: &Path, target: &Path, files: &[&Path]) -> GraphParams {
+        let mut params = GraphParams::new(
+            root.display().to_string(),
+            GraphOp::Rdeps {
+                path: target.display().to_string(),
+                depth: 1,
+                verify: true,
+            },
+        );
+        params.files = files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        params
+    }
+
+    fn rdeps_importer_paths(result: &GraphResult) -> Vec<String> {
+        let GraphOutput::Rdeps(rdeps) = &result.output else {
+            panic!("expected rdeps");
+        };
+        rdeps
+            .importers
+            .iter()
+            .map(|entry| entry.node.path.clone())
+            .collect()
+    }
+
+    fn root_graph(engine: &Engine, root: &Path) -> Arc<super::RootGraph> {
+        let graph_state = engine.extension::<GraphState>();
+        let entry = graph_state
+            .roots
+            .get(root)
+            .expect("graph root was published");
+        Arc::clone(entry.value())
+    }
+
     use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_relative_path_is_classified_without_a_lossy_key() {
+        let root = Path::new("/tmp/hearth-graph-relative-path-test");
+        let path = root.join(OsStr::from_bytes(b"a\xff.rs"));
+
+        assert_eq!(classify_relative_path(root, &path), RelativePath::NonUtf8);
+    }
 
     #[test]
     fn cold_loser_deterministically_observes_building() {
@@ -2521,6 +3021,7 @@ mod tests {
                 }
                 GraphTestPoint::ColdWaitLockAcquired => {}
                 GraphTestPoint::BeforePublish => {}
+                _ => {}
             })
         };
         graph_test_set_hook(dir.path(), Some(hook));
@@ -2537,7 +3038,15 @@ mod tests {
         release_build.wait();
 
         assert!(first.join().unwrap().is_ok());
-        assert!(second.join().unwrap().is_ok());
+        let loser_result = second.join().unwrap().unwrap();
+        assert_eq!(loser_result.meta.guarantee, GraphGuarantee::Exact);
+        assert_eq!(loser_result.meta.universe_files, 1);
+        assert_eq!(loser_result.meta.indexed_files, 1);
+        let GraphOutput::Search(search) = &loser_result.output else {
+            panic!("expected a search result");
+        };
+        assert_eq!(search.symbols.len(), 1);
+        assert_eq!(search.symbols[0].name, "symbol");
         graph_test_set_hook(dir.path(), None);
     }
 
@@ -2566,12 +3075,11 @@ mod tests {
                     observed_busy.store(true, Ordering::Release);
                     loser_waiting.wait();
                 }
-                GraphTestPoint::ColdWaitLockAcquired => {
-                    if observed_busy.load(Ordering::Acquire) {
-                        cancel.cancel();
-                    }
+                GraphTestPoint::ColdWaitLockAcquired if observed_busy.load(Ordering::Acquire) => {
+                    cancel.cancel();
                 }
                 GraphTestPoint::BeforePublish => {}
+                _ => {}
             })
         };
         graph_test_set_hook(dir.path(), Some(hook));
@@ -2624,6 +3132,49 @@ mod tests {
     }
 
     #[test]
+    fn walk_snapshot_reuse_reports_the_walk_stamp_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        seed(&root, "src/lib.rs");
+        let engine = engine();
+
+        graph(&engine, &query(&root)).unwrap();
+
+        let mut view_query = query(&root);
+        view_query.files = vec![root.join("src/lib.rs").display().to_string()];
+        graph(&engine, &view_query).unwrap();
+
+        let graph_state = engine.extension::<GraphState>();
+        let root_graph = graph_state
+            .roots
+            .get(&root)
+            .expect("graph root was published");
+        let old_walk_stamp = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .expect("test instant supports a ten-second lookback");
+        root_graph
+            .sweep
+            .lock()
+            .last_walk_sweep
+            .as_mut()
+            .expect("walk sweep stamp exists")
+            .at = old_walk_stamp;
+        drop(root_graph);
+
+        let mut reused_query = query(&root);
+        reused_query.max_stale_ms = Some(u64::MAX);
+        let reused = graph(&engine, &reused_query).unwrap();
+
+        assert!(!reused.meta.swept);
+        assert_eq!(reused.meta.guarantee, GraphGuarantee::Exact);
+        assert!(
+            reused.meta.sweep_age_ms >= 9_000,
+            "walk reuse reported the newer files-view sweep age: {}ms",
+            reused.meta.sweep_age_ms
+        );
+    }
+
+    #[test]
     fn rdeps_flight_key_covers_every_repair_walk_parameter() {
         let dir = tempfile::tempdir().unwrap();
         let state = RootState::new(dir.path());
@@ -2636,16 +3187,309 @@ mod tests {
             },
         );
         let target = CompactString::from("/root/src/target.ts");
-        let baseline = rdeps_flight_key(&state, target.clone(), &params);
+        let baseline = rdeps_flight_key(&state, target.clone(), &params, None);
 
         params.hidden = true;
-        assert_ne!(baseline, rdeps_flight_key(&state, target.clone(), &params));
+        assert_ne!(
+            baseline,
+            rdeps_flight_key(&state, target.clone(), &params, None)
+        );
         params.hidden = false;
         params.respect_gitignore = false;
-        assert_ne!(baseline, rdeps_flight_key(&state, target.clone(), &params));
+        assert_ne!(
+            baseline,
+            rdeps_flight_key(&state, target.clone(), &params, None)
+        );
         params.respect_gitignore = true;
         params.follow_symlinks = true;
-        assert_ne!(baseline, rdeps_flight_key(&state, target, &params));
+        assert_ne!(
+            baseline,
+            rdeps_flight_key(&state, target.clone(), &params, None)
+        );
+        params.follow_symlinks = false;
+        let caller_view = rustc_hash::FxHashSet::from_iter([
+            CompactString::from("src/target.ts"),
+            CompactString::from("src/importer.ts"),
+        ]);
+        assert_ne!(
+            baseline,
+            rdeps_flight_key(&state, target, &params, Some(&caller_view))
+        );
+    }
+
+    #[test]
+    fn completed_rdeps_flight_is_not_reused_after_invalidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("src/target.ts");
+        let importer = root.join("src/importer.ts");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export const targetValue = true;\n").unwrap();
+        std::fs::write(
+            &importer,
+            "import \"./target\";\nexport const importerProbe = true;\n",
+        )
+        .unwrap();
+        let engine = engine();
+        let params = rdeps_query(&root, &target, &[&target, &importer]);
+        let repair_count = Arc::new(AtomicUsize::new(0));
+        let hook: GraphTestHook = {
+            let repair_count = Arc::clone(&repair_count);
+            Arc::new(move |point| {
+                if point == GraphTestPoint::RdepsRepairStarted {
+                    repair_count.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        graph_test_set_hook(&root, Some(hook));
+
+        let first = graph(&engine, &params).unwrap();
+        assert_eq!(
+            rdeps_importer_paths(&first),
+            [importer.display().to_string()]
+        );
+        let root_graph = root_graph(&engine, &root);
+        assert!(root_graph.rdeps_flights.lock().is_empty());
+
+        let second = graph(&engine, &params).unwrap();
+        assert_eq!(
+            rdeps_importer_paths(&second),
+            [importer.display().to_string()]
+        );
+        assert!(root_graph.rdeps_flights.lock().is_empty());
+
+        std::fs::write(
+            &importer,
+            "export const importerProbe = true;\n// still mentions target\n",
+        )
+        .unwrap();
+        engine.invalidate_path(&importer);
+
+        let third = graph(&engine, &params).unwrap();
+        assert!(rdeps_importer_paths(&third).is_empty());
+        assert_eq!(repair_count.load(Ordering::SeqCst), 3);
+        assert!(root_graph.rdeps_flights.lock().is_empty());
+        graph_test_set_hook(&root, None);
+    }
+
+    #[test]
+    fn concurrent_rdeps_verify_queries_share_one_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("src/target.ts");
+        let importer = root.join("src/importer.ts");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export const targetValue = true;\n").unwrap();
+        std::fs::write(
+            &importer,
+            "import \"./target\";\nexport const importerProbe = true;\n",
+        )
+        .unwrap();
+        let engine = engine();
+        let params = rdeps_query(&root, &target, &[&target, &importer]);
+        let leader_in_repair = Arc::new(Barrier::new(2));
+        let release_leader = Arc::new(Barrier::new(2));
+        let follower_waiting = Arc::new(Barrier::new(2));
+        let repair_count = Arc::new(AtomicUsize::new(0));
+        let hook: GraphTestHook = {
+            let leader_in_repair = Arc::clone(&leader_in_repair);
+            let release_leader = Arc::clone(&release_leader);
+            let follower_waiting = Arc::clone(&follower_waiting);
+            let repair_count = Arc::clone(&repair_count);
+            Arc::new(move |point| match point {
+                GraphTestPoint::RdepsRepairStarted
+                    if repair_count.fetch_add(1, Ordering::SeqCst) == 0 =>
+                {
+                    leader_in_repair.wait();
+                    release_leader.wait();
+                }
+                GraphTestPoint::RdepsFollowerWaiting => {
+                    follower_waiting.wait();
+                }
+                _ => {}
+            })
+        };
+        graph_test_set_hook(&root, Some(hook));
+
+        let leader_engine = engine.clone();
+        let leader_params = params.clone();
+        let leader = std::thread::spawn(move || graph(&leader_engine, &leader_params));
+        leader_in_repair.wait();
+
+        let follower_engine = engine.clone();
+        let follower_params = params.clone();
+        let follower = std::thread::spawn(move || graph(&follower_engine, &follower_params));
+        follower_waiting.wait();
+        release_leader.wait();
+
+        let leader_result = leader.join().unwrap().unwrap();
+        let follower_result = follower.join().unwrap().unwrap();
+        let expected = [importer.display().to_string()];
+        assert_eq!(rdeps_importer_paths(&leader_result), expected);
+        assert_eq!(rdeps_importer_paths(&follower_result), expected);
+        assert_eq!(repair_count.load(Ordering::SeqCst), 1);
+        assert!(root_graph(&engine, &root).rdeps_flights.lock().is_empty());
+        graph_test_set_hook(&root, None);
+    }
+
+    #[test]
+    fn cancelled_leader_does_not_cancel_followers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("src/target.ts");
+        let importer = root.join("src/importer.ts");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export const targetValue = true;\n").unwrap();
+        std::fs::write(
+            &importer,
+            "import \"./target\";\nexport const importerProbe = true;\n",
+        )
+        .unwrap();
+        let engine = engine();
+        let params = rdeps_query(&root, &target, &[&target, &importer]);
+        let leader_cancel = CancelToken::new();
+        let leader_in_repair = Arc::new(Barrier::new(2));
+        let release_leader = Arc::new(Barrier::new(2));
+        let follower_waiting = Arc::new(Barrier::new(2));
+        let repair_count = Arc::new(AtomicUsize::new(0));
+        let hook: GraphTestHook = {
+            let leader_in_repair = Arc::clone(&leader_in_repair);
+            let release_leader = Arc::clone(&release_leader);
+            let follower_waiting = Arc::clone(&follower_waiting);
+            let repair_count = Arc::clone(&repair_count);
+            Arc::new(move |point| match point {
+                GraphTestPoint::RdepsRepairStarted
+                    if repair_count.fetch_add(1, Ordering::SeqCst) == 0 =>
+                {
+                    leader_in_repair.wait();
+                    release_leader.wait();
+                }
+                GraphTestPoint::RdepsFollowerWaiting => {
+                    follower_waiting.wait();
+                }
+                _ => {}
+            })
+        };
+        graph_test_set_hook(&root, Some(hook));
+
+        let leader_engine = engine.clone();
+        let leader_params = params.clone();
+        let leader_token = leader_cancel.clone();
+        let leader = std::thread::spawn(move || {
+            graph_cancellable(&leader_engine, &leader_params, &leader_token)
+        });
+        leader_in_repair.wait();
+
+        let follower_engine = engine.clone();
+        let follower_params = params.clone();
+        let follower = std::thread::spawn(move || graph(&follower_engine, &follower_params));
+        follower_waiting.wait();
+        leader_cancel.cancel();
+        release_leader.wait();
+
+        assert_eq!(
+            leader.join().unwrap().unwrap_err().kind,
+            ErrorKind::Cancelled
+        );
+        let follower_result = follower.join().unwrap().unwrap();
+        assert_eq!(
+            rdeps_importer_paths(&follower_result),
+            [importer.display().to_string()]
+        );
+        assert_eq!(repair_count.load(Ordering::SeqCst), 2);
+        assert!(root_graph(&engine, &root).rdeps_flights.lock().is_empty());
+        graph_test_set_hook(&root, None);
+    }
+
+    #[test]
+    fn sweep_publication_rebases_over_concurrent_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("src/target.ts");
+        let importer = root.join("src/ximport.ts");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export const targetValue = true;\n").unwrap();
+        let engine = engine();
+        graph(
+            &engine,
+            &GraphParams::new(
+                root.display().to_string(),
+                GraphOp::Search {
+                    query: "ximportProbe".into(),
+                    limit: 10,
+                },
+            ),
+        )
+        .unwrap();
+
+        let sweep_paused = Arc::new(Barrier::new(2));
+        let release_sweep = Arc::new(Barrier::new(2));
+        let before_publish_count = Arc::new(AtomicUsize::new(0));
+        let hook: GraphTestHook = {
+            let sweep_paused = Arc::clone(&sweep_paused);
+            let release_sweep = Arc::clone(&release_sweep);
+            let before_publish_count = Arc::clone(&before_publish_count);
+            Arc::new(move |point| {
+                if point == GraphTestPoint::BeforePublish
+                    && before_publish_count.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    sweep_paused.wait();
+                    release_sweep.wait();
+                }
+            })
+        };
+        graph_test_set_hook(&root, Some(hook));
+
+        let sweep_engine = engine.clone();
+        let sweep_params = GraphParams::new(
+            root.display().to_string(),
+            GraphOp::Search {
+                query: "ximportProbe".into(),
+                limit: 10,
+            },
+        );
+        let sweep = std::thread::spawn(move || graph(&sweep_engine, &sweep_params));
+        sweep_paused.wait();
+
+        std::fs::write(
+            &importer,
+            "import \"./target\";\nexport function ximportProbe() {}\n",
+        )
+        .unwrap();
+        engine.invalidate_path(&importer);
+        let repaired = graph(&engine, &rdeps_query(&root, &target, &[])).unwrap();
+        assert_eq!(
+            rdeps_importer_paths(&repaired),
+            [importer.display().to_string()]
+        );
+
+        std::fs::remove_file(&importer).unwrap();
+        engine.invalidate_path(&importer);
+        release_sweep.wait();
+
+        let swept = sweep.join().unwrap().unwrap();
+        let GraphOutput::Search(search) = swept.output else {
+            panic!("expected search");
+        };
+        assert!(search.symbols.is_empty());
+
+        let follow_up = graph(
+            &engine,
+            &GraphParams::new(
+                root.display().to_string(),
+                GraphOp::Search {
+                    query: "ximportProbe".into(),
+                    limit: 10,
+                },
+            ),
+        )
+        .unwrap();
+        let GraphOutput::Search(search) = follow_up.output else {
+            panic!("expected search");
+        };
+        assert!(search.symbols.is_empty());
+        assert_eq!(follow_up.meta.guarantee, GraphGuarantee::Exact);
+        graph_test_set_hook(&root, None);
     }
 
     #[test]
@@ -2690,6 +3534,64 @@ mod tests {
         graph(&engine, &query(roots.last().unwrap())).unwrap();
         assert_eq!(graph_test_root_count(&engine), MAX_GRAPH_ROOTS);
         assert_eq!(graph_clear(&engine), MAX_GRAPH_ROOTS as u64);
+    }
+
+    #[test]
+    fn concurrent_insertions_do_not_evict_each_other() {
+        let parent = tempfile::tempdir().unwrap();
+        let parent = parent.path().canonicalize().unwrap();
+        let engine = engine();
+        let mut old_root_paths = Vec::new();
+        for index in 0..15 {
+            let root = parent.join(format!("root-{index}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            graph(
+                &engine,
+                &GraphParams::new(root.display().to_string(), GraphOp::Status),
+            )
+            .unwrap();
+            old_root_paths.push(root);
+        }
+        let old_roots: Vec<_> = old_root_paths
+            .iter()
+            .map(|root| root_graph(&engine, root))
+            .collect();
+        let sweep_guards: Vec<_> = old_roots.iter().map(|root| root.sweep.lock()).collect();
+
+        let root_a = parent.join("root-a");
+        let root_b = parent.join("root-b");
+        seed(&root_a, "src/lib.rs");
+        seed(&root_b, "src/lib.rs");
+        let root_a = root_a.canonicalize().unwrap();
+        let root_b = root_b.canonicalize().unwrap();
+        let both_pinned = Arc::new(Barrier::new(2));
+        for root in [&root_a, &root_b] {
+            let both_pinned = Arc::clone(&both_pinned);
+            let hook: GraphTestHook = Arc::new(move |point| {
+                if point == GraphTestPoint::RootPinned {
+                    both_pinned.wait();
+                }
+            });
+            graph_test_set_hook(root, Some(hook));
+        }
+
+        let engine_a = engine.clone();
+        let query_a = query(&root_a);
+        let thread_a = std::thread::spawn(move || graph(&engine_a, &query_a));
+        let engine_b = engine.clone();
+        let query_b = query(&root_b);
+        let thread_b = std::thread::spawn(move || graph(&engine_b, &query_b));
+
+        assert!(thread_a.join().unwrap().is_ok());
+        assert!(thread_b.join().unwrap().is_ok());
+        assert_eq!(graph_test_root_count(&engine), MAX_GRAPH_ROOTS + 1);
+
+        graph_test_set_hook(&root_a, None);
+        graph_test_set_hook(&root_b, None);
+        drop(sweep_guards);
+        graph(&engine, &query(&root_a)).unwrap();
+        assert_eq!(graph_test_root_count(&engine), MAX_GRAPH_ROOTS);
     }
 
     #[test]

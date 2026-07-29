@@ -1104,7 +1104,10 @@ impl From<proto::GraphNode> for GraphNode {
 #[napi(object)]
 pub struct GraphDepEdge {
     pub from: String,
+    pub from_node_id: String,
     pub to: String,
+    pub to_node_id: Option<String>,
+    pub to_kind: String,
     pub specifier: String,
     pub kind: String,
     pub line: i64,
@@ -1115,7 +1118,10 @@ impl From<proto::GraphDepEdge> for GraphDepEdge {
     fn from(e: proto::GraphDepEdge) -> Self {
         Self {
             from: e.from,
+            from_node_id: e.from_node_id,
             to: e.to,
+            to_node_id: e.to_node_id,
+            to_kind: e.to_kind,
             specifier: e.specifier,
             kind: e.kind,
             line: as_i64(e.line),
