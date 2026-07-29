@@ -27,7 +27,10 @@ impl LineIndex {
         // A trailing '\n' produced a final "line start" at EOF; that is a real
         // empty last line only if the file does not end in '\n'. We keep it and
         // let `line_count` account for the trailing newline.
-        Self { line_starts, len: source.len().min(u32::MAX as usize) as u32 }
+        Self {
+            line_starts,
+            len: source.len().min(u32::MAX as usize) as u32,
+        }
     }
 
     /// Number of lines. A file ending in `\n` does not count a phantom line.

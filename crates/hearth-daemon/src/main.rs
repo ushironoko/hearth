@@ -52,7 +52,9 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let socket = args.socket.unwrap_or_else(hearth_tools::transport::default_socket_path);
+    let socket = args
+        .socket
+        .unwrap_or_else(hearth_tools::transport::default_socket_path);
 
     // Clear any stale socket from a previous (crashed) run.
     let _ = std::fs::remove_file(&socket);
@@ -138,9 +140,7 @@ fn stream_read(engine: &Engine, params: &ReadParams, fd: &OwnedFd) -> Response {
 /// Write all bytes to a raw fd without taking ownership (so it is not closed).
 fn write_all_fd(fd: i32, mut bytes: &[u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        let n = unsafe {
-            libc::write(fd, bytes.as_ptr() as *const std::ffi::c_void, bytes.len())
-        };
+        let n = unsafe { libc::write(fd, bytes.as_ptr() as *const std::ffi::c_void, bytes.len()) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {

@@ -13,7 +13,13 @@ fn files_found(eng: &hearth_core::Engine, root: &Path) -> Vec<String> {
     let mut names: Vec<String> = r
         .files
         .iter()
-        .map(|f| Path::new(&f.path).file_name().unwrap().to_string_lossy().into_owned())
+        .map(|f| {
+            Path::new(&f.path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     names.sort();
     names
@@ -28,8 +34,15 @@ fn creating_a_file_invalidates_a_cached_walk() {
     assert_eq!(files_found(&eng, dir.path()), vec!["first.txt"]);
 
     // A create through Hearth must be visible to the very next search.
-    write(&eng, &WriteParams::new(abs(dir.path(), "second.txt"), "marker\n")).unwrap();
-    assert_eq!(files_found(&eng, dir.path()), vec!["first.txt", "second.txt"]);
+    write(
+        &eng,
+        &WriteParams::new(abs(dir.path(), "second.txt"), "marker\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        files_found(&eng, dir.path()),
+        vec!["first.txt", "second.txt"]
+    );
 }
 
 #[test]
@@ -38,11 +51,26 @@ fn overwriting_an_existing_file_does_not_needlessly_drop_the_walk() {
     let eng = trusting_engine(dir.path());
     seed(dir.path(), "a.txt", "marker\n");
 
-    grep(&eng, &GrepParams::new("marker", dir.path().display().to_string())).unwrap();
-    write(&eng, &WriteParams::new(abs(dir.path(), "a.txt"), "marker again\n")).unwrap();
+    grep(
+        &eng,
+        &GrepParams::new("marker", dir.path().display().to_string()),
+    )
+    .unwrap();
+    write(
+        &eng,
+        &WriteParams::new(abs(dir.path(), "a.txt"), "marker again\n"),
+    )
+    .unwrap();
 
-    let r = grep(&eng, &GrepParams::new("marker", dir.path().display().to_string())).unwrap();
-    assert!(r.walk_cache_hit, "rewriting an existing file cannot change what a walk enumerates");
+    let r = grep(
+        &eng,
+        &GrepParams::new("marker", dir.path().display().to_string()),
+    )
+    .unwrap();
+    assert!(
+        r.walk_cache_hit,
+        "rewriting an existing file cannot change what a walk enumerates"
+    );
     assert_eq!(r.total_matches, 1);
 }
 
@@ -62,11 +90,17 @@ fn changing_an_ignore_file_invalidates_the_walk_it_governs() {
         &eng,
         &EditBatchParams::new(
             ignore.clone(),
-            vec![EditReplacement { old_text: "hidden.txt".into(), new_text: "nothing.txt".into() }],
+            vec![EditReplacement {
+                old_text: "hidden.txt".into(),
+                new_text: "nothing.txt".into(),
+            }],
         ),
     )
     .unwrap();
-    assert_eq!(files_found(&eng, dir.path()), vec!["hidden.txt", "kept.txt"]);
+    assert_eq!(
+        files_found(&eng, dir.path()),
+        vec!["hidden.txt", "kept.txt"]
+    );
 
     // The same via `write`.
     write(&eng, &WriteParams::new(&ignore, "hidden.txt\n")).unwrap();
@@ -79,7 +113,10 @@ fn explicit_invalidation_covers_a_change_hearth_did_not_make() {
     let eng = trusting_engine(dir.path());
     let path = seed(dir.path(), "outside.txt", "before\n");
 
-    assert_eq!(read(&eng, &ReadParams::new(&path)).unwrap().content, "before\n");
+    assert_eq!(
+        read(&eng, &ReadParams::new(&path)).unwrap().content,
+        "before\n"
+    );
 
     // An out-of-band write is exactly what `trustCache` promises *not* to see.
     std::fs::write(&path, "after\n").unwrap();
@@ -91,7 +128,10 @@ fn explicit_invalidation_covers_a_change_hearth_did_not_make() {
 
     let dropped = eng.invalidate_path(Path::new(&path));
     assert_eq!(dropped.files_invalidated, 1);
-    assert_eq!(read(&eng, &ReadParams::new(&path)).unwrap().content, "after\n");
+    assert_eq!(
+        read(&eng, &ReadParams::new(&path)).unwrap().content,
+        "after\n"
+    );
 }
 
 #[test]
@@ -101,8 +141,14 @@ fn invalidating_a_root_covers_a_shell_command_that_rewrote_the_tree() {
     let kept = seed(dir.path(), "kept.txt", "marker\n");
     seed(dir.path(), "doomed.txt", "marker\n");
 
-    assert_eq!(files_found(&eng, dir.path()), vec!["doomed.txt", "kept.txt"]);
-    assert_eq!(read(&eng, &ReadParams::new(&kept)).unwrap().content, "marker\n");
+    assert_eq!(
+        files_found(&eng, dir.path()),
+        vec!["doomed.txt", "kept.txt"]
+    );
+    assert_eq!(
+        read(&eng, &ReadParams::new(&kept)).unwrap().content,
+        "marker\n"
+    );
 
     // An arbitrary command can create, delete and rewrite anything.
     let r = bash(
@@ -120,7 +166,10 @@ fn invalidating_a_root_covers_a_shell_command_that_rewrote_the_tree() {
     assert!(dropped.walks_invalidated >= 1);
 
     assert_eq!(files_found(&eng, dir.path()), vec!["fresh.txt", "kept.txt"]);
-    assert_eq!(read(&eng, &ReadParams::new(&kept)).unwrap().content, "marker rewritten\n");
+    assert_eq!(
+        read(&eng, &ReadParams::new(&kept)).unwrap().content,
+        "marker rewritten\n"
+    );
 }
 
 #[test]
@@ -134,7 +183,11 @@ fn scoped_and_recursive_invalidation_do_only_what_they_say() {
 
     read(&eng, &ReadParams::new(&a)).unwrap();
     read(&eng, &ReadParams::new(&b)).unwrap();
-    grep(&eng, &GrepParams::new("marker", dir.path().display().to_string())).unwrap();
+    grep(
+        &eng,
+        &GrepParams::new("marker", dir.path().display().to_string()),
+    )
+    .unwrap();
 
     // Files only, non-recursive: one entry, no walks.
     let dropped = eng.invalidate(Path::new(&a), false, CacheScope::Files);
@@ -152,7 +205,11 @@ fn clearing_the_caches_empties_both() {
     let dir = tempfile::tempdir().unwrap();
     let eng = trusting_engine(dir.path());
     seed(dir.path(), "a.txt", "marker\n");
-    grep(&eng, &GrepParams::new("marker", dir.path().display().to_string())).unwrap();
+    grep(
+        &eng,
+        &GrepParams::new("marker", dir.path().display().to_string()),
+    )
+    .unwrap();
     assert!(!eng.files().is_empty());
 
     let dropped = eng.clear_caches();
@@ -160,6 +217,10 @@ fn clearing_the_caches_empties_both() {
     assert_eq!(dropped.walks_invalidated, 1);
     assert!(eng.files().is_empty());
 
-    let r = grep(&eng, &GrepParams::new("marker", dir.path().display().to_string())).unwrap();
+    let r = grep(
+        &eng,
+        &GrepParams::new("marker", dir.path().display().to_string()),
+    )
+    .unwrap();
     assert!(!r.walk_cache_hit, "the walk must be rebuilt after a clear");
 }

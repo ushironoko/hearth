@@ -85,7 +85,10 @@ pub struct WarmShellPool {
 }
 
 fn pool_capacity() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 8)
 }
 
 /// What a shell's reader threads forward.
@@ -173,7 +176,12 @@ fn spawn_shell(program: &str) -> std::io::Result<WarmShell> {
     spawn_reader(stderr, Src::Err, tx.clone());
     spawn_reader(ctrl, Src::Ctrl, tx);
 
-    Ok(WarmShell { child, stdin, rx, pgid })
+    Ok(WarmShell {
+        child,
+        stdin,
+        rx,
+        pgid,
+    })
 }
 
 /// A `pipe(2)` whose read end is close-on-exec (so the shell never inherits it)
@@ -190,22 +198,24 @@ fn control_pipe() -> std::io::Result<(RawFd, RawFd)> {
 }
 
 fn spawn_reader<R: Read + AsRawFd + Send + 'static>(mut reader: R, src: Src, tx: Sender<Raw>) {
-    let _ = std::thread::Builder::new().name("hearth-shell-reader".into()).spawn(move || {
-        let mut chunk = vec![0_u8; 65_536];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) | Err(_) => {
-                    let _ = tx.send(Raw::Eof);
-                    return;
-                }
-                Ok(n) => {
-                    if tx.send(Raw::Data(src, chunk[..n].to_vec())).is_err() {
-                        return; // the shell was retired
+    let _ = std::thread::Builder::new()
+        .name("hearth-shell-reader".into())
+        .spawn(move || {
+            let mut chunk = vec![0_u8; 65_536];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => {
+                        let _ = tx.send(Raw::Eof);
+                        return;
+                    }
+                    Ok(n) => {
+                        if tx.send(Raw::Data(src, chunk[..n].to_vec())).is_err() {
+                            return; // the shell was retired
+                        }
                     }
                 }
             }
-        }
-    });
+        });
 }
 
 /// Single-quote a value for safe injection into the shell script.
@@ -235,7 +245,11 @@ struct Delimited {
 
 impl Delimited {
     fn new(nonce: &[u8]) -> Self {
-        Self { nonce: nonce.to_vec(), pending: Vec::new(), done: false }
+        Self {
+            nonce: nonce.to_vec(),
+            pending: Vec::new(),
+            done: false,
+        }
     }
 
     fn push(&mut self, bytes: &[u8], emit: &mut dyn FnMut(&[u8])) {
@@ -282,7 +296,10 @@ impl Control {
             let line: Vec<u8> = self.buf.drain(..=nl).collect();
             let line = String::from_utf8_lossy(&line[..nl]);
             let mut parts = line.split_whitespace();
-            match (parts.next(), parts.next().and_then(|v| v.parse::<i32>().ok())) {
+            match (
+                parts.next(),
+                parts.next().and_then(|v| v.parse::<i32>().ok()),
+            ) {
                 (Some("P"), Some(pid)) => self.job_pgid = Some(pid),
                 (Some("X"), Some(code)) => self.exit_code = Some(code),
                 _ => {}
@@ -322,7 +339,9 @@ impl WarmShellPool {
         let r_lo = RandomState::new().build_hasher().finish();
         let nonce = format!("__HEARTH_{pid}_{n}_{r_hi:016x}{r_lo:016x}__");
 
-        let outcome = run_once(&mut shell, command, cwd, env, timeout, cancel, &nonce, on_bytes);
+        let outcome = run_once(
+            &mut shell, command, cwd, env, timeout, cancel, &nonce, on_bytes,
+        );
 
         if matches!(outcome, Dispatch::Done { .. }) {
             self.release(program, shell);
@@ -384,7 +403,7 @@ fn run_once(
             return Dispatch::Indeterminate(
                 "the shell closed while its command was being written; the command may have run"
                     .into(),
-            )
+            );
         }
     }
 
@@ -404,7 +423,8 @@ fn run_once(
         // Once the command has settled, only wait out the idle grace for
         // stragglers rather than the full timeout.
         if let Some(at) = settled_at
-            && at.elapsed() >= IDLE_GRACE {
+            && at.elapsed() >= IDLE_GRACE
+        {
             break;
         }
         if killed.is_none() {
@@ -484,7 +504,9 @@ fn next_wait(deadline: Instant, settled_at: Option<Instant>, cancel: &CancelToke
 /// pool's pre-dispatch drain is the backstop for that case.
 fn kill_job(ctrl: &Control, shell: &WarmShell) {
     if let Some(job) = ctrl.job_pgid
-        && job > 0 && job != shell.pgid {
+        && job > 0
+        && job != shell.pgid
+    {
         // SAFETY: `job` is a process group descended from our own shell.
         unsafe { libc::kill(-job, libc::SIGKILL) };
         unsafe { libc::kill(job, libc::SIGKILL) };
@@ -563,7 +585,10 @@ mod tests {
         assert_eq!(got, b"hello", "a possible nonce prefix must not be emitted");
         d.push(b"YZ", &mut |b| got.extend_from_slice(b));
         assert!(d.done);
-        assert_eq!(got, b"hello ", "the held-back space was output, the nonce was not");
+        assert_eq!(
+            got, b"hello ",
+            "the held-back space was output, the nonce was not"
+        );
     }
 
     #[test]
@@ -572,7 +597,10 @@ mod tests {
         let mut got = Vec::new();
         d.push(b"partial X", &mut |b| got.extend_from_slice(b));
         d.flush(&mut |b| got.extend_from_slice(b));
-        assert_eq!(got, b"partial X", "held-back bytes are real output when no nonce arrives");
+        assert_eq!(
+            got, b"partial X",
+            "held-back bytes are real output when no nonce arrives"
+        );
     }
 
     #[test]

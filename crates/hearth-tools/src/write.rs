@@ -1,7 +1,7 @@
 //! The `write` tool: full-file writes that refresh the warm cache.
 
 use crate::util::{resolve_path, resolve_write_target, write_bytes};
-use hearth_core::{profile, CancelToken, Engine};
+use hearth_core::{CancelToken, Engine, profile};
 use hearth_proto::{ToolResult, WriteMode, WriteParams, WriteResult};
 use std::sync::Arc;
 
@@ -73,7 +73,9 @@ pub fn write_owned_cancellable(
 
         // Move the content's own allocation into the cache Arc (no extra copy).
         let arc: Arc<[u8]> = Arc::from(content.into_bytes().into_boxed_slice());
-        engine.files().put_written(&target, arc, meta.size, meta.mtime_ns);
+        engine
+            .files()
+            .put_written(&target, arc, meta.size, meta.mtime_ns);
         if followed_symlink {
             // The link path is a separate cache key; drop it so a `trustCache`
             // read through the link cannot serve the pre-write bytes.

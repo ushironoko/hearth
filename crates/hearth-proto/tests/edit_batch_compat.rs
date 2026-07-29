@@ -19,14 +19,20 @@ const LEGACY_PARAMS: &str = r#"{
 fn legacy_params_default_to_hearth_010_behavior() {
     let params: EditBatchParams = serde_json::from_str(LEGACY_PARAMS).unwrap();
     assert!(!params.return_original_content);
-    assert_eq!(params.whitespace_only_target_policy, WhitespaceOnlyTargetPolicy::Reject);
+    assert_eq!(
+        params.whitespace_only_target_policy,
+        WhitespaceOnlyTargetPolicy::Reject
+    );
 }
 
 #[test]
 fn new_params_round_trip_through_named_msgpack() {
     let mut params = EditBatchParams::new(
         "/tmp/a.txt",
-        vec![hearth_proto::EditReplacement { old_text: "a".into(), new_text: "b".into() }],
+        vec![hearth_proto::EditReplacement {
+            old_text: "a".into(),
+            new_text: "b".into(),
+        }],
     );
     params.return_original_content = true;
     params.whitespace_only_target_policy = WhitespaceOnlyTargetPolicy::ExactFile;
@@ -34,12 +40,18 @@ fn new_params_round_trip_through_named_msgpack() {
     let bytes = rmp_serde::to_vec_named(&params).unwrap();
     let back: EditBatchParams = rmp_serde::from_slice(&bytes).unwrap();
     assert!(back.return_original_content);
-    assert_eq!(back.whitespace_only_target_policy, WhitespaceOnlyTargetPolicy::ExactFile);
+    assert_eq!(
+        back.whitespace_only_target_policy,
+        WhitespaceOnlyTargetPolicy::ExactFile
+    );
 }
 
 #[test]
 fn policy_serializes_as_camel_case_tags() {
-    assert_eq!(serde_json::to_string(&WhitespaceOnlyTargetPolicy::Reject).unwrap(), "\"reject\"");
+    assert_eq!(
+        serde_json::to_string(&WhitespaceOnlyTargetPolicy::Reject).unwrap(),
+        "\"reject\""
+    );
     assert_eq!(
         serde_json::to_string(&WhitespaceOnlyTargetPolicy::ExactFile).unwrap(),
         "\"exactFile\""
@@ -63,7 +75,10 @@ fn absent_original_content_stays_off_the_wire() {
         original_content: None,
     };
     let json = serde_json::to_string(&result).unwrap();
-    assert!(!json.contains("originalContent"), "unset field leaked into the wire: {json}");
+    assert!(
+        !json.contains("originalContent"),
+        "unset field leaked into the wire: {json}"
+    );
 
     // A response from a daemon that predates the field still deserializes.
     let legacy: EditBatchResult = serde_json::from_str(&json).unwrap();

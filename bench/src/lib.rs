@@ -17,9 +17,9 @@ fn mix(mut x: u64) -> u64 {
 }
 
 const WORDS: &[&str] = &[
-    "engine", "cache", "token", "buffer", "index", "walk", "shard", "arena",
-    "vector", "matcher", "region", "handle", "session", "worker", "signal",
-    "kernel", "packet", "stream", "cursor", "anchor", "module", "syntax",
+    "engine", "cache", "token", "buffer", "index", "walk", "shard", "arena", "vector", "matcher",
+    "region", "handle", "session", "worker", "signal", "kernel", "packet", "stream", "cursor",
+    "anchor", "module", "syntax",
 ];
 
 /// Generate one file's UTF-8 text with `lines` lines. Some lines carry known
@@ -47,7 +47,12 @@ pub fn file_text(seed: u64, lines: usize) -> String {
 /// Write a corpus of `num_files` files spread across `dirs` subdirectories,
 /// each with `lines_per_file` lines. Returns the paths written. Idempotent for a
 /// given (root, params): re-running overwrites the same content.
-pub fn gen_corpus(root: &Path, num_files: usize, dirs: usize, lines_per_file: usize) -> Vec<PathBuf> {
+pub fn gen_corpus(
+    root: &Path,
+    num_files: usize,
+    dirs: usize,
+    lines_per_file: usize,
+) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(num_files);
     for d in 0..dirs {
         std::fs::create_dir_all(root.join(format!("d{d:03}"))).unwrap();

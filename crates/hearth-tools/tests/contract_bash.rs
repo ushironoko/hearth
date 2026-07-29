@@ -25,7 +25,11 @@ fn collect(
 }
 
 fn channel_text(chunks: &[BashChunk], channel: BashChannel) -> String {
-    chunks.iter().filter(|c| c.channel == channel).map(|c| c.text.as_str()).collect()
+    chunks
+        .iter()
+        .filter(|c| c.channel == channel)
+        .map(|c| c.text.as_str())
+        .collect()
 }
 
 /// Poll until `pid` is gone, or give up. A killed process that is not our child
@@ -48,18 +52,24 @@ fn wait_for_exit(pid: i32, limit: Duration) -> bool {
 fn chunks_reconstruct_the_final_output_with_one_monotonic_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    let params = BashParams::new(
-        "for i in 1 2 3; do printf 'out%s\\n' $i; printf 'err%s\\n' $i 1>&2; done",
-    );
+    let params =
+        BashParams::new("for i in 1 2 3; do printf 'out%s\\n' $i; printf 'err%s\\n' $i 1>&2; done");
     let (r, chunks) = collect(&eng, &params, &CancelToken::none());
 
     assert_eq!(r.exit_code, 0);
     assert_eq!(channel_text(&chunks, BashChannel::Stdout), r.stdout);
     assert_eq!(channel_text(&chunks, BashChannel::Stderr), r.stderr);
-    assert_eq!(r.chunks, chunks.len() as u64, "the result must agree on how many chunks it sent");
+    assert_eq!(
+        r.chunks,
+        chunks.len() as u64,
+        "the result must agree on how many chunks it sent"
+    );
 
     let seqs: Vec<u64> = chunks.iter().map(|c| c.seq).collect();
-    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "sequence must be strictly increasing");
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "sequence must be strictly increasing"
+    );
     assert_eq!(seqs.first().copied(), Some(1));
 }
 
@@ -79,7 +89,10 @@ fn large_output_on_both_pipes_does_not_deadlock() {
     for eng in [engine(dir.path()), warm_engine(dir.path())] {
         let r = bash(
             &eng,
-            &BashParams { timeout_ms: Some(60_000), ..BashParams::new("seq 50000; seq 50000 1>&2") },
+            &BashParams {
+                timeout_ms: Some(60_000),
+                ..BashParams::new("seq 50000; seq 50000 1>&2")
+            },
         )
         .unwrap();
         assert_eq!(r.stdout.lines().count(), 50_000);
@@ -92,7 +105,11 @@ fn large_output_on_both_pipes_does_not_deadlock() {
 fn non_zero_exit_is_reported_with_its_output() {
     let dir = tempfile::tempdir().unwrap();
     for eng in [engine(dir.path()), warm_engine(dir.path())] {
-        let r = bash(&eng, &BashParams::new("printf out; printf err 1>&2; exit 42")).unwrap();
+        let r = bash(
+            &eng,
+            &BashParams::new("printf out; printf err 1>&2; exit 42"),
+        )
+        .unwrap();
         assert_eq!(r.exit_code, 42);
         assert_eq!(r.stdout, "out");
         assert_eq!(r.stderr, "err");
@@ -106,12 +123,18 @@ fn timeout_keeps_partial_output() {
     for eng in [engine(dir.path()), warm_engine(dir.path())] {
         let r = bash(
             &eng,
-            &BashParams { timeout_ms: Some(300), ..BashParams::new("printf partial; sleep 30") },
+            &BashParams {
+                timeout_ms: Some(300),
+                ..BashParams::new("printf partial; sleep 30")
+            },
         )
         .unwrap();
         assert!(r.timed_out);
         assert!(!r.aborted);
-        assert_eq!(r.stdout, "partial", "output produced before the timeout must survive");
+        assert_eq!(
+            r.stdout, "partial",
+            "output produced before the timeout must survive"
+        );
     }
 }
 
@@ -153,17 +176,26 @@ fn abort_keeps_partial_output_and_kills_the_process_tree() {
     );
     let (r, chunks) = collect(
         &eng,
-        &BashParams { timeout_ms: Some(30_000), ..BashParams::new(command) },
+        &BashParams {
+            timeout_ms: Some(30_000),
+            ..BashParams::new(command)
+        },
         &cancel,
     );
 
     assert!(r.aborted, "the result must report the abort");
     assert!(!r.timed_out);
-    assert_eq!(r.stdout, "started", "output produced before the abort must survive");
+    assert_eq!(
+        r.stdout, "started",
+        "output produced before the abort must survive"
+    );
     assert_eq!(channel_text(&chunks, BashChannel::Stdout), "started");
 
-    let grandchild: i32 =
-        std::fs::read_to_string(&pidfile).unwrap().trim().parse().expect("child pid");
+    let grandchild: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("child pid");
     assert!(
         wait_for_exit(grandchild, Duration::from_secs(5)),
         "no process may outlive the settled abort"
@@ -180,7 +212,10 @@ fn a_detached_descendant_holding_the_pipes_does_not_hang_the_call() {
     // the pipe open far longer than the call should wait.
     let r = bash(
         &eng,
-        &BashParams { timeout_ms: Some(30_000), ..BashParams::new("sleep 20 & printf done") },
+        &BashParams {
+            timeout_ms: Some(30_000),
+            ..BashParams::new("sleep 20 & printf done")
+        },
     )
     .unwrap();
 
@@ -198,13 +233,19 @@ fn marker_like_output_is_not_mistaken_for_the_protocol() {
     let dir = tempfile::tempdir().unwrap();
     let eng = warm_engine(dir.path());
     // Output that mimics the delimiter's shape, plus a plausible control line.
-    let r = bash(&eng, &BashParams::new(
-        "printf '__HEARTH_1_2_abc__\\nP 999\\nX 7\\n'; printf '__HEARTH_x__' 1>&2",
-    ))
+    let r = bash(
+        &eng,
+        &BashParams::new(
+            "printf '__HEARTH_1_2_abc__\\nP 999\\nX 7\\n'; printf '__HEARTH_x__' 1>&2",
+        ),
+    )
     .unwrap();
     assert_eq!(r.stdout, "__HEARTH_1_2_abc__\nP 999\nX 7\n");
     assert_eq!(r.stderr, "__HEARTH_x__");
-    assert_eq!(r.exit_code, 0, "the real exit code must come from the control channel");
+    assert_eq!(
+        r.exit_code, 0,
+        "the real exit code must come from the control channel"
+    );
 }
 
 #[test]
@@ -213,19 +254,29 @@ fn warm_shell_reuse_isolates_commands_from_each_other() {
     let eng = warm_engine(dir.path());
 
     // A background writer must not reach the next command's output.
-    let first = bash(&eng, &BashParams::new("printf first; (sleep 0.3; printf LEAK) &")).unwrap();
+    let first = bash(
+        &eng,
+        &BashParams::new("printf first; (sleep 0.3; printf LEAK) &"),
+    )
+    .unwrap();
     assert_eq!(first.exit_code, 0);
     assert!(!first.stdout.contains("LEAK"));
 
     // Environment and variables must not survive either.
     bash(&eng, &BashParams::new("export CARRIED=yes; MYVAR=1")).unwrap();
-    let second = bash(&eng, &BashParams::new("printf 'second:%s:%s' \"$CARRIED\" \"$MYVAR\""))
-        .unwrap();
+    let second = bash(
+        &eng,
+        &BashParams::new("printf 'second:%s:%s' \"$CARRIED\" \"$MYVAR\""),
+    )
+    .unwrap();
     assert_eq!(second.stdout, "second::");
 
     std::thread::sleep(Duration::from_millis(500));
     let third = bash(&eng, &BashParams::new("printf third")).unwrap();
-    assert_eq!(third.stdout, "third", "a retired background writer must not leak in later");
+    assert_eq!(
+        third.stdout, "third",
+        "a retired background writer must not leak in later"
+    );
 }
 
 #[test]
@@ -237,11 +288,20 @@ fn an_ambiguous_warm_shell_failure_is_reported_and_never_retried() {
     // Killing the pooled shell mid-command destroys the protocol *after* the
     // command was dispatched: Hearth cannot know whether it completed.
     let command = format!("echo x >> {}; kill -9 $$", counter.display());
-    let err = bash(&eng, &BashParams { timeout_ms: Some(5000), ..BashParams::new(command) })
-        .unwrap_err();
+    let err = bash(
+        &eng,
+        &BashParams {
+            timeout_ms: Some(5000),
+            ..BashParams::new(command)
+        },
+    )
+    .unwrap_err();
 
     assert_eq!(err.kind, ErrorKind::Indeterminate);
-    let runs = std::fs::read_to_string(&counter).unwrap_or_default().lines().count();
+    let runs = std::fs::read_to_string(&counter)
+        .unwrap_or_default()
+        .lines()
+        .count();
     assert_eq!(runs, 1, "an indeterminate command must not be re-executed");
 
     // The pool recovers for the next command.
@@ -300,7 +360,10 @@ fn cwd_and_environment_are_honoured() {
     )
     .unwrap();
     assert!(r.stdout.starts_with("on"));
-    assert!(r.stdout.contains(sub.file_name().unwrap().to_str().unwrap()));
+    assert!(
+        r.stdout
+            .contains(sub.file_name().unwrap().to_str().unwrap())
+    );
 
     // With the environment cleared, only what the call passes is visible.
     let cleared = bash(
@@ -319,10 +382,15 @@ fn cwd_and_environment_are_honoured() {
 fn collect_output_can_be_turned_off_for_a_streaming_caller() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    let params =
-        BashParams { collect_output: false, ..BashParams::new("printf streamed") };
+    let params = BashParams {
+        collect_output: false,
+        ..BashParams::new("printf streamed")
+    };
     let (r, chunks) = collect(&eng, &params, &CancelToken::none());
 
-    assert!(r.stdout.is_empty(), "the result must not hold a second copy");
+    assert!(
+        r.stdout.is_empty(),
+        "the result must not hold a second copy"
+    );
     assert_eq!(channel_text(&chunks, BashChannel::Stdout), "streamed");
 }

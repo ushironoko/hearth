@@ -39,7 +39,9 @@ impl Metrics {
         self.count += 1;
         self.total = self.total.saturating_add(duration);
         self.child_time = self.child_time.saturating_add(child);
-        self.self_time = self.self_time.saturating_add(duration.saturating_sub(child));
+        self.self_time = self
+            .self_time
+            .saturating_add(duration.saturating_sub(child));
         self.min = self.min.min(duration);
         self.max = self.max.max(duration);
         let bucket = duration_bucket(duration);

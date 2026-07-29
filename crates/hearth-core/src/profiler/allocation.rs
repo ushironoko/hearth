@@ -93,8 +93,12 @@ impl AllocationSnapshot {
             dealloc_calls: self.dealloc_calls.saturating_sub(earlier.dealloc_calls),
             dealloc_bytes: self.dealloc_bytes.saturating_sub(earlier.dealloc_bytes),
             realloc_calls: self.realloc_calls.saturating_sub(earlier.realloc_calls),
-            realloc_old_bytes: self.realloc_old_bytes.saturating_sub(earlier.realloc_old_bytes),
-            realloc_new_bytes: self.realloc_new_bytes.saturating_sub(earlier.realloc_new_bytes),
+            realloc_old_bytes: self
+                .realloc_old_bytes
+                .saturating_sub(earlier.realloc_old_bytes),
+            realloc_new_bytes: self
+                .realloc_new_bytes
+                .saturating_sub(earlier.realloc_new_bytes),
             failures: self.failures.saturating_sub(earlier.failures),
         }
     }

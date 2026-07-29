@@ -80,7 +80,8 @@ fn ensure_parent(path: &Path, create_dirs: bool) -> Result<(), ToolError> {
         return Ok(());
     }
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() {
+        && !parent.as_os_str().is_empty()
+    {
         fs::create_dir_all(parent).map_err(|e| io_err(e, path))?;
     }
     Ok(())
@@ -98,8 +99,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<Writ
     let previous = fs::metadata(path).ok();
     let existed = previous.is_some();
 
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let tmp = dir.join(format!(".{name}.hearth.{pid}.{seq}.tmp"));
@@ -126,7 +133,11 @@ pub fn atomic_write(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<Writ
     }
 
     let meta = fs::metadata(path).map_err(|e| io_err(e, path))?;
-    Ok(WriteMeta { size: meta.len(), mtime_ns: mtime_nanos(&meta), existed })
+    Ok(WriteMeta {
+        size: meta.len(),
+        mtime_ns: mtime_nanos(&meta),
+        existed,
+    })
 }
 
 /// Truncate and rewrite the existing inode, the semantics of `fs.writeFile`.
@@ -139,7 +150,11 @@ pub fn inplace_write(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<Wri
     let existed = fs::metadata(path).is_ok();
 
     let res = (|| -> std::io::Result<()> {
-        let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
         f.write_all(bytes)?;
         f.flush()?;
         Ok(())
@@ -149,7 +164,11 @@ pub fn inplace_write(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<Wri
     }
 
     let meta = fs::metadata(path).map_err(|e| io_err(e, path))?;
-    Ok(WriteMeta { size: meta.len(), mtime_ns: mtime_nanos(&meta), existed })
+    Ok(WriteMeta {
+        size: meta.len(),
+        mtime_ns: mtime_nanos(&meta),
+        existed,
+    })
 }
 
 /// Nanoseconds since the Unix epoch for the file's mtime (signed pre-epoch).

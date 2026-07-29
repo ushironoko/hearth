@@ -8,7 +8,10 @@ use hearth_proto::*;
 use hearth_tools::{edit_batch, read};
 
 fn one(old: &str, new: &str) -> Vec<EditReplacement> {
-    vec![EditReplacement { old_text: old.into(), new_text: new.into() }]
+    vec![EditReplacement {
+        old_text: old.into(),
+        new_text: new.into(),
+    }]
 }
 
 fn on_disk(path: &str) -> String {
@@ -19,15 +22,25 @@ fn on_disk(path: &str) -> String {
 fn single_and_multiple_disjoint_edits() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    let path = seed(dir.path(), "a.rs", "fn one() {}\nfn two() {}\nfn three() {}\n");
+    let path = seed(
+        dir.path(),
+        "a.rs",
+        "fn one() {}\nfn two() {}\nfn three() {}\n",
+    );
 
     let r = edit_batch(
         &eng,
         &EditBatchParams::new(
             path.clone(),
             vec![
-                EditReplacement { old_text: "fn one".into(), new_text: "fn ONE".into() },
-                EditReplacement { old_text: "fn three".into(), new_text: "fn THREE".into() },
+                EditReplacement {
+                    old_text: "fn one".into(),
+                    new_text: "fn ONE".into(),
+                },
+                EditReplacement {
+                    old_text: "fn three".into(),
+                    new_text: "fn THREE".into(),
+                },
             ],
         ),
     )
@@ -50,8 +63,14 @@ fn each_edit_matches_the_original_file_not_the_running_result() {
         &EditBatchParams::new(
             path.clone(),
             vec![
-                EditReplacement { old_text: "alpha".into(), new_text: "beta".into() },
-                EditReplacement { old_text: "beta".into(), new_text: "gamma".into() },
+                EditReplacement {
+                    old_text: "alpha".into(),
+                    new_text: "beta".into(),
+                },
+                EditReplacement {
+                    old_text: "beta".into(),
+                    new_text: "gamma".into(),
+                },
             ],
         ),
     )
@@ -71,7 +90,11 @@ fn duplicate_target_is_rejected_with_its_edit_index() {
     let err = edit_batch(&eng, &EditBatchParams::new(path.clone(), one("x", "y"))).unwrap_err();
     assert_eq!(err.kind, ErrorKind::MultipleMatches);
     assert_eq!(err.edit_index, Some(0));
-    assert_eq!(on_disk(&path), "x\nx\n", "a rejected batch must not touch the file");
+    assert_eq!(
+        on_disk(&path),
+        "x\nx\n",
+        "a rejected batch must not touch the file"
+    );
 }
 
 #[test]
@@ -82,12 +105,24 @@ fn overlapping_and_nested_targets_are_rejected_before_writing() {
 
     for edits in [
         vec![
-            EditReplacement { old_text: "abcd".into(), new_text: "1".into() },
-            EditReplacement { old_text: "cdef".into(), new_text: "2".into() },
+            EditReplacement {
+                old_text: "abcd".into(),
+                new_text: "1".into(),
+            },
+            EditReplacement {
+                old_text: "cdef".into(),
+                new_text: "2".into(),
+            },
         ],
         vec![
-            EditReplacement { old_text: "abcdef".into(), new_text: "1".into() },
-            EditReplacement { old_text: "cd".into(), new_text: "2".into() },
+            EditReplacement {
+                old_text: "abcdef".into(),
+                new_text: "1".into(),
+            },
+            EditReplacement {
+                old_text: "cd".into(),
+                new_text: "2".into(),
+            },
         ],
     ] {
         let err = edit_batch(&eng, &EditBatchParams::new(path.clone(), edits)).unwrap_err();
@@ -108,8 +143,14 @@ fn one_failing_edit_leaves_the_whole_batch_unapplied() {
         &EditBatchParams::new(
             path.clone(),
             vec![
-                EditReplacement { old_text: "change me".into(), new_text: "changed".into() },
-                EditReplacement { old_text: "absent".into(), new_text: "x".into() },
+                EditReplacement {
+                    old_text: "change me".into(),
+                    new_text: "changed".into(),
+                },
+                EditReplacement {
+                    old_text: "absent".into(),
+                    new_text: "x".into(),
+                },
             ],
         ),
     )
@@ -117,7 +158,11 @@ fn one_failing_edit_leaves_the_whole_batch_unapplied() {
 
     assert_eq!(err.kind, ErrorKind::NoMatch);
     assert_eq!(err.edit_index, Some(1));
-    assert_eq!(on_disk(&path), original, "the first edit must not have been applied either");
+    assert_eq!(
+        on_disk(&path),
+        original,
+        "the first edit must not have been applied either"
+    );
 }
 
 #[test]
@@ -127,7 +172,11 @@ fn bom_is_preserved() {
     let path = seed(dir.path(), "bom.txt", "\u{FEFF}hello\nworld\n");
 
     // The caller does not include the invisible BOM in oldText.
-    let r = edit_batch(&eng, &EditBatchParams::new(path.clone(), one("hello", "HELLO"))).unwrap();
+    let r = edit_batch(
+        &eng,
+        &EditBatchParams::new(path.clone(), one("hello", "HELLO")),
+    )
+    .unwrap();
     assert!(r.had_bom);
     assert_eq!(on_disk(&path), "\u{FEFF}HELLO\nworld\n");
 }
@@ -196,11 +245,20 @@ fn edits_through_a_symlink_rewrite_the_target_and_keep_the_link() {
     .unwrap();
 
     assert!(
-        std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "the symlink itself must survive"
     );
     assert_eq!(on_disk(&target), "value = 2\n");
-    assert_eq!(r.path, std::fs::canonicalize(&target).unwrap().display().to_string());
+    assert_eq!(
+        r.path,
+        std::fs::canonicalize(&target)
+            .unwrap()
+            .display()
+            .to_string()
+    );
 }
 
 #[test]
@@ -232,7 +290,11 @@ fn concurrent_edits_of_the_same_file_do_not_lose_updates() {
         }
     });
 
-    assert_eq!(on_disk(&path), "a=1\nb=1\nc=1\nd=1\n", "every concurrent edit must survive");
+    assert_eq!(
+        on_disk(&path),
+        "a=1\nb=1\nc=1\nd=1\n",
+        "every concurrent edit must survive"
+    );
 }
 
 #[test]
@@ -252,20 +314,34 @@ fn diff_metadata_locates_the_change() {
     .unwrap();
 
     assert_eq!(r.first_changed_line, Some(20));
-    assert_eq!(r.old_line_count, 31, "split('\\n') counts the empty element after the last newline");
+    assert_eq!(
+        r.old_line_count, 31,
+        "split('\\n') counts the empty element after the last newline"
+    );
     assert_eq!(r.new_line_count, 31);
     assert_eq!(r.hunks.len(), 1);
 
     let hunk = &r.hunks[0];
     // Four lines of context on each side, by default.
     assert_eq!(hunk.old_start, 16);
-    assert!(hunk.rows.iter().any(|row| row.op == DiffOp::Delete && row.text == "line 20"));
-    assert!(hunk.rows.iter().any(|row| row.op == DiffOp::Insert && row.text == "LINE TWENTY"));
+    assert!(
+        hunk.rows
+            .iter()
+            .any(|row| row.op == DiffOp::Delete && row.text == "line 20")
+    );
+    assert!(
+        hunk.rows
+            .iter()
+            .any(|row| row.op == DiffOp::Insert && row.text == "LINE TWENTY")
+    );
     assert!(
         !hunk.rows.iter().any(|row| row.text == "line 1"),
         "distant context must be elided, not shipped"
     );
-    assert_eq!(r.content.as_deref().unwrap().lines().nth(19), Some("LINE TWENTY"));
+    assert_eq!(
+        r.content.as_deref().unwrap().lines().nth(19),
+        Some("LINE TWENTY")
+    );
 }
 
 #[test]
@@ -283,7 +359,10 @@ fn skip_diff_and_no_content_by_default() {
     )
     .unwrap();
     assert!(r.hunks.is_empty());
-    assert!(r.content.is_none(), "the full file must not ship unless asked for");
+    assert!(
+        r.content.is_none(),
+        "the full file must not ship unless asked for"
+    );
 }
 
 #[test]
@@ -313,8 +392,15 @@ fn original_content_is_the_raw_pre_edit_text() {
     )
     .unwrap();
 
-    assert_eq!(r.original_content.as_deref(), Some("\u{FEFF}one\r\ntwo\r\n"));
-    assert_eq!(r.content.as_deref(), Some("one\nTWO\n"), "content stays normalized");
+    assert_eq!(
+        r.original_content.as_deref(),
+        Some("\u{FEFF}one\r\ntwo\r\n")
+    );
+    assert_eq!(
+        r.content.as_deref(),
+        Some("one\nTWO\n"),
+        "content stays normalized"
+    );
     assert_eq!(on_disk(&path), "\u{FEFF}one\r\nTWO\r\n");
 
     // Lone CR is collapsed on persistence, but the snapshot keeps it.
@@ -337,7 +423,10 @@ fn original_content_is_absent_unless_requested() {
     let eng = engine(dir.path());
     let path = seed(dir.path(), "quiet-raw.txt", "a\n");
     let r = edit_batch(&eng, &EditBatchParams::new(path, one("a", "A"))).unwrap();
-    assert!(r.original_content.is_none(), "the pre-edit file must not ship unless asked for");
+    assert!(
+        r.original_content.is_none(),
+        "the pre-edit file must not ship unless asked for"
+    );
 }
 
 #[test]
@@ -349,7 +438,11 @@ fn whitespace_only_policy_flows_through_the_tool() {
     let path = seed(dir.path(), "ws.txt", "   ");
     let err = edit_batch(&eng, &EditBatchParams::new(path.clone(), one("   ", "x"))).unwrap_err();
     assert_eq!(err.kind, ErrorKind::InvalidInput);
-    assert_eq!(on_disk(&path), "   ", "a rejected edit must leave the file untouched");
+    assert_eq!(
+        on_disk(&path),
+        "   ",
+        "a rejected edit must leave the file untouched"
+    );
 
     // Opting in permits exactly the whole-file case, atomically with the
     // original snapshot.
@@ -373,10 +466,16 @@ fn cache_is_coherent_after_a_batch_edit_under_trust_cache() {
     let path = seed(dir.path(), "warm.txt", "old\n");
 
     // Warm the cache first, so a stale entry would be observable.
-    assert_eq!(read(&eng, &ReadParams::new(&path)).unwrap().content, "old\n");
+    assert_eq!(
+        read(&eng, &ReadParams::new(&path)).unwrap().content,
+        "old\n"
+    );
     edit_batch(&eng, &EditBatchParams::new(path.clone(), one("old", "new"))).unwrap();
 
     let r = read(&eng, &ReadParams::new(&path)).unwrap();
     assert_eq!(r.content, "new\n");
-    assert!(r.cache_hit, "the refreshed entry should still be a warm hit");
+    assert!(
+        r.cache_hit,
+        "the refreshed entry should still be a warm hit"
+    );
 }

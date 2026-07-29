@@ -40,20 +40,29 @@ pub struct WalkCache {
 
 impl WalkCache {
     pub fn new(threads: usize) -> Self {
-        Self { map: DashMap::new(), threads: threads.max(1) }
+        Self {
+            map: DashMap::new(),
+            threads: threads.max(1),
+        }
     }
 
     /// Get (or build) the file list for `root` under `opts`. `hit` reports
     /// whether the cached walk was reused.
     pub fn get(&self, root: &Path, opts: WalkKey) -> (Arc<WalkEntry>, bool) {
-        let key = CacheKey { root: root.to_path_buf(), opts };
+        let key = CacheKey {
+            root: root.to_path_buf(),
+            opts,
+        };
         if let Some(entry) = self.map.get(&key) {
             crate::profiler::count("cache.walk.hit", 1);
             return (Arc::clone(entry.value()), true);
         }
         crate::profiler::count("cache.walk.miss", 1);
         let files = self.build(root, opts);
-        let entry = Arc::new(WalkEntry { root: root.to_path_buf(), files: Arc::new(files) });
+        let entry = Arc::new(WalkEntry {
+            root: root.to_path_buf(),
+            files: Arc::new(files),
+        });
         self.map.insert(key, Arc::clone(&entry));
         (entry, false)
     }
@@ -74,7 +83,8 @@ impl WalkCache {
         builder.build_parallel().run(|| {
             Box::new(|result| {
                 if let Ok(entry) = result
-                    && entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                {
                     sink.lock().push(entry.into_path());
                 }
                 WalkState::Continue
@@ -97,7 +107,8 @@ impl WalkCache {
     /// `write`/`edit` when they create a path or touch an ignore file.
     pub fn invalidate_under(&self, path: &Path) -> usize {
         let before = self.map.len();
-        self.map.retain(|k, _| !path.starts_with(&k.root) && !k.root.starts_with(path));
+        self.map
+            .retain(|k, _| !path.starts_with(&k.root) && !k.root.starts_with(path));
         before.saturating_sub(self.map.len())
     }
 

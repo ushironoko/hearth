@@ -12,14 +12,18 @@ use std::time::{Duration, Instant};
 /// A tree with a predictable number of matches per file, in path order.
 fn tree(dir: &std::path::Path) {
     for file in 0..10 {
-        let body: String =
-            (0..5).map(|line| format!("needle {file}-{line}\nfiller\n")).collect();
+        let body: String = (0..5)
+            .map(|line| format!("needle {file}-{line}\nfiller\n"))
+            .collect();
         seed(dir, &format!("f{file:02}.txt"), &body);
     }
 }
 
 fn base(dir: &std::path::Path) -> GrepParams {
-    GrepParams { mode: GrepMode::Content, ..GrepParams::new("needle", dir.display().to_string()) }
+    GrepParams {
+        mode: GrepMode::Content,
+        ..GrepParams::new("needle", dir.display().to_string())
+    }
 }
 
 #[test]
@@ -34,7 +38,10 @@ fn global_limit_is_deterministic_and_takes_the_first_matches_in_path_order() {
         let eng = engine(dir.path());
         let r = grep(
             &eng,
-            &GrepParams { max_total_count: Some(12), ..base(dir.path()) },
+            &GrepParams {
+                max_total_count: Some(12),
+                ..base(dir.path())
+            },
         )
         .unwrap();
         assert_eq!(r.total_matches, 12);
@@ -42,7 +49,12 @@ fn global_limit_is_deterministic_and_takes_the_first_matches_in_path_order() {
         runs.push(
             r.files
                 .iter()
-                .flat_map(|f| f.lines.iter().filter(|l| l.is_match).map(|l| l.text.clone()))
+                .flat_map(|f| {
+                    f.lines
+                        .iter()
+                        .filter(|l| l.is_match)
+                        .map(|l| l.text.clone())
+                })
                 .collect::<Vec<_>>(),
         );
     }
@@ -52,7 +64,10 @@ fn global_limit_is_deterministic_and_takes_the_first_matches_in_path_order() {
         .map(|i| format!("needle {}-{}", i / 5, i % 5))
         .collect();
     for run in &runs {
-        assert_eq!(run, &expected, "the kept matches must not depend on worker interleaving");
+        assert_eq!(
+            run, &expected,
+            "the kept matches must not depend on worker interleaving"
+        );
     }
 }
 
@@ -65,7 +80,11 @@ fn the_global_limit_is_independent_of_the_per_file_limit() {
     // Two matches per file, six overall: three files contribute.
     let r = grep(
         &eng,
-        &GrepParams { max_count: Some(2), max_total_count: Some(6), ..base(dir.path()) },
+        &GrepParams {
+            max_count: Some(2),
+            max_total_count: Some(6),
+            ..base(dir.path())
+        },
     )
     .unwrap();
     assert_eq!(r.total_matches, 6);
@@ -79,7 +98,14 @@ fn a_limit_that_is_never_reached_is_reported_as_such() {
     tree(dir.path());
     let eng = engine(dir.path());
 
-    let r = grep(&eng, &GrepParams { max_total_count: Some(1000), ..base(dir.path()) }).unwrap();
+    let r = grep(
+        &eng,
+        &GrepParams {
+            max_total_count: Some(1000),
+            ..base(dir.path())
+        },
+    )
+    .unwrap();
     assert_eq!(r.total_matches, 50);
     assert!(!r.limit_reached);
     assert_eq!(r.files_searched, 10);
@@ -88,7 +114,11 @@ fn a_limit_that_is_never_reached_is_reported_as_such() {
 #[test]
 fn context_lines_survive_truncation_at_the_limit() {
     let dir = tempfile::tempdir().unwrap();
-    seed(dir.path(), "ctx.txt", "before\nneedle one\nafter\nbefore\nneedle two\nafter\n");
+    seed(
+        dir.path(),
+        "ctx.txt",
+        "before\nneedle one\nafter\nbefore\nneedle two\nafter\n",
+    );
     let eng = engine(dir.path());
 
     let r = grep(
@@ -155,8 +185,14 @@ fn regex_literal_case_and_glob_behaviour() {
     let root = dir.path().display().to_string();
 
     // Regex.
-    let r = grep(&eng, &GrepParams { mode: GrepMode::Content, ..GrepParams::new(r"let \w+ =", &root) })
-        .unwrap();
+    let r = grep(
+        &eng,
+        &GrepParams {
+            mode: GrepMode::Content,
+            ..GrepParams::new(r"let \w+ =", &root)
+        },
+    )
+    .unwrap();
     assert_eq!(r.total_matches, 3);
 
     // The same text as a literal matches nothing.
@@ -172,9 +208,14 @@ fn regex_literal_case_and_glob_behaviour() {
     assert_eq!(r.total_matches, 0);
 
     // Case sensitivity.
-    let sensitive =
-        grep(&eng, &GrepParams { mode: GrepMode::Content, ..GrepParams::new("value", &root) })
-            .unwrap();
+    let sensitive = grep(
+        &eng,
+        &GrepParams {
+            mode: GrepMode::Content,
+            ..GrepParams::new("value", &root)
+        },
+    )
+    .unwrap();
     assert_eq!(sensitive.total_matches, 0);
     let insensitive = grep(
         &eng,
@@ -214,16 +255,30 @@ fn hidden_and_ignored_files_are_opt_in() {
     let root = dir.path().display().to_string();
 
     let default = grep(&eng, &GrepParams::new("target", &root)).unwrap();
-    assert_eq!(default.files.len(), 1, "hidden and ignored files are skipped by default");
+    assert_eq!(
+        default.files.len(),
+        1,
+        "hidden and ignored files are skipped by default"
+    );
     assert!(default.files[0].path.ends_with("visible.txt"));
 
-    let with_hidden =
-        grep(&eng, &GrepParams { hidden: true, ..GrepParams::new("target", &root) }).unwrap();
+    let with_hidden = grep(
+        &eng,
+        &GrepParams {
+            hidden: true,
+            ..GrepParams::new("target", &root)
+        },
+    )
+    .unwrap();
     assert_eq!(with_hidden.files.len(), 2);
 
     let everything = grep(
         &eng,
-        &GrepParams { hidden: true, respect_gitignore: false, ..GrepParams::new("target", &root) },
+        &GrepParams {
+            hidden: true,
+            respect_gitignore: false,
+            ..GrepParams::new("target", &root)
+        },
     )
     .unwrap();
     assert_eq!(everything.files.len(), 3);
@@ -246,7 +301,10 @@ fn a_file_root_searches_only_that_file_and_says_so() {
 fn a_missing_root_is_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    let err = grep(&eng, &GrepParams::new("x", dir.path().join("nope").display().to_string()))
-        .unwrap_err();
+    let err = grep(
+        &eng,
+        &GrepParams::new("x", dir.path().join("nope").display().to_string()),
+    )
+    .unwrap_err();
     assert_eq!(err.kind, ErrorKind::NotFound);
 }
