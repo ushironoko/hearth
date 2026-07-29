@@ -41,6 +41,9 @@ default = []
 # When enabled, the ProfilingAllocator counts every allocation. The leaf binary
 # composes it as the #[global_allocator]; core only provides the type.
 profiling = []
+# Internal test hook: downstream integration tests use PollWatcher so sandboxed
+# macOS runners do not depend on FSEvents delivery.
+test-poll-watcher = []
 
 [dev-dependencies]
 tempfile = { workspace = true }

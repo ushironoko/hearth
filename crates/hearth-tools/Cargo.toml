@@ -41,4 +41,5 @@ rmp-serde = { workspace = true }
 nix = { workspace = true }
 
 [dev-dependencies]
+hearth-core = { workspace = true, features = ["test-poll-watcher"] }
 tempfile = { workspace = true }

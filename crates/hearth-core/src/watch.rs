@@ -8,10 +8,10 @@
 
 use crate::cache::{FileCache, WalkCache};
 use crate::invalidation::InvalidationLog;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-poll-watcher")))]
 use notify::RecommendedWatcher;
-use notify::event::ModifyKind;
-#[cfg(test)]
+use notify::event::{MetadataKind, ModifyKind};
+#[cfg(any(test, feature = "test-poll-watcher"))]
 use notify::{Config, PollWatcher};
 use notify::{Event, EventHandler, EventKind, RecursiveMode, Watcher};
 use parking_lot::RwLock;
@@ -19,14 +19,14 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-poll-watcher"))]
 use std::time::Duration;
 
 const MAX_EXPANDED_PATHS: usize = 64;
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-poll-watcher")))]
 type WatcherBackend = RecommendedWatcher;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-poll-watcher"))]
 type WatcherBackend = PollWatcher;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,13 +58,15 @@ enum EventPathExpansion {
 }
 
 fn event_effect(kind: &EventKind) -> EventEffect {
-    // Metadata-only events (for example atime bumps caused by our own reads)
-    // must not trigger a read -> atime -> invalidate feedback loop.
+    // Access-time and other metadata-only events must not trigger a
+    // read -> atime -> invalidate feedback loop. WriteTime is different:
+    // PollWatcher may use it as the sole notification for a content write.
     let invalidate_content = matches!(
         kind,
         EventKind::Create(_)
             | EventKind::Remove(_)
             | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime))
             | EventKind::Modify(ModifyKind::Any)
             | EventKind::Modify(ModifyKind::Name(_))
     );
@@ -84,12 +86,12 @@ fn normalize_root(root: &Path) -> PathBuf {
     resolve_root(root).0
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-poll-watcher")))]
 fn new_watcher(event_handler: impl EventHandler) -> Result<WatcherBackend, notify::Error> {
     notify::recommended_watcher(event_handler)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-poll-watcher"))]
 fn new_watcher(event_handler: impl EventHandler) -> Result<WatcherBackend, notify::Error> {
     // Polling is a real watcher backend and keeps callback integration tests
     // deterministic on temporary filesystems where native event delivery can
@@ -749,17 +751,39 @@ mod tests {
     }
 
     #[test]
-    fn metadata_only_changes_are_not_recorded() {
+    fn write_time_metadata_invalidates_content_and_is_recorded() {
         assert_eq!(
             event_effect(&EventKind::Modify(ModifyKind::Metadata(
                 MetadataKind::WriteTime
             ))),
             EventEffect {
-                invalidate_content: false,
+                invalidate_content: true,
                 invalidate_walk: false,
-                record: false,
+                record: true,
             }
         );
+    }
+
+    #[test]
+    fn non_content_metadata_changes_are_not_recorded() {
+        for metadata in [
+            MetadataKind::Any,
+            MetadataKind::AccessTime,
+            MetadataKind::Permissions,
+            MetadataKind::Ownership,
+            MetadataKind::Extended,
+            MetadataKind::Other,
+        ] {
+            assert_eq!(
+                event_effect(&EventKind::Modify(ModifyKind::Metadata(metadata))),
+                EventEffect {
+                    invalidate_content: false,
+                    invalidate_walk: false,
+                    record: false,
+                },
+                "{metadata:?}"
+            );
+        }
     }
 
     #[test]
