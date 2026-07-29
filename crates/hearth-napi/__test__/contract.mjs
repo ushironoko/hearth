@@ -4,7 +4,7 @@
 // `index.js` by default, or an installed tarball in CI.
 
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import {
   errorKind,
@@ -515,6 +515,330 @@ test("invalidateRoot covers what a shell command did", async () => {
 
   const cleared = engine.clearCaches();
   assert.ok(cleared.walksInvalidated >= 1);
+});
+
+// ---------------------------------------------------------------------------
+suite("graph");
+
+test("keeps all graph operations in sync and async parity", async () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const path = seed(
+    root,
+    "a.ts",
+    'import { beta } from "./b";\nexport function alpha() { return beta(); }\n',
+  );
+  const dependency = seed(root, "b.ts", "export function beta() { return 42; }\n");
+  const outputFields = [
+    "symbols",
+    "outline",
+    "search",
+    "definitions",
+    "deps",
+    "rdeps",
+    "neighborhood",
+    "status",
+  ];
+  const operations = [
+    {
+      field: "status",
+      syncMethod: "graphStatus",
+      asyncMethod: "graphStatusAsync",
+      params: { root },
+    },
+    {
+      field: "symbols",
+      syncMethod: "graphSymbols",
+      asyncMethod: "graphSymbolsAsync",
+      params: { root, path },
+    },
+    {
+      field: "outline",
+      syncMethod: "graphOutline",
+      asyncMethod: "graphOutlineAsync",
+      params: { root, path },
+    },
+    {
+      field: "search",
+      syncMethod: "graphSearch",
+      asyncMethod: "graphSearchAsync",
+      params: { root, query: "alpha", limit: 10 },
+    },
+    {
+      field: "definitions",
+      syncMethod: "graphDefinitions",
+      asyncMethod: "graphDefinitionsAsync",
+      params: { root, name: "alpha", limit: 10 },
+    },
+    {
+      field: "deps",
+      syncMethod: "graphDeps",
+      asyncMethod: "graphDepsAsync",
+      params: { root, path },
+    },
+    {
+      field: "rdeps",
+      syncMethod: "graphRdeps",
+      asyncMethod: "graphRdepsAsync",
+      params: { root, path: dependency, verify: true },
+    },
+    {
+      field: "neighborhood",
+      syncMethod: "graphNeighborhood",
+      asyncMethod: "graphNeighborhoodAsync",
+      params: { root, path, depth: 1 },
+    },
+  ];
+
+  for (const { field, syncMethod, asyncMethod, params } of operations) {
+    const sync = engine[syncMethod]({ ...params });
+    const asyncResult = await engine[asyncMethod]({ ...params });
+    assert.deepStrictEqual(
+      sync[field],
+      asyncResult[field],
+      `${syncMethod} and ${asyncMethod} return the same ${field} payload`,
+    );
+
+    for (const result of [sync, asyncResult]) {
+      assert.notEqual(result[field], undefined, `${field} output is present`);
+      for (const otherField of outputFields) {
+        if (otherField !== field) {
+          assert.equal(result[otherField], undefined, `${otherField} output is absent`);
+        }
+      }
+    }
+  }
+});
+
+test("reports the graph build transition and counters", () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  const path = seed(dir, "a.ts", "export function alpha() {}\n");
+
+  const before = engine.graphStatus({ root: dir });
+  assert.equal(before.status.built, false);
+
+  engine.graphSymbols({ root: dir, path });
+  const after = engine.graphStatus({ root: dir });
+  assert.equal(after.status.built, true);
+  assert.ok(after.status.universeFiles >= 1);
+  assert.ok(after.status.indexedFiles >= 1);
+  assert.ok(after.status.symbols >= 1);
+  assert.equal(typeof after.status.components, "number");
+});
+
+test("limits graph search results", () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  seed(
+    dir,
+    "a.ts",
+    "export function matchAlpha() {}\nexport function matchBeta() {}\n",
+  );
+
+  const result = engine.graphSearch({ root: dir, query: "match", limit: 1 });
+  assert.equal(result.search.symbols.length, 1);
+  assert.equal(result.search.limitReached, true);
+});
+
+test("revalidates an out-of-band edit", () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  const path = seed(dir, "a.ts", "export function alpha() {}\n");
+
+  engine.graphSymbols({ root: dir, path });
+  writeFileSync(
+    path,
+    "export function alpha() {}\nexport function newlyAddedFunction() {}\n",
+  );
+
+  const result = engine.graphSymbols({ root: dir, path });
+  assert.ok(result.symbols.symbols.some((symbol) => symbol.name === "newlyAddedFunction"));
+  assert.ok(result.meta.reindexedFiles >= 1);
+});
+
+test("reports a missing graph root", () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  const missing = join(dir, "missing");
+  const error = throws(() =>
+    engine.graphSymbols({ root: missing, path: join(missing, "a.ts") }),
+  );
+
+  assert.equal(errorKind(error), "notFound");
+  assert.equal(typeof error.path, "string");
+  assert.ok(error.path.includes(missing));
+});
+
+test("rejects a pre-aborted graph query", async () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  const path = seed(dir, "a.ts", "export function alpha() {}\n");
+  const controller = new AbortController();
+  controller.abort();
+
+  const error = await rejects(() =>
+    engine.graphSymbolsAsync({ root: dir, path }, controller.signal),
+  );
+  assert.equal(errorKind(error), "cancelled");
+});
+
+test("uses camelCase counters and lowercase hex node ids", () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  const path = seed(dir, "a.ts", "export function alpha() {}\n");
+  const result = engine.graphSymbols({ root: dir, path });
+
+  assert.equal(typeof result.meta.universeFiles, "number");
+  assert.equal(typeof result.meta.sweepAgeMs, "number");
+  const lastAt = result.symbols.nodeId.lastIndexOf("@");
+  assert.ok(lastAt >= 0);
+  // This is the same wire format as GraphBasisEntry.contentHashHex, which
+  // coverage-bearing graph operations produce when includeBasis is true.
+  assert.match(result.symbols.nodeId.slice(lastAt), /^@[0-9a-f]{16}$/);
+});
+
+test("returns dependency edges in sync and async queries", async () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const a = seed(
+    root,
+    "a.ts",
+    'import { value } from "./b";\nexport const doubled = value * 2;\n',
+  );
+  const b = seed(root, "b.ts", "export const value = 21;\n");
+  const params = { root, path: a, includeBasis: true };
+
+  const sync = engine.graphDeps(params);
+  const asyncResult = await engine.graphDepsAsync(params);
+  for (const result of [sync, asyncResult]) {
+    const edge = result.deps.edges.find((candidate) => candidate.to === b);
+    assert.ok(edge, "a.ts has an edge to b.ts");
+    assert.deepEqual(
+      Object.keys(edge).sort(),
+      [
+        "from",
+        "fromNodeId",
+        "guarantee",
+        "kind",
+        "line",
+        "specifier",
+        "to",
+        "toKind",
+        "toNodeId",
+      ],
+    );
+    assert.equal(edge.from, a);
+    assert.equal(edge.from, result.deps.node.path);
+    assert.equal(edge.fromNodeId, result.deps.node.nodeId);
+    assert.equal(typeof edge.toNodeId, "string");
+    assert.equal(edge.toKind, "path");
+    assert.equal(edge.specifier, "./b");
+    assert.equal(edge.kind, "import");
+    assert.equal(edge.line, 1);
+    assert.equal(edge.guarantee, "exact");
+
+    const basis = result.deps.coverage.basis.find((entry) => entry.path === a);
+    assert.ok(basis);
+    assert.deepEqual(Object.keys(basis).sort(), ["contentHashHex", "path"]);
+    assert.match(basis.contentHashHex, /^[0-9a-f]{16}$/);
+  }
+});
+
+test("uses bare package names for external dependency targets", () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const packageDir = join(root, "node_modules", "react");
+  mkdirSync(packageDir, { recursive: true });
+  seed(packageDir, "package.json", '{"name":"react","main":"index.js"}\n');
+  seed(packageDir, "index.js", "export default {};\n");
+  const importer = seed(
+    root,
+    "external.ts",
+    'import React from "react";\nexport const element = React;\n',
+  );
+
+  const result = engine.graphDeps({ root, path: importer });
+  const edge = result.deps.edges.find((candidate) => candidate.specifier === "react");
+  assert.ok(edge, "external package import produces an edge");
+  assert.equal(edge.fromNodeId, result.deps.node.nodeId);
+  assert.equal(edge.to, "react");
+  assert.equal(edge.toNodeId, undefined);
+  assert.equal(edge.toKind, "external");
+  assert.equal(edge.to.startsWith("/"), false);
+});
+
+test("returns verified reverse dependencies in sync and async queries", async () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const a = seed(
+    root,
+    "a.ts",
+    'import { value } from "./b";\nexport const doubled = value * 2;\n',
+  );
+  const b = seed(root, "b.ts", "export const value = 21;\n");
+  const params = { root, path: b, verify: true };
+
+  const sync = engine.graphRdeps(params);
+  const asyncResult = await engine.graphRdepsAsync(params);
+  for (const result of [sync, asyncResult]) {
+    assert.equal(typeof result.rdeps.verified, "boolean");
+    assert.equal(result.rdeps.verified, true);
+    const importer = result.rdeps.importers.find((entry) => entry.node.path === a);
+    assert.ok(importer, "b.ts has a.ts as an importer");
+    assert.equal(importer.specifier, "./b");
+    assert.equal(importer.line, 1);
+    assert.equal(importer.guarantee, "exact");
+  }
+});
+
+test("files views omit out-of-view reverse dependencies", () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const a = seed(
+    root,
+    "a.ts",
+    'import { value } from "./b";\nexport const doubled = value * 2;\n',
+  );
+  const b = seed(root, "b.ts", "export const value = 21;\n");
+
+  engine.graphRdeps({ root, path: b, verify: true });
+  const result = engine.graphRdeps({ root, path: b, files: [b], verify: true });
+  const importer = result.rdeps.importers.find((entry) => entry.node.path === a);
+
+  assert.equal(importer, undefined);
+  assert.equal(result.meta.guarantee, "approximate");
+});
+
+test("returns neighborhood nodes and edges in sync and async queries", async () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const a = seed(
+    root,
+    "a.ts",
+    'import { value } from "./b";\nexport const doubled = value * 2;\n',
+  );
+  const b = seed(root, "b.ts", "export const value = 21;\n");
+  const params = { root, path: a };
+
+  const sync = engine.graphNeighborhood(params);
+  const asyncResult = await engine.graphNeighborhoodAsync(params);
+  for (const result of [sync, asyncResult]) {
+    assert.equal(result.neighborhood.center.path, a);
+    assert.deepEqual(
+      result.neighborhood.nodes.map((node) => node.path).sort(),
+      [a, b].sort(),
+    );
+    const edge = result.neighborhood.edges.find(
+      (candidate) => candidate.from === a && candidate.to === b,
+    );
+    assert.ok(edge, "the neighborhood connects a.ts to b.ts");
+    const fromNode = result.neighborhood.nodes.find((node) => node.path === edge.from);
+    const toNode = result.neighborhood.nodes.find((node) => node.path === edge.to);
+    assert.equal(edge.fromNodeId, fromNode.nodeId);
+    assert.equal(edge.toNodeId, toNode.nodeId);
+    assert.equal(edge.toKind, "path");
+  }
 });
 
 await run(`@hearthdev/napi contract (${typeof Bun !== "undefined" ? "bun" : "node"})`);

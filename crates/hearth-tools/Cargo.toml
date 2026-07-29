@@ -9,6 +9,7 @@ description = "Hearth tools: read, write, edit, bash, grep — built on the shar
 
 [dependencies]
 hearth-core = { workspace = true }
+hearth-graph = { workspace = true }
 hearth-proto = { workspace = true }
 
 compact_str = { workspace = true }
@@ -16,6 +17,7 @@ smallvec = { workspace = true }
 memchr = { workspace = true }
 bstr = { workspace = true }
 rustc-hash = { workspace = true }
+xxhash-rust = { workspace = true }
 
 # grep engine (ripgrep stack)
 grep-searcher = { workspace = true }

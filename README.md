@@ -13,7 +13,7 @@ Built in Rust, inspired by the *corsa-bind* orchestration model and the
 
 ## Overview
 
-The five tools an agent leans on most, behind one engine:
+The six tools an agent leans on most, behind one engine:
 
 | Tool | What it does |
 |------|--------------|
@@ -22,13 +22,14 @@ The five tools an agent leans on most, behind one engine:
 | `edit` | One exact replacement, or a batch of disjoint ones applied atomically — matched against the original file, preserving BOM and CRLF, with diff hunks in the result. |
 | `bash` | Shell commands with ordered output streaming, configurable shell, timeout + process-group kill, and an opt-in **warm-shell pool** with at-most-once semantics. |
 | `grep` | ripgrep-grade search (`grep-searcher` + `grep-regex`) over a **cached walk** and **cached file bytes**, with a deterministic global match limit. |
+| `graph` | Cached symbols, outlines, search, definitions, dependency/reverse-dependency traversal (`deps`/`rdeps`), bidirectional neighborhoods, and index status. |
 
 Every operation is cancellable: pass an `AbortSignal` and the native work stops
 at its next safe point, with nothing left running once the promise settles.
 
 Three surfaces, one core:
 
-- **Native Rust** — `hearth_tools::{read,write,edit,bash,grep}(&Engine, &params)`.
+- **Native Rust** — `hearth_tools::{read,write,edit,bash,grep,graph}(&Engine, &params)`.
 - **Node.js** — `@hearthdev/napi`'s `HearthEngine` class (typed sync + cancellable
   async methods, streaming `bash`).
 - **Daemon + CLI** — `hearthd` (a resident server) and the thin `hearth` client,
@@ -236,7 +237,8 @@ let hits = grep(&engine, &GrepParams {
 |-------|------|
 | `hearth-proto` | Shared request/response types (the one contract; `serde`, `camelCase`). |
 | `hearth-core`  | The resident `Engine`: the shared caches, warm-shells, and fs-watch. |
-| `hearth-tools` | The five tools + msgpack transport, built on the engine. |
+| `hearth-graph` | The I/O-free language registry, symbol extraction, and code-index layer. |
+| `hearth-tools` | The six tools + msgpack transport, built on the engine. |
 | `hearth-daemon`| `hearthd` — the Unix-socket server. |
 | `hearth-cli`   | `hearth` — the thin client (daemon or inline). |
 | `hearth-napi`  | `@hearthdev/napi` — the Node addon. |

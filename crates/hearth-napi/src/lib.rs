@@ -51,7 +51,10 @@ static GLOBAL: hearth_core::profiler::ProfilingAllocator<mimalloc::MiMalloc> =
 /// access (a worker thread mid-`compute`) and as the fallback when building
 /// the structured object itself fails.
 fn plain_err(e: &proto::ToolError) -> Error {
-    Error::new(Status::GenericFailure, format!("{}: {}", e.kind.as_str(), e.message))
+    Error::new(
+        Status::GenericFailure,
+        format!("{}: {}", e.kind.as_str(), e.message),
+    )
 }
 
 /// Keep the tool error for `reject` — which runs on the JS thread and can
@@ -101,7 +104,9 @@ pub struct Abort {
 impl FromNapiValue for Abort {
     unsafe fn from_napi_value(env: sys::napi_env, napi_val: sys::napi_value) -> Result<Self> {
         let object = unsafe { Object::from_napi_value(env, napi_val)? };
-        let already = object.get_named_property::<bool>("aborted").unwrap_or(false);
+        let already = object
+            .get_named_property::<bool>("aborted")
+            .unwrap_or(false);
         let signal = unsafe { AbortSignal::from_napi_value(env, napi_val)? };
 
         let token = CancelToken::new();
@@ -169,7 +174,10 @@ struct Progress {
 
 impl ChunkStream {
     fn new(callback: ChunkCallback) -> Self {
-        Self { callback, progress: Arc::new((Mutex::new(Progress::default()), Condvar::new())) }
+        Self {
+            callback,
+            progress: Arc::new((Mutex::new(Progress::default()), Condvar::new())),
+        }
     }
 
     fn send(&self, chunk: proto::BashChunk) {
@@ -278,7 +286,9 @@ impl HearthEngine {
                 cfg.shell = Some(shell.into());
             }
         }
-        Ok(Self { engine: Engine::new(cfg) })
+        Ok(Self {
+            engine: Engine::new(cfg),
+        })
     }
 
     /// Enable the profiler (timing + allocation tracking).
@@ -306,14 +316,15 @@ impl HearthEngine {
         ts_args_type = "params: ReadParams, signal?: AbortSignal",
         ts_return_type = "Promise<ReadResult>"
     )]
-    pub fn read_async(
-        &self,
-        params: ReadParams,
-        signal: Option<Abort>,
-    ) -> AsyncTask<ReadTask> {
+    pub fn read_async(&self, params: ReadParams, signal: Option<Abort>) -> AsyncTask<ReadTask> {
         let (cancel, signal) = split(signal);
         AsyncTask::with_optional_signal(
-            ReadTask { engine: self.engine.clone(), params: params.into(), cancel, failure: None },
+            ReadTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
             signal,
         )
     }
@@ -370,14 +381,15 @@ impl HearthEngine {
         ts_args_type = "params: WriteParams, signal?: AbortSignal",
         ts_return_type = "Promise<WriteResult>"
     )]
-    pub fn write_async(
-        &self,
-        params: WriteParams,
-        signal: Option<Abort>,
-    ) -> AsyncTask<WriteTask> {
+    pub fn write_async(&self, params: WriteParams, signal: Option<Abort>) -> AsyncTask<WriteTask> {
         let (cancel, signal) = split(signal);
         AsyncTask::with_optional_signal(
-            WriteTask { engine: self.engine.clone(), params: params.into(), cancel, failure: None },
+            WriteTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
             signal,
         )
     }
@@ -436,14 +448,265 @@ impl HearthEngine {
         ts_args_type = "params: GrepParams, signal?: AbortSignal",
         ts_return_type = "Promise<GrepResult>"
     )]
-    pub fn grep_async(
-        &self,
-        params: GrepParams,
-        signal: Option<Abort>,
-    ) -> AsyncTask<GrepTask> {
+    pub fn grep_async(&self, params: GrepParams, signal: Option<Abort>) -> AsyncTask<GrepTask> {
         let (cancel, signal) = split(signal);
         AsyncTask::with_optional_signal(
-            GrepTask { engine: self.engine.clone(), params: params.into(), cancel, failure: None },
+            GrepTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
+            signal,
+        )
+    }
+
+    // -- graph -----------------------------------------------------------
+
+    /// Synchronously list symbols extracted from one file.
+    #[napi]
+    pub fn graph_symbols(&self, env: Env, params: GraphSymbolsParams) -> Result<GraphResult> {
+        hearth_tools::graph(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
+    }
+
+    /// Synchronously return the nested symbol outline for one file.
+    #[napi]
+    pub fn graph_outline(&self, env: Env, params: GraphOutlineParams) -> Result<GraphResult> {
+        hearth_tools::graph(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
+    }
+
+    /// Synchronously search indexed symbols by name.
+    #[napi]
+    pub fn graph_search(&self, env: Env, params: GraphSearchParams) -> Result<GraphResult> {
+        hearth_tools::graph(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
+    }
+
+    /// Synchronously find definitions with an exact name.
+    #[napi]
+    pub fn graph_definitions(
+        &self,
+        env: Env,
+        params: GraphDefinitionsParams,
+    ) -> Result<GraphResult> {
+        hearth_tools::graph(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
+    }
+
+    /// Synchronously traverse dependencies from one file.
+    #[napi]
+    pub fn graph_deps(&self, env: Env, params: GraphDepsParams) -> Result<GraphResult> {
+        hearth_tools::graph(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
+    }
+
+    /// Synchronously traverse reverse dependencies from one file.
+    #[napi]
+    pub fn graph_rdeps(&self, env: Env, params: GraphRdepsParams) -> Result<GraphResult> {
+        hearth_tools::graph(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
+    }
+
+    /// Synchronously traverse both directions around one file.
+    #[napi]
+    pub fn graph_neighborhood(
+        &self,
+        env: Env,
+        params: GraphNeighborhoodParams,
+    ) -> Result<GraphResult> {
+        hearth_tools::graph(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
+    }
+
+    /// Synchronously return graph build and coverage status.
+    #[napi]
+    pub fn graph_status(&self, env: Env, params: GraphStatusParams) -> Result<GraphResult> {
+        hearth_tools::graph(&self.engine, &params.into())
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
+    }
+
+    /// Asynchronously list symbols extracted from one file.
+    #[napi(
+        ts_args_type = "params: GraphSymbolsParams, signal?: AbortSignal",
+        ts_return_type = "Promise<GraphResult>"
+    )]
+    pub fn graph_symbols_async(
+        &self,
+        params: GraphSymbolsParams,
+        signal: Option<Abort>,
+    ) -> AsyncTask<GraphTask> {
+        let (cancel, signal) = split(signal);
+        AsyncTask::with_optional_signal(
+            GraphTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
+            signal,
+        )
+    }
+
+    /// Asynchronously return the nested symbol outline for one file.
+    #[napi(
+        ts_args_type = "params: GraphOutlineParams, signal?: AbortSignal",
+        ts_return_type = "Promise<GraphResult>"
+    )]
+    pub fn graph_outline_async(
+        &self,
+        params: GraphOutlineParams,
+        signal: Option<Abort>,
+    ) -> AsyncTask<GraphTask> {
+        let (cancel, signal) = split(signal);
+        AsyncTask::with_optional_signal(
+            GraphTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
+            signal,
+        )
+    }
+
+    /// Asynchronously search indexed symbols by name.
+    #[napi(
+        ts_args_type = "params: GraphSearchParams, signal?: AbortSignal",
+        ts_return_type = "Promise<GraphResult>"
+    )]
+    pub fn graph_search_async(
+        &self,
+        params: GraphSearchParams,
+        signal: Option<Abort>,
+    ) -> AsyncTask<GraphTask> {
+        let (cancel, signal) = split(signal);
+        AsyncTask::with_optional_signal(
+            GraphTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
+            signal,
+        )
+    }
+
+    /// Asynchronously find definitions with an exact name.
+    #[napi(
+        ts_args_type = "params: GraphDefinitionsParams, signal?: AbortSignal",
+        ts_return_type = "Promise<GraphResult>"
+    )]
+    pub fn graph_definitions_async(
+        &self,
+        params: GraphDefinitionsParams,
+        signal: Option<Abort>,
+    ) -> AsyncTask<GraphTask> {
+        let (cancel, signal) = split(signal);
+        AsyncTask::with_optional_signal(
+            GraphTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
+            signal,
+        )
+    }
+
+    /// Asynchronously traverse dependencies from one file.
+    #[napi(
+        ts_args_type = "params: GraphDepsParams, signal?: AbortSignal",
+        ts_return_type = "Promise<GraphResult>"
+    )]
+    pub fn graph_deps_async(
+        &self,
+        params: GraphDepsParams,
+        signal: Option<Abort>,
+    ) -> AsyncTask<GraphTask> {
+        let (cancel, signal) = split(signal);
+        AsyncTask::with_optional_signal(
+            GraphTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
+            signal,
+        )
+    }
+
+    /// Asynchronously traverse reverse dependencies from one file.
+    #[napi(
+        ts_args_type = "params: GraphRdepsParams, signal?: AbortSignal",
+        ts_return_type = "Promise<GraphResult>"
+    )]
+    pub fn graph_rdeps_async(
+        &self,
+        params: GraphRdepsParams,
+        signal: Option<Abort>,
+    ) -> AsyncTask<GraphTask> {
+        let (cancel, signal) = split(signal);
+        AsyncTask::with_optional_signal(
+            GraphTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
+            signal,
+        )
+    }
+
+    /// Asynchronously traverse both directions around one file.
+    #[napi(
+        ts_args_type = "params: GraphNeighborhoodParams, signal?: AbortSignal",
+        ts_return_type = "Promise<GraphResult>"
+    )]
+    pub fn graph_neighborhood_async(
+        &self,
+        params: GraphNeighborhoodParams,
+        signal: Option<Abort>,
+    ) -> AsyncTask<GraphTask> {
+        let (cancel, signal) = split(signal);
+        AsyncTask::with_optional_signal(
+            GraphTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
+            signal,
+        )
+    }
+
+    /// Asynchronously return graph build and coverage status.
+    #[napi(
+        ts_args_type = "params: GraphStatusParams, signal?: AbortSignal",
+        ts_return_type = "Promise<GraphResult>"
+    )]
+    pub fn graph_status_async(
+        &self,
+        params: GraphStatusParams,
+        signal: Option<Abort>,
+    ) -> AsyncTask<GraphTask> {
+        let (cancel, signal) = split(signal);
+        AsyncTask::with_optional_signal(
+            GraphTask {
+                engine: self.engine.clone(),
+                params: params.into(),
+                cancel,
+                failure: None,
+            },
             signal,
         )
     }
@@ -463,11 +726,7 @@ impl HearthEngine {
         ts_args_type = "params: BashParams, signal?: AbortSignal",
         ts_return_type = "Promise<BashResult>"
     )]
-    pub fn bash_async(
-        &self,
-        params: BashParams,
-        signal: Option<Abort>,
-    ) -> AsyncTask<BashTask> {
+    pub fn bash_async(&self, params: BashParams, signal: Option<Abort>) -> AsyncTask<BashTask> {
         let (cancel, signal) = split(signal);
         AsyncTask::with_optional_signal(
             BashTask {
@@ -617,6 +876,13 @@ tool_task!(
     proto::GrepResult,
     GrepResult,
     hearth_tools::grep_cancellable
+);
+tool_task!(
+    GraphTask,
+    proto::GraphParams,
+    proto::GraphResult,
+    GraphResult,
+    hearth_tools::graph_cancellable
 );
 
 /// `readBytes` resolves to a `Buffer`, so it does not fit the macro's

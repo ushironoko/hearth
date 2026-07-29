@@ -591,6 +591,7 @@ module.exports.HearthEngine = nativeBinding.HearthEngine
 module.exports.BashChannel = nativeBinding.BashChannel
 module.exports.CacheScope = nativeBinding.CacheScope
 module.exports.DiffOp = nativeBinding.DiffOp
+module.exports.GraphGuarantee = nativeBinding.GraphGuarantee
 module.exports.GrepMode = nativeBinding.GrepMode
 module.exports.LineWindowMode = nativeBinding.LineWindowMode
 module.exports.ShellTransport = nativeBinding.ShellTransport

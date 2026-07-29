@@ -13,6 +13,7 @@
 mod bash;
 mod edit;
 mod edit_text;
+mod graph;
 mod grep;
 mod read;
 mod shell;
@@ -22,6 +23,7 @@ mod write;
 
 pub use bash::{bash, bash_cancellable, bash_stream};
 pub use edit::{edit, edit_batch, edit_batch_cancellable, edit_cancellable};
+pub use graph::{graph, graph_cancellable, graph_clear};
 pub use grep::{grep, grep_cancellable};
 pub use read::{read, read_bytes, read_bytes_cancellable, read_cancellable};
 pub use write::{write, write_cancellable, write_owned, write_owned_cancellable};
@@ -29,8 +31,8 @@ pub use write::{write, write_cancellable, write_owned, write_owned_cancellable};
 /// The pi-compatible text machinery behind `edit_batch`, exposed so a contract
 /// suite can exercise the matching rules directly.
 pub use edit_text::{
-    apply_edits, apply_edits_opts, detect_crlf, diff_hunks, normalize_for_fuzzy_match,
-    normalize_to_lf, restore_line_endings, split_line_count, strip_bom, AppliedEdits,
+    AppliedEdits, apply_edits, apply_edits_opts, detect_crlf, diff_hunks,
+    normalize_for_fuzzy_match, normalize_to_lf, restore_line_endings, split_line_count, strip_bom,
 };
 
 pub use hearth_core::{CancelToken, Engine};
@@ -65,12 +67,20 @@ pub fn dispatch(engine: &Engine, req: hearth_proto::Request) -> hearth_proto::Re
             Ok(r) => Response::Grep(r),
             Err(e) => Response::Error(e),
         },
+        Request::Graph(p) => match graph(engine, &p) {
+            Ok(r) => Response::Graph(r),
+            Err(e) => Response::Error(e),
+        },
         Request::Invalidate(p) => Response::Invalidate(engine.invalidate(
             std::path::Path::new(&p.path),
             p.recursive,
             p.scope,
         )),
-        Request::ClearCaches => Response::Invalidate(engine.clear_caches()),
+        Request::ClearCaches => {
+            let result = engine.clear_caches();
+            graph::graph_clear(engine);
+            Response::Invalidate(result)
+        }
         Request::Ping => Response::Pong,
         Request::Stats => Response::Stats(engine.profiler_report()),
         Request::Shutdown => Response::ShuttingDown,
