@@ -1,7 +1,5 @@
 use std::borrow::Cow;
 
-use compact_str::CompactString;
-use smallvec::SmallVec;
 use tree_sitter::Language;
 
 use crate::{ImportKind, ImportSpec, LanguageRegistry, LanguageSpec};
@@ -25,17 +23,10 @@ fn language_spec_with_imports(
     tags_query: Cow<'static, str>,
     imports: Option<ImportSpec>,
 ) -> LanguageSpec {
-    LanguageSpec {
-        name: CompactString::new(name),
-        language,
-        extensions: extensions
-            .iter()
-            .copied()
-            .map(CompactString::new)
-            .collect::<SmallVec<_>>(),
-        tags_query: Some(tags_query),
-        merge_adjacent_same_name_definitions: false,
-        imports,
+    let spec = LanguageSpec::new(name, language, extensions).with_tags_query(tags_query);
+    match imports {
+        Some(imports) => spec.with_imports(imports),
+        None => spec,
     }
 }
 
@@ -45,9 +36,8 @@ fn language_spec_merging_adjacent_definitions(
     extensions: &[&str],
     tags_query: Cow<'static, str>,
 ) -> LanguageSpec {
-    let mut spec = language_spec(name, language, extensions, tags_query);
-    spec.merge_adjacent_same_name_definitions = true;
-    spec
+    language_spec(name, language, extensions, tags_query)
+        .with_merge_adjacent_same_name_definitions(true)
 }
 
 fn import_kind(capture: &str) -> ImportKind {

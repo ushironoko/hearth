@@ -1,6 +1,5 @@
 #![cfg(feature = "bundled-languages")]
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 use hearth_graph::{
@@ -228,17 +227,17 @@ fn static_import_kind(capture: &str) -> ImportKind {
 #[test]
 fn analyze_and_index_drivers_keep_distinct_prefilters() {
     let mut registry = LanguageRegistry::empty();
-    registry.register(LanguageSpec {
-        name: "imports-only".into(),
-        language: tree_sitter_javascript::LANGUAGE.into(),
-        extensions: ["dep".into()].into_iter().collect(),
-        tags_query: None,
-        merge_adjacent_same_name_definitions: false,
-        imports: Some(ImportSpec::Query {
-            source: Cow::Borrowed("(import_statement source: (string) @import.source.static)"),
+    registry.register(
+        LanguageSpec::new(
+            "imports-only",
+            tree_sitter_javascript::LANGUAGE.into(),
+            ["dep"],
+        )
+        .with_imports(ImportSpec::Query {
+            source: "(import_statement source: (string) @import.source.static)".into(),
             kind_map: static_import_kind,
         }),
-    });
+    );
     let loader = MemoryLoader {
         sources: HashMap::from([(
             "module.dep".to_owned(),

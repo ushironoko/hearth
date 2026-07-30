@@ -20,6 +20,7 @@ impl LanguageId {
 /// Import-extraction strategy for a language. Stage B supplies the
 /// extractors; the shape is fixed here so registering one later is not a
 /// public-API break.
+#[non_exhaustive]
 pub enum ImportSpec {
     /// Extract imports with a tree-sitter query whose capture names map to
     /// import kinds.
@@ -35,6 +36,11 @@ pub enum ImportSpec {
 }
 
 /// Parsing and query metadata for one registered language.
+///
+/// Create specifications with [`LanguageSpec::new`] and its builder methods.
+/// The struct is non-exhaustive so hosts can keep registering custom grammars
+/// when Hearth adds optional language metadata.
+#[non_exhaustive]
 pub struct LanguageSpec {
     /// Wire-stable lowercase language name.
     pub name: CompactString,
@@ -51,6 +57,56 @@ pub struct LanguageSpec {
     pub merge_adjacent_same_name_definitions: bool,
     /// Import extraction strategy, when available.
     pub imports: Option<ImportSpec>,
+}
+
+impl LanguageSpec {
+    /// Creates a language specification with no symbol or import queries.
+    ///
+    /// Extensions must not include a leading dot. Optional behavior can be
+    /// enabled with the builder methods without coupling hosts to every field.
+    #[must_use]
+    pub fn new<I, E>(
+        name: impl Into<CompactString>,
+        language: tree_sitter::Language,
+        extensions: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: AsRef<str>,
+    {
+        Self {
+            name: name.into(),
+            language,
+            extensions: extensions
+                .into_iter()
+                .map(|extension| CompactString::new(extension.as_ref()))
+                .collect(),
+            tags_query: None,
+            merge_adjacent_same_name_definitions: false,
+            imports: None,
+        }
+    }
+
+    /// Configures the tree-sitter tags query used for symbol extraction.
+    #[must_use]
+    pub fn with_tags_query(mut self, tags_query: impl Into<Cow<'static, str>>) -> Self {
+        self.tags_query = Some(tags_query.into());
+        self
+    }
+
+    /// Configures whether adjacent same-name definitions form one symbol.
+    #[must_use]
+    pub const fn with_merge_adjacent_same_name_definitions(mut self, enabled: bool) -> Self {
+        self.merge_adjacent_same_name_definitions = enabled;
+        self
+    }
+
+    /// Configures import extraction for the language.
+    #[must_use]
+    pub fn with_imports(mut self, imports: ImportSpec) -> Self {
+        self.imports = Some(imports);
+        self
+    }
 }
 
 /// Ordered language registry with last-registration-wins extension lookup.
