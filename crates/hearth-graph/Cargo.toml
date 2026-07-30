@@ -1,10 +1,15 @@
 [package]
 name = "hearth-graph"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Standalone tree-sitter symbol index and module graph with injectable languages"
+documentation = "https://docs.rs/hearth-graph"
+readme = "README.md"
+keywords = ["code-intelligence", "tree-sitter", "symbols", "dependency-graph"]
+categories = ["development-tools", "parser-implementations"]
 
 [features]
 default = ["bundled-languages", "fs", "resolve-js", "resolve-rust"]
