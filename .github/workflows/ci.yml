@@ -67,6 +67,9 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Lint hearth-graph without default features
+        run: cargo clippy -p hearth-graph --no-default-features --all-targets -- -D warnings
+
       - name: Test
         run: cargo test --workspace --all-targets
 

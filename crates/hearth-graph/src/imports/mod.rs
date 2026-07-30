@@ -5,6 +5,7 @@
 use compact_str::CompactString;
 
 pub(crate) mod js;
+#[cfg(feature = "bundled-languages")]
 pub(crate) mod rust;
 
 /// How an import reference appears in source.
