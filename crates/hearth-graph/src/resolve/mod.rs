@@ -114,7 +114,7 @@ impl ResolverSet {
     pub fn baseline_completeness(&self, language: &str) -> ResolutionCompleteness {
         let resolver = match language {
             "rust" => self.rust.as_deref(),
-            "typescript" | "tsx" | "javascript" | "jsx" => self.js.as_deref(),
+            "typescript" | "tsx" | "javascript" | "jsx" | "vue" => self.js.as_deref(),
             _ => None,
         };
         resolver.map_or(

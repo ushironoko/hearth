@@ -96,6 +96,73 @@ fn registered_jsx_and_tsx_queries_extract_imports() {
 }
 
 #[test]
+fn extracts_vue_typescript_imports_once_with_whole_file_locations() {
+    let source = "\
+<template><Child /></template>
+<script setup lang=\"ts\">
+import { ref } from \"vue\";
+import Child from \"./Child.vue\";
+export { helper } from \"./helper\";
+const lazy = import(\"./lazy\");
+const opaque = import(target);
+</script>
+";
+    let analysis = analyze(source, "src/App.vue");
+
+    assert_eq!(analysis.language.as_deref(), Some("vue"));
+    assert_eq!(
+        analysis
+            .imports
+            .iter()
+            .map(|import| (import.specifier.as_str(), import.kind, import.line))
+            .collect::<Vec<_>>(),
+        [
+            ("vue", ImportKind::EsStatic, 3),
+            ("./Child.vue", ImportKind::EsStatic, 4),
+            ("./helper", ImportKind::EsReexport, 5),
+            ("./lazy", ImportKind::EsDynamic, 6),
+        ]
+    );
+    assert!(analysis.has_opaque_imports);
+    for import in &analysis.imports {
+        let literal = &source[import.span.0 as usize..import.span.1 as usize];
+        assert_eq!(literal, format!("\"{}\"", import.specifier));
+    }
+}
+
+#[test]
+fn extracts_vue_javascript_jsx_and_tsx_script_imports() {
+    for attribute in [
+        "",
+        " lang=\"jsx\"",
+        " lang=jsx",
+        " lang=\"tsx\"",
+        " lang=tsx",
+    ] {
+        let source = format!(
+            "<script{attribute}>\nimport View from \"./View\";\nexport function renderView() {{}}\n</script>\n"
+        );
+
+        assert_eq!(
+            imports(&source, "src/View.vue"),
+            [("./View".to_owned(), ImportKind::EsStatic)],
+            "{attribute}"
+        );
+    }
+}
+
+#[test]
+fn vue_template_interpolations_are_not_module_injections() {
+    let analysis = analyze(
+        "<template>{{ import(\"./template-only\") }}</template>\n",
+        "src/Template.vue",
+    );
+
+    assert!(analysis.imports.is_empty());
+    assert!(!analysis.has_opaque_imports);
+}
+
+#[test]
 fn non_literal_dynamic_and_commonjs_imports_are_opaque() {
     let source = "\
 import(expr);

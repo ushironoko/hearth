@@ -11,6 +11,7 @@ policy.
 - injectable [`LanguageRegistry`](https://docs.rs/hearth-graph/latest/hearth_graph/struct.LanguageRegistry.html)
   with an optional bundled grammar set
 - one-pass symbol and import analysis over tree-sitter parse trees
+- Vue 3 SFC analysis through JavaScript, TypeScript, JSX, and TSX script injections
 - incremental `SymbolIndex` search and definition lookup
 - incremental `ModuleGraph` dependency, reverse-dependency, and neighborhood
   queries with `Exact` or `Approximate` guarantees
@@ -18,6 +19,10 @@ policy.
 - best-effort Rust module resolution
 - cancellation-aware parallel index construction through a host-provided
   `SourceLoader`
+
+Vue support covers inline JavaScript, TypeScript, JSX, and TSX `<script>`
+blocks. External `src` scripts and custom non-JavaScript block languages are
+not currently modeled.
 
 ## Quick start
 
@@ -55,7 +60,7 @@ registry.register(
 
 | Feature | Enabled by default | Purpose |
 | --- | --- | --- |
-| `bundled-languages` | yes | Bundled grammars, symbol queries, and supported import extractors |
+| `bundled-languages` | yes | Bundled grammars, symbol queries, import extractors, and Vue 3 SFC script injections |
 | `fs` | yes | `FsLoader` implementation for direct filesystem indexing |
 | `resolve-js` | yes | JavaScript and TypeScript resolution through `oxc_resolver` |
 | `resolve-rust` | yes | Best-effort Rust module resolution |

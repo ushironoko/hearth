@@ -11,6 +11,7 @@ pub struct ParserPool<'r> {
     parsers: FxHashMap<LanguageId, Option<Parser>>,
     tags_queries: FxHashMap<LanguageId, Option<Query>>,
     imports_queries: FxHashMap<LanguageId, Option<Query>>,
+    injections_queries: FxHashMap<LanguageId, Option<Query>>,
 }
 
 impl<'r> ParserPool<'r> {
@@ -22,6 +23,7 @@ impl<'r> ParserPool<'r> {
             parsers: FxHashMap::default(),
             tags_queries: FxHashMap::default(),
             imports_queries: FxHashMap::default(),
+            injections_queries: FxHashMap::default(),
         }
     }
 
@@ -80,5 +82,20 @@ impl<'r> ParserPool<'r> {
         }
 
         self.imports_queries.get(&id).and_then(Option::as_ref)
+    }
+
+    /// Returns the compiled injection query for `id`.
+    ///
+    /// Missing query sources and compilation failures are cached permanently.
+    pub fn injections_query(&mut self, id: LanguageId) -> Option<&Query> {
+        if let Entry::Vacant(entry) = self.injections_queries.entry(id) {
+            let query = self.registry.get(id).and_then(|spec| {
+                let source = spec.injections_query.as_deref()?;
+                Query::new(&spec.language, source).ok()
+            });
+            entry.insert(query);
+        }
+
+        self.injections_queries.get(&id).and_then(Option::as_ref)
     }
 }

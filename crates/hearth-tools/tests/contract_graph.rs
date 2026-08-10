@@ -73,6 +73,50 @@ fn dep_targets(result: &GraphResult) -> Vec<&str> {
 }
 
 #[test]
+fn vue_sfc_symbols_and_dependencies_flow_through_the_graph_adapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let target = seed(&root, "src/dep.ts", "export const dep = true;\n");
+    let component = seed(
+        &root,
+        "src/App.vue",
+        "<template><div /></template>\n\
+<script setup lang=\"ts\">\n\
+import { dep } from \"./dep\";\n\
+export function vueEntry() { return dep; }\n\
+</script>\n",
+    );
+    let eng = engine(&root);
+
+    let outline = graph(
+        &eng,
+        &params(
+            &root,
+            GraphOp::Outline {
+                path: component.clone(),
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(symbol_names(&outline), ["vueEntry"]);
+    assert_eq!(outline.meta.unsupported_files, 0);
+
+    let deps = graph(
+        &eng,
+        &params(
+            &root,
+            GraphOp::Deps {
+                path: component,
+                depth: 1,
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(dep_targets(&deps), [target]);
+    assert_eq!(deps.meta.guarantee, GraphGuarantee::Exact);
+}
+
+#[test]
 fn verification_01_lazy_build_transitions_status_from_unbuilt_to_built() {
     let dir = tempfile::tempdir().unwrap();
     let file = seed(dir.path(), "src/lib.rs", "pub fn lazy_symbol() {}\n");

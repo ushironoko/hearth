@@ -13,6 +13,7 @@ mod cancel;
 mod fs_loader;
 pub mod graph;
 pub mod imports;
+mod injections;
 mod lang;
 mod parse;
 pub mod resolve;

@@ -98,6 +98,20 @@ intro
 ### Options
 ";
 
+const VUE_TYPESCRIPT_SOURCE: &str = "\
+<template>
+  <Child />
+</template>
+<script setup lang=\"ts\">
+import Child from \"./Child.vue\";
+export interface Props { title: string }
+export class Controller {
+  reset(): void {}
+}
+export function useCounter() {}
+</script>
+";
+
 const SYNTAX_ERROR_SOURCE: &str = "fn ok() {}\nfn broken( {\n";
 const CJK_SOURCE: &str = "// 日本語のコメント\nfn 名前() {}\n";
 const MULTIBYTE_PREFIX_SOURCE: &str = "class 構造体 { メソッド() {} }\n";
@@ -385,6 +399,104 @@ fn extract_markdown_headings() {
 }
 
 #[test]
+fn extract_vue_typescript_script_symbols_with_whole_file_locations() {
+    let registry = LanguageRegistry::bundled();
+    let mut pool = ParserPool::new(&registry);
+    let symbols = extract_symbols(VUE_TYPESCRIPT_SOURCE, "src/Counter.vue", &mut pool);
+
+    assert_eq!(
+        symbols
+            .iter()
+            .map(|symbol| (
+                symbol.name.as_str(),
+                symbol.line,
+                symbol.column,
+                symbol.depth
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("Props", 6, 17, 0),
+            ("Controller", 7, 13, 0),
+            ("reset", 8, 2, 1),
+            ("useCounter", 10, 16, 0),
+        ]
+    );
+    for symbol in &symbols {
+        assert_eq!(
+            &VUE_TYPESCRIPT_SOURCE
+                [symbol.name_start as usize..symbol.name_start as usize + symbol.name.len()],
+            symbol.name.as_str()
+        );
+        assert!(symbol.def_start as usize >= VUE_TYPESCRIPT_SOURCE.find("<script").unwrap());
+        assert!(symbol.def_end as usize <= VUE_TYPESCRIPT_SOURCE.find("</script>").unwrap());
+    }
+}
+
+#[test]
+fn extract_vue_unquoted_typescript_lang_attribute() {
+    let source = "<script setup lang=ts>\nexport interface UnquotedProps {}\n</script>\n";
+
+    assert_eq!(names(source, "src/Unquoted.vue"), ["UnquotedProps"]);
+}
+
+#[test]
+fn extract_vue_multiple_script_languages_in_source_order() {
+    let source = "<script>\nexport function fromJavaScript() {}\n</script>\n\
+<script lang=\"tsx\">\nexport class FromTsx {}\n</script>\n";
+
+    assert_eq!(
+        names(source, "src/Mixed.vue"),
+        ["fromJavaScript", "FromTsx"]
+    );
+}
+
+#[test]
+fn extract_vue_inline_script_preserves_multibyte_character_column() {
+    let source = "<template>日本語</template><script>export function inlineVue() {}</script>";
+    let registry = LanguageRegistry::bundled();
+    let mut pool = ParserPool::new(&registry);
+    let symbol = extract_symbols(source, "src/Inline.vue", &mut pool)
+        .into_iter()
+        .find(|symbol| symbol.name == "inlineVue")
+        .expect("inline Vue function");
+
+    assert_eq!(symbol.line, 1);
+    assert_eq!(
+        symbol.column as usize,
+        source[..source.find("inlineVue").unwrap()].chars().count()
+    );
+    assert_eq!(
+        symbol.name_start as usize,
+        source.find("inlineVue").unwrap()
+    );
+}
+
+#[test]
+fn vue_included_ranges_do_not_leak_into_reused_script_parsers() {
+    let registry = LanguageRegistry::bundled();
+    let mut pool = ParserPool::new(&registry);
+
+    let vue = extract_symbols(
+        "<script>export function insideVue() {}</script>\n",
+        "src/App.vue",
+        &mut pool,
+    );
+    let javascript = extract_symbols(
+        "export function standaloneJavaScript() {}\n",
+        "src/standalone.js",
+        &mut pool,
+    );
+
+    assert_eq!(vue[0].name, "insideVue");
+    assert_eq!(javascript[0].name, "standaloneJavaScript");
+}
+
+#[test]
+fn vue_template_without_script_symbols_yields_an_empty_outline() {
+    assert!(names("<template><div>Hello</div></template>\n", "src/App.vue").is_empty());
+}
+
+#[test]
 fn empty_source_yields_no_symbols() {
     assert!(names("", "src/lib.rs").is_empty());
 }
@@ -449,6 +561,7 @@ fn extracted_byte_ranges_are_coherent() {
         (ZIG_SOURCE, "point.zig"),
         (BASH_SOURCE, "deploy.sh"),
         (MARKDOWN_SOURCE, "README.md"),
+        (VUE_TYPESCRIPT_SOURCE, "src/Counter.vue"),
         ("", "src/lib.rs"),
         ("fn main() {}", "notes.txt"),
         ("body { color: red }", "site.css"),

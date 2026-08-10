@@ -1,5 +1,4 @@
 use std::collections::hash_map::Entry;
-use std::path::Path;
 
 use compact_str::CompactString;
 use rustc_hash::FxHashMap;
@@ -26,34 +25,7 @@ struct RawTag {
 /// Unsupported languages and parse or query failures produce an empty
 /// outline, because an unavailable outline is not a source-processing error.
 pub fn extract_symbols(source: &str, path: &str, pool: &mut ParserPool<'_>) -> Vec<Symbol> {
-    // Symbol stores byte offsets as u32; a source beyond that range cannot be
-    // represented, so it gets the same empty outline as an unsupported input.
-    // Build inputs never get here (the 2 MiB prefilter cap is far smaller).
-    if u32::try_from(source.len()).is_err() {
-        return Vec::new();
-    }
-    let Some(id) = pool.registry().for_path(Path::new(path)) else {
-        return Vec::new();
-    };
-    if pool
-        .registry()
-        .get(id)
-        .is_none_or(|spec| spec.tags_query.is_none())
-    {
-        return Vec::new();
-    }
-
-    let tree = {
-        let Some(parser) = pool.parser(id) else {
-            return Vec::new();
-        };
-        match parser.parse(source, None) {
-            Some(tree) => tree,
-            None => return Vec::new(),
-        }
-    };
-
-    extract_symbols_from_tree(source, &tree, id, pool)
+    crate::analyze::extract_symbols_only(source, path, pool)
 }
 
 pub(crate) fn extract_symbols_from_tree(

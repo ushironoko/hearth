@@ -73,6 +73,10 @@ fn analyze_source_symbols_match_standalone_extraction() {
             "import View from \"./view\";\nexport const App = () => <View />;\n",
             "src/app.jsx",
         ),
+        (
+            "<script setup lang=\"ts\">\nimport View from \"./view\";\nexport function VueValue() {}\n</script>\n",
+            "src/value.vue",
+        ),
         ("use crate::dep;\npub struct RustValue;\n", "src/value.rs"),
     ];
     let registry = LanguageRegistry::bundled();

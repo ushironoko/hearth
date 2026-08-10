@@ -54,6 +54,7 @@ impl Default for JsResolveOptions {
                 ".jsx".into(),
                 ".mjs".into(),
                 ".cjs".into(),
+                ".vue".into(),
             ],
         }
     }

@@ -32,6 +32,33 @@ fn resolves_relative_import_with_extension_probing() {
 }
 
 #[test]
+fn resolves_vue_importers_and_extensionless_vue_targets() {
+    let fixture = Fixture::new();
+    let importer = fixture.write("src/App.vue", "");
+    let expected_component = fixture.write("src/Component.vue", "<template />\n");
+    let expected_helper = fixture.write("src/helper.ts", "export const helper = true;\n");
+    let resolver = js_resolver(JsResolveOptions::default());
+
+    let component = resolver.resolve(
+        path_str(&importer),
+        &raw_import("./Component", ImportKind::EsStatic),
+    );
+    let helper = resolver.resolve(
+        path_str(&importer),
+        &raw_import("./helper", ImportKind::EsStatic),
+    );
+
+    assert_eq!(
+        component.resolved,
+        Resolved::Path(compact_path(&expected_component))
+    );
+    assert_eq!(
+        helper.resolved,
+        Resolved::Path(compact_path(&expected_helper))
+    );
+}
+
+#[test]
 fn resolves_tsconfig_path_alias_and_tracks_the_config() {
     let fixture = Fixture::new();
     let tsconfig = fixture.write(
@@ -872,6 +899,36 @@ fn failed_js_resolution_downgrades_graph_deps_guarantee() {
     assert_eq!(
         graph.deps(path_str(&importer)).unwrap().guarantee,
         Guarantee::Approximate
+    );
+}
+
+#[test]
+fn vue_graph_nodes_keep_the_javascript_resolver_live() {
+    let fixture = Fixture::new();
+    let importer = fixture.write("src/App.vue", "");
+    let expected = fixture.write("src/helper.ts", "export const helper = true;\n");
+    let resolvers = ResolverSet {
+        js: Some(js_resolver(JsResolveOptions::default())),
+        rust: None,
+    };
+    let mut graph = ModuleGraph::new();
+    let analysis = FileAnalysis {
+        path: compact_path(&importer),
+        content_hash: 1,
+        language: Some("vue".into()),
+        symbols: Vec::new(),
+        imports: vec![raw_import("./helper", ImportKind::EsStatic)],
+        has_opaque_imports: false,
+    };
+
+    graph.upsert_file(&analysis, &resolvers, true);
+
+    let node = graph.node(path_str(&importer)).expect("Vue graph node");
+    assert!(node.resolver_live());
+    assert!(node.resolution_complete());
+    assert_eq!(
+        graph.deps(path_str(&importer)).unwrap().edges[0].to,
+        hearth_graph::graph::EdgeTargetOwned::Path(compact_path(&expected))
     );
 }
 

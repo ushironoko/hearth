@@ -221,18 +221,25 @@ fn test_build_indexes_supported_files_only() {
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
     std::fs::write(dir.path().join("src/b.ts"), "export function beta() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("src/c.vue"),
+        "<script setup lang=\"ts\">\nexport function gamma() {}\n</script>\n",
+    )
+    .unwrap();
     std::fs::write(dir.path().join("notes.txt"), "not code\n").unwrap();
     let paths = vec![
         "src/a.rs".to_owned(),
         "src/b.ts".to_owned(),
+        "src/c.vue".to_owned(),
         "notes.txt".to_owned(),
         "src/missing.rs".to_owned(),
     ];
 
     let index = completed_index(build_with_fs(dir.path(), &paths, &NeverCancelled));
-    assert_eq!(index.paths().count(), 2);
+    assert_eq!(index.paths().count(), 3);
     assert_eq!(index.definitions("alpha").len(), 1);
     assert_eq!(index.definitions("beta")[0].path, "src/b.ts");
+    assert_eq!(index.definitions("gamma")[0].path, "src/c.vue");
 }
 
 struct PanickingLoader {
