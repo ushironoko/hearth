@@ -31,6 +31,7 @@ bundled-languages = [
   "dep:tree-sitter-php",
   "dep:tree-sitter-swift",
   "dep:tree-sitter-md",
+  "dep:octorus-tree-sitter-vue3",
 ]
 fs = []
 resolve-js = [
@@ -65,6 +66,7 @@ tree-sitter-lua = { workspace = true, optional = true }
 tree-sitter-php = { workspace = true, optional = true }
 tree-sitter-swift = { workspace = true, optional = true }
 tree-sitter-md = { workspace = true, optional = true }
+octorus-tree-sitter-vue3 = { workspace = true, optional = true }
 oxc_resolver = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 json-strip-comments = { workspace = true, optional = true }

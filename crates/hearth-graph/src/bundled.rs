@@ -6,6 +6,7 @@ use crate::{ImportKind, ImportSpec, LanguageRegistry, LanguageSpec};
 
 const JAVASCRIPT_IMPORTS_QUERY: &str = include_str!("../queries/javascript/imports.scm");
 const TYPESCRIPT_IMPORTS_QUERY: &str = include_str!("../queries/typescript/imports.scm");
+const VUE_SCRIPT_INJECTIONS_QUERY: &str = include_str!("../queries/vue/injections.scm");
 
 fn language_spec(
     name: &'static str,
@@ -194,6 +195,10 @@ impl LanguageRegistry {
             &["swift"],
             Cow::Borrowed(tree_sitter_swift::TAGS_QUERY),
         ));
+        registry.register(
+            LanguageSpec::new("vue", tree_sitter_vue3::LANGUAGE.into(), ["vue"])
+                .with_injections_query(VUE_SCRIPT_INJECTIONS_QUERY),
+        );
         registry.register(language_spec(
             "markdown",
             tree_sitter_md::LANGUAGE.into(),
@@ -215,14 +220,17 @@ mod tests {
     #[test]
     fn all_bundled_tags_queries_compile_and_are_pool_reachable() {
         let registry = LanguageRegistry::bundled();
-        assert_eq!(registry.iter().len(), 19);
+        assert_eq!(registry.iter().len(), 20);
 
         let mut pool = ParserPool::new(&registry);
+        let mut query_count = 0;
         for (id, spec) in registry.iter() {
-            let source = spec
-                .tags_query
-                .as_deref()
-                .unwrap_or_else(|| panic!("{} is missing its tags query", spec.name));
+            let Some(source) = spec.tags_query.as_deref() else {
+                assert_eq!(spec.name, "vue");
+                assert!(pool.tags_query(id).is_none());
+                continue;
+            };
+            query_count += 1;
             tree_sitter::Query::new(&spec.language, source)
                 .unwrap_or_else(|error| panic!("{} tags query failed: {error}", spec.name));
             assert!(
@@ -231,6 +239,31 @@ mod tests {
                 spec.name
             );
         }
+        assert_eq!(query_count, 19);
+    }
+
+    #[test]
+    fn bundled_injection_queries_compile_and_are_pool_reachable() {
+        let registry = LanguageRegistry::bundled();
+        let mut pool = ParserPool::new(&registry);
+        let mut query_count = 0;
+
+        for (id, spec) in registry.iter() {
+            let Some(source) = spec.injections_query.as_deref() else {
+                assert!(pool.injections_query(id).is_none(), "{}", spec.name);
+                continue;
+            };
+            query_count += 1;
+            tree_sitter::Query::new(&spec.language, source)
+                .unwrap_or_else(|error| panic!("{} injections query failed: {error}", spec.name));
+            assert!(
+                pool.injections_query(id).is_some(),
+                "{} is not reachable through ParserPool::injections_query",
+                spec.name
+            );
+        }
+
+        assert_eq!(query_count, 1);
     }
 
     #[test]
@@ -295,12 +328,13 @@ mod tests {
             "module.cts",
             "module.ts",
             "component.tsx",
+            "component.vue",
             "lib.rs",
         ] {
             assert!(registry.supports_symbols(Path::new(path)), "{path}");
         }
 
-        for path in ["style.css", "component.vue", "Makefile"] {
+        for path in ["style.css", "Makefile"] {
             assert!(!registry.supports_symbols(Path::new(path)), "{path}");
         }
     }
@@ -317,6 +351,7 @@ mod tests {
             "module.ts",
             "component.tsx",
             "component.jsx",
+            "component.vue",
             "lib.rs",
         ] {
             assert!(registry.supports_imports(Path::new(path)), "{path}");

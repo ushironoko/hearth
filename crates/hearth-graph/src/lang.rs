@@ -50,6 +50,11 @@ pub struct LanguageSpec {
     pub extensions: SmallVec<[CompactString; 4]>,
     /// Tree-sitter tags query used for symbol extraction.
     pub tags_query: Option<Cow<'static, str>>,
+    /// Tree-sitter injection query used to find embedded source languages.
+    ///
+    /// Injected language names resolve against other entries in the same
+    /// registry. Their symbols and imports retain containing-file locations.
+    pub injections_query: Option<Cow<'static, str>>,
     /// Merge adjacent same-name definitions emitted for one logical symbol.
     ///
     /// This is intended for grammars such as Haskell, where each equation of
@@ -82,6 +87,7 @@ impl LanguageSpec {
                 .map(|extension| CompactString::new(extension.as_ref()))
                 .collect(),
             tags_query: None,
+            injections_query: None,
             merge_adjacent_same_name_definitions: false,
             imports: None,
         }
@@ -91,6 +97,13 @@ impl LanguageSpec {
     #[must_use]
     pub fn with_tags_query(mut self, tags_query: impl Into<Cow<'static, str>>) -> Self {
         self.tags_query = Some(tags_query.into());
+        self
+    }
+
+    /// Configures the tree-sitter query used to locate embedded languages.
+    #[must_use]
+    pub fn with_injections_query(mut self, injections_query: impl Into<Cow<'static, str>>) -> Self {
+        self.injections_query = Some(injections_query.into());
         self
     }
 
@@ -109,7 +122,7 @@ impl LanguageSpec {
     }
 }
 
-/// Ordered language registry with last-registration-wins extension lookup.
+/// Ordered language registry with last-registration-wins extension and name lookup.
 pub struct LanguageRegistry {
     specs: Vec<LanguageSpec>,
     by_extension: FxHashMap<CompactString, LanguageId>,
@@ -129,8 +142,8 @@ impl LanguageRegistry {
 
     /// Registers a language and returns its stable identifier.
     ///
-    /// When an extension was already registered, this specification becomes
-    /// the extension's new owner.
+    /// When an extension or language name was already registered, this
+    /// specification becomes the new lookup owner.
     pub fn register(&mut self, spec: LanguageSpec) -> LanguageId {
         let id = LanguageId(
             u16::try_from(self.specs.len()).expect("language registry exhausted its u16 id space"),
@@ -164,20 +177,30 @@ impl LanguageRegistry {
         self.specs.get(id.index())
     }
 
-    /// Returns whether the path has a registered symbol query.
+    /// Resolves a registered language by its wire-stable name.
+    #[must_use]
+    pub fn for_name(&self, name: &str) -> Option<LanguageId> {
+        self.specs
+            .iter()
+            .rposition(|spec| spec.name == name)
+            .and_then(|index| u16::try_from(index).ok())
+            .map(LanguageId)
+    }
+
+    /// Returns whether the path has direct or injected symbol support.
     #[must_use]
     pub fn supports_symbols(&self, path: &Path) -> bool {
         self.for_path(path)
             .and_then(|id| self.get(id))
-            .is_some_and(|spec| spec.tags_query.is_some())
+            .is_some_and(|spec| spec.tags_query.is_some() || spec.injections_query.is_some())
     }
 
-    /// Returns whether the path has a registered import extractor.
+    /// Returns whether the path has a direct or injected import extractor.
     #[must_use]
     pub fn supports_imports(&self, path: &Path) -> bool {
         self.for_path(path)
             .and_then(|id| self.get(id))
-            .is_some_and(|spec| spec.imports.is_some())
+            .is_some_and(|spec| spec.imports.is_some() || spec.injections_query.is_some())
     }
 
     /// Iterates over registered identifiers and specifications in registration order.

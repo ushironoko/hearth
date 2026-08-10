@@ -833,7 +833,7 @@ fn resolver_is_live(
 ) -> bool {
     match language {
         Some("rust") => resolvers.rust.is_some(),
-        Some("typescript" | "tsx" | "javascript" | "jsx") => resolvers.js.is_some(),
+        Some("typescript" | "tsx" | "javascript" | "jsx" | "vue") => resolvers.js.is_some(),
         Some(_) if !imports.is_empty() => imports.iter().all(|raw| match raw.kind {
             ImportKind::RustUse | ImportKind::RustMod => resolvers.rust.is_some(),
             _ => resolvers.js.is_some(),
