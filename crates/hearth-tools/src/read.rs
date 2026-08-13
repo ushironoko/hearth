@@ -144,7 +144,17 @@ pub fn read_cancellable(
 
         let returned_lines = end_line - start_line + 1;
         let content = if params.line_numbers {
-            let mut out = String::with_capacity(window.len() + (returned_lines as usize) * 8);
+            let numbered_capacity = usize::try_from(returned_lines)
+                .ok()
+                .and_then(|lines| lines.checked_mul(8))
+                .and_then(|prefixes| window.len().checked_add(prefixes))
+                .ok_or_else(|| ToolError::invalid("numbered read output size overflow"))?;
+            if numbered_capacity > engine.config().max_tool_file_bytes as usize {
+                return Err(ToolError::invalid(
+                    "numbered read output exceeds byte limit",
+                ));
+            }
+            let mut out = String::with_capacity(numbered_capacity);
             for (i, line) in window.split_inclusive('\n').enumerate() {
                 let n = start_line + i as u64;
                 let has_nl = line.ends_with('\n');

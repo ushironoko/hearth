@@ -188,12 +188,27 @@ fn spawn_shell(program: &str) -> std::io::Result<WarmShell> {
 /// and whose write end is not (so it survives into the child for `dup2`).
 fn control_pipe() -> std::io::Result<(RawFd, RawFd)> {
     let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `fds` is a valid two-element array, as pipe(2) requires.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    // SAFETY: `fds` is a valid two-element array. `pipe2` atomically marks both
+    // ends close-on-exec so concurrent process spawns cannot inherit a writer.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if result != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: fds[0] is the pipe read end this function owns.
-    unsafe { libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    for fd in fds {
+        // SAFETY: both descriptors were created above. macOS lacks pipe2, so
+        // this is the narrow best-effort portable fallback.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+    }
     Ok((fds[0], fds[1]))
 }
 

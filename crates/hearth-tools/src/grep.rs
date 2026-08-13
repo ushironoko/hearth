@@ -160,6 +160,14 @@ pub fn grep_cancellable(
 
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let limit_reached = apply_total_limit(&mut files, total_limit, params.after_context as u64);
+        let result_bytes = files.iter().fold(0usize, |total, file| {
+            total
+                .saturating_add(file.path.len())
+                .saturating_add(file.lines.iter().map(|line| line.text.len()).sum::<usize>())
+        });
+        if result_bytes > engine.config().max_grep_output_bytes {
+            return Err(ToolError::invalid("grep result exceeds global byte limit"));
+        }
         let total_matches: u64 = files.iter().map(|f| f.match_count).sum();
         let files_searched = searched.load(Ordering::Relaxed);
 

@@ -66,7 +66,10 @@ pub fn default_runtime_dir() -> PathBuf {
     if let Some(dir) = validated_runtime_env("TMPDIR") {
         return dir.join("hearth");
     }
-    std::env::temp_dir().join(format!("hearth-{}", effective_uid()))
+    // No predictable shared-/tmp fallback: callers must supply an explicit
+    // endpoint rooted in a private directory when the OS exposes no trusted
+    // per-user runtime root.
+    PathBuf::new()
 }
 
 fn validated_runtime_env(name: &str) -> Option<PathBuf> {
@@ -91,6 +94,12 @@ pub fn default_socket_path() -> PathBuf {
 
 pub fn prepare_default_endpoint() -> io::Result<ValidatedEndpoint> {
     let runtime_dir = default_runtime_dir();
+    if runtime_dir.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no trusted per-user runtime directory; pass --socket under a private mode-0700 directory",
+        ));
+    }
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
     match builder.create(&runtime_dir) {

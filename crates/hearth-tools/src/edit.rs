@@ -167,6 +167,21 @@ pub fn edit_batch_cancellable(
         )
         .map_err(|e| annotate(e, &params.path))?;
 
+        // Diff rows and optional content/original copies are response memory on
+        // top of the rewritten file. Reserve their coarse worst case before
+        // materializing a diff.
+        let optional_bytes = usize::from(params.return_original_content)
+            .saturating_mul(raw.len())
+            .saturating_add(
+                usize::from(params.return_content).saturating_mul(applied.new_content.len()),
+            );
+        let diff_budget = content
+            .len()
+            .saturating_add(applied.new_content.len())
+            .saturating_add(optional_bytes);
+        if diff_budget > engine.config().max_edit_result_bytes {
+            return Err(ToolError::invalid("edit response exceeds byte limit"));
+        }
         let (hunks, first_changed_line) = if params.skip_diff {
             (Vec::new(), None)
         } else {
@@ -182,10 +197,22 @@ pub fn edit_batch_cancellable(
             .len()
             .checked_add(3)
             .ok_or_else(|| ToolError::invalid("edit result size overflow"))?;
-        if final_capacity > engine.config().max_edit_result_bytes {
+        let newline_expansion = if crlf {
+            applied
+                .new_content
+                .bytes()
+                .filter(|&byte| byte == b'\n')
+                .count()
+        } else {
+            0
+        };
+        let restored_capacity = final_capacity
+            .checked_add(newline_expansion)
+            .ok_or_else(|| ToolError::invalid("edit result size overflow"))?;
+        if restored_capacity > engine.config().max_edit_result_bytes {
             return Err(ToolError::invalid("edit result exceeds byte limit"));
         }
-        let mut final_text = String::with_capacity(final_capacity);
+        let mut final_text = String::with_capacity(restored_capacity);
         if had_bom {
             final_text.push('\u{FEFF}');
         }
