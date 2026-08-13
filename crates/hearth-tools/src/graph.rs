@@ -1509,7 +1509,7 @@ fn traverse_rdeps(
     if depth == 0 {
         // Reverse-dependency exactness is a root-wide property; an empty
         // answer still must not claim more than the store can prove.
-        let guarantee = graph.rdeps(path)?.guarantee;
+        let guarantee = graph.rdeps_guarantee_for(path)?;
         return Some(TraversedEdges {
             edges: Vec::new(),
             guarantee,
@@ -1530,7 +1530,8 @@ fn traverse_rdeps(
             escaped_view = true;
             continue;
         }
-        let rdeps = graph.rdeps(current.as_str())?;
+        let remaining = MAX_GRAPH_RESULTS as usize - edges.len();
+        let rdeps = graph.rdeps_bounded(current.as_str(), remaining)?;
         guarantee = weakest_guarantee(guarantee, rdeps.guarantee);
         for edge in rdeps.edges {
             if edges.len() >= MAX_GRAPH_RESULTS as usize {
@@ -1596,7 +1597,8 @@ fn traverse_neighborhood(
             }
         }
 
-        let rdeps = graph.rdeps(current.as_str())?;
+        let remaining = MAX_GRAPH_RESULTS as usize - reached.len();
+        let rdeps = graph.rdeps_bounded(current.as_str(), remaining)?;
         for edge in rdeps.edges {
             if graph_path_escapes_view(root, edge.from.as_str(), caller_view) {
                 escaped_view = true;
@@ -1640,7 +1642,7 @@ fn traverse_neighborhood(
         );
     }
     if depth != 0 {
-        guarantee = weakest_guarantee(guarantee, graph.rdeps(path)?.guarantee);
+        guarantee = weakest_guarantee(guarantee, graph.rdeps_guarantee_for(path)?);
     }
     if escaped_view {
         guarantee = Guarantee::Approximate;
