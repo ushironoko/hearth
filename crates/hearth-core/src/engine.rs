@@ -43,6 +43,10 @@ pub struct EngineConfig {
     pub max_cached_walks: usize,
     /// Start an fs-watcher on searched roots to proactively invalidate caches.
     pub enable_watch: bool,
+    /// Hard cap on distinct roots admitted to the resident watcher. When the
+    /// cap is reached, new roots remain correct via stat validation but are not
+    /// proactively watched.
+    pub max_watch_roots: usize,
     /// Skip the per-hit freshness `stat` on warm reads/greps. This is a
     /// single-writer / bounded-staleness fast path: it assumes files are only
     /// modified *through* Hearth (whose `write`/`edit` refresh the cache) — an
@@ -75,6 +79,7 @@ impl Default for EngineConfig {
             walk_threads: threads,
             max_cached_walks: 64,
             enable_watch: false,
+            max_watch_roots: 64,
             trust_cache: false,
             enable_optimizer: true,
             max_cached_files: 65_536,
@@ -110,6 +115,7 @@ struct EngineInner {
     invalidations: Arc<InvalidationLog>,
     tuning: Arc<Tuning>,
     watch: Mutex<Option<WatchHandle>>,
+    watched_roots: Mutex<std::collections::HashSet<PathBuf>>,
     /// Type-erased per-engine extensions, so tools can stash long-lived state
     /// (e.g. a compiled-matcher cache) without `hearth-core` depending on their
     /// types.
@@ -182,6 +188,7 @@ impl Engine {
                 invalidations,
                 tuning,
                 watch: Mutex::new(None),
+                watched_roots: Mutex::new(std::collections::HashSet::new()),
                 extensions: DashMap::new(),
                 opt_stop,
                 opt_thread: Mutex::new(opt_thread),
@@ -243,11 +250,22 @@ impl Engine {
         if !self.inner.config.enable_watch {
             return;
         }
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        {
+            let mut roots = self.inner.watched_roots.lock();
+            if roots.contains(&root) {
+                return;
+            }
+            if roots.len() >= self.inner.config.max_watch_roots {
+                return;
+            }
+            roots.insert(root.clone());
+        }
         let mut guard = self.inner.watch.lock();
         let started = match guard.as_mut() {
-            Some(handle) => handle.add_root(root).is_ok(),
+            Some(handle) => handle.add_root(&root).is_ok(),
             None => match WatchHandle::start(
-                root,
+                &root,
                 Arc::clone(&self.inner.files),
                 Arc::clone(&self.inner.walks),
                 Arc::clone(&self.inner.invalidations),
@@ -260,7 +278,9 @@ impl Engine {
             },
         };
         drop(guard);
-        let _ = started;
+        if !started {
+            self.inner.watched_roots.lock().remove(&root);
+        }
     }
 
     /// Whether a warm hit may skip the freshness `stat` — true only in
@@ -268,6 +288,11 @@ impl Engine {
     /// default stats every hit.
     pub fn stat_free(&self, _path: &Path) -> bool {
         self.inner.config.trust_cache
+    }
+
+    #[cfg(test)]
+    fn watched_root_count(&self) -> usize {
+        self.inner.watched_roots.lock().len()
     }
 
     // -- mutation serialization ------------------------------------------
@@ -362,6 +387,7 @@ impl Engine {
         let result = self.clear_filesystem_caches();
         self.inner.extensions.clear();
         self.inner.watch.lock().take();
+        self.inner.watched_roots.lock().clear();
         result
     }
 
@@ -499,5 +525,45 @@ fn optimizer_loop(
             crate::profiler::count("optimizer.evictions", (evicted + pruned) as u64);
             crate::profiler::count("optimizer.bytes_freed", freed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watcher_root_budget_is_synchronous() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let engine = Engine::new(EngineConfig {
+            enable_watch: true,
+            max_watch_roots: 1,
+            ..EngineConfig::default()
+        });
+
+        engine.watch_root(&first);
+        assert_eq!(engine.watched_root_count(), 1);
+        engine.watch_root(&second);
+        assert_eq!(engine.watched_root_count(), 1);
+        engine.watch_root(&first);
+        assert_eq!(engine.watched_root_count(), 1);
+    }
+
+    #[test]
+    fn zero_watcher_root_budget_never_starts_a_watcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(EngineConfig {
+            enable_watch: true,
+            max_watch_roots: 0,
+            ..EngineConfig::default()
+        });
+
+        engine.watch_root(temp.path());
+        assert_eq!(engine.watched_root_count(), 0);
+        assert!(engine.inner.watch.lock().is_none());
     }
 }
