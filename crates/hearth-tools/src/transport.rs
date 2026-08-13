@@ -822,6 +822,9 @@ impl<'a> RequestReceiver<'a> {
                 .checked_add(self.start as u64)
                 .ok_or_else(|| io::Error::other("stream offset overflow"))?;
             self.bytes.clear();
+            if self.bytes.capacity() > READ_CHUNK * 4 {
+                self.bytes.shrink_to(READ_CHUNK * 2);
+            }
             self.start = 0;
         } else if self.start >= READ_CHUNK && self.start >= self.bytes.len() / 2 {
             self.base_offset = self
@@ -836,7 +839,7 @@ impl<'a> RequestReceiver<'a> {
 
     fn poison(&mut self) {
         self.poisoned = true;
-        self.bytes.clear();
+        self.bytes = Vec::new();
         self.start = 0;
         self.ancillary.clear();
     }
@@ -1147,6 +1150,20 @@ mod tests {
 
         let err = encode_frame_with_limit(&Request::Ping, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn receiver_releases_oversized_capacity_after_frame() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let request = Request::Stats;
+        let frame = encode_frame(&request).unwrap();
+        sender.write_all(&frame).unwrap();
+
+        let mut requests = RequestReceiver::new(&receiver);
+        requests.bytes.reserve(READ_CHUNK * 16);
+        assert!(requests.bytes.capacity() > READ_CHUNK * 4);
+        assert!(matches!(requests.recv_request().unwrap().0, Request::Stats));
+        assert!(requests.bytes.capacity() <= READ_CHUNK * 2);
     }
 
     #[test]

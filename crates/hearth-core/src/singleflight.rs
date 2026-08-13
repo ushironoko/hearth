@@ -75,40 +75,47 @@ where
     pub fn run(&self, key: K, loader: impl FnOnce() -> V) -> V {
         let mut loader = Some(loader);
 
+        let (call, is_leader) = {
+            let mut map = self.in_flight.lock();
+            if let Some(existing) = map.get(&key) {
+                (Arc::clone(existing), false)
+            } else {
+                let call = Arc::new(Call::new());
+                map.insert(key.clone(), Arc::clone(&call));
+                (call, true)
+            }
+        };
+
+        if is_leader {
+            // Install the guard before invoking user code so unwinding always
+            // aborts this exact call.
+            let guard = LeaderGuard::new(self, &key, &call);
+            let loader = loader
+                .take()
+                .expect("a follower loader cannot be consumed before retry");
+            let value = loader();
+            return guard.complete(value);
+        }
+
+        let mut state = call.state.lock();
         loop {
-            let (call, is_leader) = {
-                let mut map = self.in_flight.lock();
-                if let Some(existing) = map.get(&key) {
-                    (Arc::clone(existing), false)
-                } else {
-                    let call = Arc::new(Call::new());
-                    map.insert(key.clone(), Arc::clone(&call));
-                    (call, true)
-                }
-            };
-
-            if is_leader {
-                // Install the guard before invoking user code so unwinding
-                // always aborts and deregisters this exact call.
-                let guard = LeaderGuard::new(self, &key, &call);
-                let loader = loader
-                    .take()
-                    .expect("a follower loader cannot be consumed before retry");
-                let value = loader();
-                return guard.complete(value);
-            }
-
-            let mut state = call.state.lock();
-            loop {
-                match &*state {
-                    CallState::Running => call.ready.wait(&mut state),
-                    CallState::Ready(value) => return value.clone(),
-                    CallState::Aborted => break,
+            match &*state {
+                CallState::Running => call.ready.wait(&mut state),
+                CallState::Ready(value) => return value.clone(),
+                CallState::Aborted => {
+                    // Keep every follower attached to this same Call. One
+                    // waiter atomically claims replacement leadership; the
+                    // rest observe Running and wait, even if retry is instant.
+                    *state = CallState::Running;
+                    drop(state);
+                    let guard = LeaderGuard::new(self, &key, &call);
+                    let loader = loader
+                        .take()
+                        .expect("a follower loader is consumed only as retry leader");
+                    let value = loader();
+                    return guard.complete(value);
                 }
             }
-            drop(state);
-            // The failed leader never consumed this caller's loader. Retry
-            // top-level coordination so one awakened follower replaces it.
         }
     }
 }
@@ -165,7 +172,10 @@ where
         debug_assert!(matches!(*state, CallState::Running));
         *state = CallState::Aborted;
         self.call.ready.notify_all();
-        self.flight.remove_call(self.key, self.call);
+        // Keep the aborted identity registered. Existing followers (or the
+        // next caller when there were none) retry on this same Call, preventing
+        // fast replacement completion from splitting one cohort into many
+        // independent loads.
     }
 }
 
@@ -271,7 +281,10 @@ mod tests {
         retry_started_rx.recv_timeout(WATCHDOG).unwrap();
 
         let retry_call = flight.in_flight.lock().get(&KEY).cloned().unwrap();
-        assert!(!Arc::ptr_eq(&aborted_call, &retry_call));
+        assert!(
+            Arc::ptr_eq(&aborted_call, &retry_call),
+            "retry keeps the original follower cohort on one call identity"
+        );
         // Map + replacement leader + this test + the other followers.
         wait_for_references(&retry_call, FOLLOWERS + 2);
         retry_gate.open();
@@ -298,6 +311,59 @@ mod tests {
         });
         assert_eq!(*fresh, 99);
         assert_eq!(fresh_operations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fast_retry_after_panic_still_runs_exactly_once() {
+        const FOLLOWERS: usize = 16;
+        const KEY: usize = 19;
+
+        let flight = Arc::new(SingleFlight::<usize, Arc<usize>>::new());
+        let retries = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (panic_tx, panic_rx) = mpsc::sync_channel(0);
+
+        let leader_flight = Arc::clone(&flight);
+        let leader = thread::spawn(move || {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                leader_flight.run(KEY, || {
+                    started_tx.send(()).unwrap();
+                    panic_rx.recv().unwrap();
+                    panic!("leader failed");
+                })
+            }));
+        });
+        started_rx.recv_timeout(WATCHDOG).unwrap();
+        let failed_call = flight.in_flight.lock().get(&KEY).cloned().unwrap();
+        let original_references = Arc::strong_count(&failed_call);
+
+        let followers: Vec<_> = (0..FOLLOWERS)
+            .map(|_| {
+                let flight = Arc::clone(&flight);
+                let retries = Arc::clone(&retries);
+                thread::spawn(move || {
+                    flight.run(KEY, || {
+                        retries.fetch_add(1, Ordering::SeqCst);
+                        Arc::new(42)
+                    })
+                })
+            })
+            .collect();
+        wait_for_references(&failed_call, original_references + FOLLOWERS);
+        panic_tx.send(()).unwrap();
+        leader.join().unwrap();
+
+        let results: Vec<_> = followers
+            .into_iter()
+            .map(|follower| follower.join().unwrap())
+            .collect();
+        assert_eq!(retries.load(Ordering::SeqCst), 1);
+        assert!(
+            results[1..]
+                .iter()
+                .all(|result| Arc::ptr_eq(&results[0], result))
+        );
+        assert!(flight.in_flight.lock().is_empty());
     }
 
     struct CloneProbe {

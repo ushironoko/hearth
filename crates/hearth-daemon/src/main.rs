@@ -328,7 +328,20 @@ fn run(args: Args) -> io::Result<LifecycleState> {
                     continue;
                 }
                 let Some(permit) = connections.try_acquire() else {
-                    eprintln!("hearthd: connection ceiling reached; rejecting client");
+                    // Keep shutdown reachable even if clients occupy every
+                    // ordinary permit. This overload lane accepts exactly one
+                    // frame and dispatches only the authenticated control
+                    // request; all data-plane operations are rejected.
+                    let control_lifecycle = Arc::clone(&lifecycle);
+                    let control_frames = Arc::clone(&frames);
+                    match std::thread::Builder::new()
+                        .name("hearthd-overload-control".into())
+                        .spawn(move || {
+                            handle_overload_control(stream, control_lifecycle, control_frames);
+                        }) {
+                        Ok(worker) => workers.push(worker),
+                        Err(error) => eprintln!("hearthd: failed to spawn control thread: {error}"),
+                    }
                     continue;
                 };
                 if let Err(error) = stream.set_read_timeout(Some(IDLE_CONNECTION_POLL_INTERVAL)) {
@@ -415,6 +428,34 @@ fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
         } else {
             index += 1;
         }
+    }
+}
+
+fn handle_overload_control(
+    stream: UnixStream,
+    lifecycle: Arc<Lifecycle>,
+    frames: Arc<FrameBudget>,
+) {
+    let Some(_frame_permit) = frames.try_acquire() else {
+        return;
+    };
+    let mut requests = hearth_tools::transport::RequestReceiver::new(&stream);
+    let Ok((request, fd)) = requests.recv_request() else {
+        return;
+    };
+    drop(fd);
+    let mut writer = &stream;
+    if matches!(request, Request::Shutdown) {
+        lifecycle.begin_draining();
+        let _ = write_msg(&mut writer, &Response::ShuttingDown);
+    } else {
+        let _ = write_msg(
+            &mut writer,
+            &Response::Error(ToolError::new(
+                hearth_proto::ErrorKind::Io,
+                "daemon connection limit reached",
+            )),
+        );
     }
 }
 
@@ -532,6 +573,23 @@ mod tests {
         assert_eq!(pool.active(), 2);
         drop((second, replacement));
         assert_eq!(pool.active(), 0);
+    }
+
+    #[test]
+    fn overload_control_lane_keeps_shutdown_reachable() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let frames = FrameBudget::new(DEFAULT_MAX_IN_FLIGHT_FRAME_BYTES).unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let worker_lifecycle = Arc::clone(&lifecycle);
+        let worker =
+            std::thread::spawn(move || handle_overload_control(server, worker_lifecycle, frames));
+
+        hearth_tools::transport::send_request_with_fd(&client, &Request::Shutdown, None).unwrap();
+        let response = hearth_tools::transport::read_msg::<_, Response>(&mut client).unwrap();
+        worker.join().unwrap();
+
+        assert!(matches!(response, Response::ShuttingDown));
+        assert_eq!(lifecycle.state(), LifecycleState::Draining);
     }
 
     #[test]

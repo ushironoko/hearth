@@ -44,21 +44,37 @@ impl LifetimeLock {
         let c_path = CString::new(bytes).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "lock path contains a NUL byte")
         })?;
-        // `O_NOFOLLOW` rejects a symlink leaf. The already-validated private
-        // parent excludes interference from other UIDs; fstat below rejects a
-        // non-regular, foreign, linked, or permissively exposed lock inode.
-        let raw_fd = unsafe {
-            libc::open(
+        // Create atomically so a restrictive process umask can be normalized
+        // only for an inode we created. Existing lock files are opened without
+        // O_CREAT and must already satisfy the strict metadata policy below.
+        let (raw_fd, created) = unsafe {
+            let fd = libc::open(
                 c_path.as_ptr(),
-                libc::O_CLOEXEC | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_RDWR,
+                libc::O_CLOEXEC | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_RDWR,
                 0o600,
-            )
+            );
+            if fd >= 0 {
+                (fd, true)
+            } else if io::Error::last_os_error().kind() == io::ErrorKind::AlreadyExists {
+                (
+                    libc::open(
+                        c_path.as_ptr(),
+                        libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_RDWR,
+                    ),
+                    false,
+                )
+            } else {
+                (fd, false)
+            }
         };
         if raw_fd == -1 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `open` returned a fresh descriptor now owned by this scope.
         let file = unsafe { File::from_raw_fd(raw_fd) };
+        if created && unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
         let metadata = file.metadata()?;
         if !metadata.file_type().is_file()
             || metadata.uid() != effective_uid()
