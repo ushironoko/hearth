@@ -55,7 +55,34 @@ pub fn effective_uid() -> u32 {
 }
 
 pub fn default_runtime_dir() -> PathBuf {
-    PathBuf::from("/tmp").join(format!("hearth-{}", effective_uid()))
+    if cfg!(target_os = "linux")
+        && let Some(dir) = validated_runtime_env("XDG_RUNTIME_DIR")
+    {
+        return dir.join("hearth");
+    }
+    // macOS exposes an euid-private, randomized temporary directory through
+    // TMPDIR. Linux also commonly provides a private TMPDIR in managed
+    // environments; both are safer than a predictable direct child of /tmp.
+    if let Some(dir) = validated_runtime_env("TMPDIR") {
+        return dir.join("hearth");
+    }
+    std::env::temp_dir().join(format!("hearth-{}", effective_uid()))
+}
+
+fn validated_runtime_env(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(name)?);
+    if !path.is_absolute() || path.as_os_str().as_bytes().contains(&0) {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != effective_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        return None;
+    }
+    Some(path)
 }
 
 pub fn default_socket_path() -> PathBuf {
