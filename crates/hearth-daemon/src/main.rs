@@ -33,6 +33,7 @@ const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 5_000;
 const MAX_DRAIN_TIMEOUT_MS: u64 = 60_000;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const IDLE_CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CONTROL_FRAME_BYTES: u32 = 4096;
 
 #[cfg(not(feature = "profiling"))]
 #[global_allocator]
@@ -436,7 +437,8 @@ fn handle_overload_control(
     lifecycle: Arc<Lifecycle>,
     frames: Arc<FrameBudget>,
 ) {
-    let mut requests = hearth_tools::transport::RequestReceiver::new(&stream);
+    let mut requests =
+        hearth_tools::transport::RequestReceiver::with_max_frame(&stream, CONTROL_FRAME_BYTES);
     let Ok((hello, fd)) = requests.recv_request() else {
         return;
     };

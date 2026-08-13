@@ -658,6 +658,7 @@ fn receive_chunk(fd: RawFd, data: &mut [u8]) -> io::Result<(usize, AncillaryBatc
 /// descriptors that have not crossed a successful `recv_request` boundary.
 pub struct RequestReceiver<'a> {
     stream: &'a UnixStream,
+    max_frame: u32,
     bytes: Vec<u8>,
     start: usize,
     base_offset: u64,
@@ -668,12 +669,19 @@ pub struct RequestReceiver<'a> {
 
 impl<'a> RequestReceiver<'a> {
     pub fn new(stream: &'a UnixStream) -> Self {
-        Self::with_read_ahead(stream, true)
+        Self::with_options(stream, true, MAX_FRAME)
     }
 
-    fn with_read_ahead(stream: &'a UnixStream, read_ahead: bool) -> Self {
+    /// A receiver with a stricter per-frame limit, used by small fixed-shape
+    /// control lanes that must not inherit the 256 MiB data-plane allowance.
+    pub fn with_max_frame(stream: &'a UnixStream, max_frame: u32) -> Self {
+        Self::with_options(stream, true, max_frame.min(MAX_FRAME))
+    }
+
+    fn with_options(stream: &'a UnixStream, read_ahead: bool, max_frame: u32) -> Self {
         Self {
             stream,
+            max_frame,
             bytes: Vec::new(),
             start: 0,
             base_offset: 0,
@@ -704,10 +712,10 @@ impl<'a> RequestReceiver<'a> {
     fn recv_request_inner(&mut self) -> io::Result<(Request, Option<OwnedFd>)> {
         self.ensure_available(4)?;
         let prefix = &self.bytes[self.start..self.start + 4];
-        let len =
-            validate_frame_len(
-                u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize,
-            )?;
+        let len = validate_frame_len_with_limit(
+            u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize,
+            self.max_frame,
+        )?;
         let frame_len = 4usize
             .checked_add(len as usize)
             .ok_or_else(frame_too_large)?;
@@ -851,7 +859,7 @@ impl<'a> RequestReceiver<'a> {
 /// consume bytes belonging to a later frame. Multi-request connections should
 /// keep one [`RequestReceiver`] for their entire lifetime.
 pub fn recv_request(stream: &UnixStream) -> io::Result<(Request, Option<OwnedFd>)> {
-    RequestReceiver::with_read_ahead(stream, false).recv_request()
+    RequestReceiver::with_options(stream, false, MAX_FRAME).recv_request()
 }
 
 #[cfg(test)]
