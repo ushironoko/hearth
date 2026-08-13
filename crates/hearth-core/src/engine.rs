@@ -250,7 +250,10 @@ impl Engine {
         if !self.inner.config.enable_watch {
             return;
         }
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        // Preserve the caller's spelling: WatchHandle uses it to map events
+        // back through symlinked roots. The hard cap may conservatively count
+        // two spellings of one directory, which is safe.
+        let root = root.to_path_buf();
         {
             let mut roots = self.inner.watched_roots.lock();
             if roots.contains(&root) {
