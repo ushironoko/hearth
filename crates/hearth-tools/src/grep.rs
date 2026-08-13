@@ -25,6 +25,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+const MAX_PATTERN_BYTES: usize = 1024 * 1024;
+const MAX_GLOBS: usize = 256;
+const MAX_GLOB_BYTES: usize = 16 * 1024;
+const MAX_CONTEXT_LINES: u32 = 10_000;
+const MAX_MATCHES: u64 = 1_000_000;
+const MAX_MATCHER_CACHE_ENTRIES: usize = 256;
+
 pub fn grep(engine: &Engine, params: &GrepParams) -> ToolResult<GrepResult> {
     grep_cancellable(engine, params, &CancelToken::none())
 }
@@ -39,6 +46,7 @@ pub fn grep_cancellable(
 ) -> ToolResult<GrepResult> {
     profile!("tool.grep", {
         cancel.check()?;
+        validate_params(params)?;
         // Compiled regex + glob sets are cached on the engine, so a repeated
         // pattern is never recompiled.
         let cache = engine.extension::<MatcherCache>();
@@ -166,6 +174,29 @@ pub fn grep_cancellable(
             root_is_dir,
         })
     })
+}
+
+fn validate_params(params: &GrepParams) -> ToolResult<()> {
+    if params.pattern.len() > MAX_PATTERN_BYTES {
+        return Err(ToolError::invalid("grep pattern exceeds 1 MiB"));
+    }
+    if params.globs.len() > MAX_GLOBS {
+        return Err(ToolError::invalid("grep accepts at most 256 globs"));
+    }
+    if params.globs.iter().any(|glob| glob.len() > MAX_GLOB_BYTES) {
+        return Err(ToolError::invalid("grep glob exceeds 16 KiB"));
+    }
+    if params.before_context > MAX_CONTEXT_LINES || params.after_context > MAX_CONTEXT_LINES {
+        return Err(ToolError::invalid("grep context exceeds 10000 lines"));
+    }
+    if params.max_count.is_some_and(|limit| limit > MAX_MATCHES)
+        || params
+            .max_total_count
+            .is_some_and(|limit| limit > MAX_MATCHES)
+    {
+        return Err(ToolError::invalid("grep match limit exceeds 1000000"));
+    }
+    Ok(())
 }
 
 /// Keep only the first `limit` matches in path order, reporting whether the cap
@@ -305,6 +336,9 @@ impl MatcherCache {
             return Ok(Arc::clone(m.value()));
         }
         let m = Arc::new(build_matcher(params)?);
+        if self.regex.len() >= MAX_MATCHER_CACHE_ENTRIES {
+            self.regex.clear();
+        }
         self.regex.insert(key, Arc::clone(&m));
         Ok(m)
     }
@@ -314,6 +348,9 @@ impl MatcherCache {
             return Ok(Arc::clone(g.value()));
         }
         let g = Arc::new(GlobFilter::new(globs)?);
+        if self.globs.len() >= MAX_MATCHER_CACHE_ENTRIES {
+            self.globs.clear();
+        }
         self.globs.insert(globs.to_vec(), Arc::clone(&g));
         Ok(g)
     }
@@ -367,6 +404,8 @@ fn search_one(
         blob: Vec::new(),
         spans: Vec::new(),
         found: false,
+        max_output_bytes: engine.config().max_grep_output_bytes,
+        output_full: false,
         cancel,
     };
     // Fast path: search the cached bytes directly (no open()/read() syscalls on
@@ -412,19 +451,36 @@ struct CollectSink<'a> {
     blob: Vec<u8>,
     spans: Vec<LineSpan>,
     found: bool,
+    max_output_bytes: usize,
+    output_full: bool,
     cancel: &'a CancelToken,
 }
 
 impl CollectSink<'_> {
     #[inline]
     fn push_line(&mut self, line_number: u64, bytes: &[u8], is_match: bool) {
+        if self.output_full {
+            return;
+        }
         let text = trim_eol(bytes);
-        let start = self.blob.len() as u32;
+        let remaining = self.max_output_bytes.saturating_sub(self.blob.len());
+        if text.len() > remaining {
+            self.output_full = true;
+            return;
+        }
+        let Ok(start) = u32::try_from(self.blob.len()) else {
+            self.output_full = true;
+            return;
+        };
+        let Ok(len) = u32::try_from(text.len()) else {
+            self.output_full = true;
+            return;
+        };
         self.blob.extend_from_slice(text);
         self.spans.push(LineSpan {
             line_number,
             start,
-            len: text.len() as u32,
+            len,
             is_match,
         });
     }
@@ -459,11 +515,14 @@ impl Sink for CollectSink<'_> {
             self.match_count = 1;
             return Ok(false);
         }
-        self.match_count += 1;
         if self.mode == GrepMode::Content {
             let line_number = mat.line_number().unwrap_or(0);
             self.push_line(line_number, mat.bytes(), true);
+            if self.output_full {
+                return Ok(false);
+            }
         }
+        self.match_count += 1;
         if let Some(mc) = self.max_count
             && self.match_count >= mc
         {
@@ -476,6 +535,9 @@ impl Sink for CollectSink<'_> {
         if self.mode == GrepMode::Content {
             let line_number = ctx.line_number().unwrap_or(0);
             self.push_line(line_number, ctx.bytes(), false);
+            if self.output_full {
+                return Ok(false);
+            }
         }
         Ok(true)
     }

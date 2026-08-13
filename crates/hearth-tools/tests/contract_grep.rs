@@ -298,6 +298,52 @@ fn a_file_root_searches_only_that_file_and_says_so() {
 }
 
 #[test]
+fn hostile_scalar_and_vector_limits_are_rejected_before_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+
+    let mut params = GrepParams::new("x", dir.path().display().to_string());
+    params.before_context = u32::MAX;
+    assert_eq!(
+        grep(&eng, &params).unwrap_err().kind,
+        ErrorKind::InvalidInput
+    );
+
+    let mut params = GrepParams::new("x", dir.path().display().to_string());
+    params.max_total_count = Some(u64::MAX);
+    assert_eq!(
+        grep(&eng, &params).unwrap_err().kind,
+        ErrorKind::InvalidInput
+    );
+
+    let mut params = GrepParams::new("x", dir.path().display().to_string());
+    params.globs = vec!["*.rs".into(); 257];
+    assert_eq!(
+        grep(&eng, &params).unwrap_err().kind,
+        ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn content_output_is_bounded_per_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.txt");
+    std::fs::write(&path, format!("{}\n", "x".repeat(4096))).unwrap();
+    let eng = hearth_core::Engine::new(hearth_core::EngineConfig {
+        default_cwd: dir.path().to_path_buf(),
+        max_grep_output_bytes: 1024,
+        enable_optimizer: false,
+        ..hearth_core::EngineConfig::default()
+    });
+    let mut params = GrepParams::new("x", path.display().to_string());
+    params.mode = GrepMode::Content;
+
+    let result = grep(&eng, &params).unwrap();
+    assert_eq!(result.total_matches, 0);
+    assert!(result.files.is_empty() || result.files[0].lines.is_empty());
+}
+
+#[test]
 fn a_missing_root_is_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());

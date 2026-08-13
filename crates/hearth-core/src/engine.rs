@@ -30,6 +30,8 @@ pub struct EngineConfig {
     /// Hard cap on collected Bash stdout + stderr bytes. Pipes continue to be
     /// drained after the cap so a noisy child cannot deadlock.
     pub max_bash_output_bytes: usize,
+    /// Hard cap on Grep Content-mode line/context text retained per file.
+    pub max_grep_output_bytes: usize,
     /// Use the pooled warm-shell fast path for `bash` (opt-in). Default false:
     /// each command spawns a fresh `/bin/sh -c` (always correct). The warm pool
     /// avoids the per-command spawn but falls back to a fresh spawn on any
@@ -68,6 +70,7 @@ impl Default for EngineConfig {
             bash_timeout_ms: 120_000,
             shell: None,
             max_bash_output_bytes: 16 * 1024 * 1024,
+            max_grep_output_bytes: 4 * 1024 * 1024,
             warm_shell: false,
             walk_threads: threads,
             max_cached_walks: 64,
