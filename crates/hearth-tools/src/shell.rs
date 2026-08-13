@@ -300,8 +300,12 @@ impl Control {
                 parts.next(),
                 parts.next().and_then(|v| v.parse::<i32>().ok()),
             ) {
-                (Some("P"), Some(pid)) => self.job_pgid = Some(pid),
-                (Some("X"), Some(code)) => self.exit_code = Some(code),
+                (Some("P"), Some(pid)) if self.job_pgid.is_none() && self.exit_code.is_none() => {
+                    self.job_pgid = Some(pid);
+                }
+                (Some("X"), Some(code)) if self.job_pgid.is_some() && self.exit_code.is_none() => {
+                    self.exit_code = Some(code);
+                }
                 _ => {}
             }
         }
@@ -543,7 +547,7 @@ fn build_script(command: &str, cwd: &str, env: &[(String, String)], nonce: &str)
     // Job control is switched back off *inside* the subshell so the command's
     // own background jobs stay in the subshell's process group rather than
     // splitting into groups Hearth has no handle on.
-    script.push_str("( set +m 2>/dev/null; cd ");
+    script.push_str("( set +m 2>/dev/null; exec 3>&-; cd ");
     script.push_str(&sh_quote(cwd));
     script.push_str(" && { ");
     for (k, v) in env {
@@ -614,5 +618,20 @@ mod tests {
         assert_eq!(c.exit_code, None);
         c.push(b"7\n");
         assert_eq!(c.exit_code, Some(7));
+    }
+
+    #[test]
+    fn control_rejects_forged_or_out_of_order_records() {
+        let mut c = Control::default();
+        c.push(b"X 0\nP 123\nP 999\nX 7\nX 0\n");
+        assert_eq!(c.job_pgid, Some(123));
+        assert_eq!(c.exit_code, Some(7));
+    }
+
+    #[test]
+    fn command_subshell_closes_the_private_control_fd() {
+        let script = build_script("printf forged >&3 2>/dev/null || :", "/", &[], "nonce");
+        assert!(script.contains("exec 3>&-"));
+        assert!(script.find("exec 3>&-").unwrap() < script.find("eval ").unwrap());
     }
 }
