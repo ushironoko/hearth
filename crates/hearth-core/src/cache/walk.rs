@@ -39,6 +39,8 @@ pub struct WalkCache {
     map: DashMap<CacheKey, Arc<WalkEntry>>,
     threads: usize,
     max_entries: usize,
+    max_files: usize,
+    max_path_bytes: usize,
     clock: AtomicU64,
     /// Serializes insert/evict and invalidation so the count cap is restored
     /// synchronously before a mutation returns.
@@ -51,10 +53,21 @@ impl WalkCache {
     }
 
     pub fn with_limit(threads: usize, max_entries: usize) -> Self {
+        Self::with_limits(threads, max_entries, usize::MAX, usize::MAX)
+    }
+
+    pub fn with_limits(
+        threads: usize,
+        max_entries: usize,
+        max_files: usize,
+        max_path_bytes: usize,
+    ) -> Self {
         Self {
             map: DashMap::new(),
             threads: threads.max(1),
             max_entries,
+            max_files,
+            max_path_bytes,
             clock: AtomicU64::new(1),
             mutation: Mutex::new(()),
         }
@@ -138,13 +151,29 @@ impl WalkCache {
             .follow_links(opts.follow_symlinks)
             .threads(self.threads);
 
-        let sink = Mutex::new(Vec::new());
+        struct Sink {
+            files: Vec<PathBuf>,
+            path_bytes: usize,
+        }
+        let sink = Mutex::new(Sink {
+            files: Vec::new(),
+            path_bytes: 0,
+        });
         builder.build_parallel().run(|| {
             Box::new(|result| {
                 if let Ok(entry) = result
                     && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
                 {
-                    sink.lock().push(entry.into_path());
+                    let path = entry.into_path();
+                    let path_bytes = path.as_os_str().len();
+                    let mut sink = sink.lock();
+                    if sink.files.len() >= self.max_files
+                        || path_bytes > self.max_path_bytes.saturating_sub(sink.path_bytes)
+                    {
+                        return WalkState::Quit;
+                    }
+                    sink.path_bytes += path_bytes;
+                    sink.files.push(path);
                 }
                 WalkState::Continue
             })
@@ -152,9 +181,9 @@ impl WalkCache {
         // The parallel walk finishes in thread-completion order. Sorting here
         // once makes every consumer deterministic — and lets `grep` treat the
         // index order as path order when it applies a global match limit.
-        let mut files = sink.into_inner();
-        files.sort_unstable();
-        files
+        let mut sink = sink.into_inner();
+        sink.files.sort_unstable();
+        sink.files
     }
 
     /// Invalidate every cached walk that overlaps `path` — both walks rooted at
@@ -230,5 +259,25 @@ mod tests {
         assert!(!hit);
         assert_eq!(entry.files.len(), 1);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn file_and_path_byte_caps_apply_during_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["aaaa", "bbbb", "cccc"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let one_path = dir.path().join("aaaa").as_os_str().len();
+        let cache = WalkCache::with_limits(1, 1, 2, one_path * 2);
+        let (entry, _) = cache.get(dir.path(), key());
+        assert!(entry.files.len() <= 2);
+        assert!(
+            entry
+                .files
+                .iter()
+                .map(|path| path.as_os_str().len())
+                .sum::<usize>()
+                <= one_path * 2
+        );
     }
 }

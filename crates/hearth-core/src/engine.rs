@@ -41,6 +41,9 @@ pub struct EngineConfig {
     pub walk_threads: usize,
     /// Hard cap on retained directory-walk snapshots.
     pub max_cached_walks: usize,
+    /// Hard per-walk cap on discovered files and retained path bytes.
+    pub max_walk_files: usize,
+    pub max_walk_path_bytes: usize,
     /// Start an fs-watcher on searched roots to proactively invalidate caches.
     pub enable_watch: bool,
     /// Hard cap on distinct roots admitted to the resident watcher. When the
@@ -78,6 +81,8 @@ impl Default for EngineConfig {
             warm_shell: false,
             walk_threads: threads,
             max_cached_walks: 64,
+            max_walk_files: 1_000_000,
+            max_walk_path_bytes: 256 * 1024 * 1024,
             enable_watch: false,
             max_watch_roots: 64,
             trust_cache: false,
@@ -146,9 +151,11 @@ impl Engine {
             config.max_cache_bytes,
             config.max_cached_files,
         ));
-        let walks = Arc::new(WalkCache::with_limit(
+        let walks = Arc::new(WalkCache::with_limits(
             config.walk_threads,
             config.max_cached_walks,
+            config.max_walk_files,
+            config.max_walk_path_bytes,
         ));
         let invalidations = Arc::new(InvalidationLog::new());
         let tuning = Arc::new(Tuning::default());
