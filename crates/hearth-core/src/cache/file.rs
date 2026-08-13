@@ -13,6 +13,7 @@ use crate::line_index::LineIndex;
 use crate::singleflight::SingleFlight;
 use dashmap::DashMap;
 use hearth_proto::ToolError;
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -25,14 +26,40 @@ pub struct FileEntry {
     data: Arc<[u8]>,
     pub size: u64,
     pub mtime_ns: i128,
+    /// Source bytes plus the full reserved upper bound for the lazy line index.
+    /// `None` means the bound overflowed `u64`, so this entry is never retained.
+    accounted_bytes: Option<u64>,
     hash: OnceLock<u64>,
-    line_index: OnceLock<Arc<LineIndex>>,
+    line_index: OnceLock<LineIndex>,
     valid_utf8: OnceLock<bool>,
     /// Monotonic access stamp for LRU eviction (0 = never touched).
     last_access: AtomicU64,
 }
 
 impl FileEntry {
+    fn new(path: PathBuf, data: Arc<[u8]>, size: u64, mtime_ns: i128) -> Self {
+        let source_bytes = u64::try_from(data.len()).ok();
+        let accounted_bytes = source_bytes.and_then(|source_bytes| {
+            source_bytes.checked_add(LineIndex::max_heap_bytes(data.len())?)
+        });
+        Self {
+            path,
+            data,
+            size,
+            mtime_ns,
+            accounted_bytes,
+            hash: OnceLock::new(),
+            line_index: OnceLock::new(),
+            valid_utf8: OnceLock::new(),
+            last_access: AtomicU64::new(0),
+        }
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.accounted_bytes
+            .expect("retained file entry must have representable accounting")
+    }
+
     #[inline]
     pub fn bytes(&self) -> &[u8] {
         &self.data
@@ -46,8 +73,7 @@ impl FileEntry {
 
     /// The line index, built once and cached.
     pub fn line_index(&self) -> &LineIndex {
-        self.line_index
-            .get_or_init(|| Arc::new(LineIndex::new(&self.data)))
+        self.line_index.get_or_init(|| LineIndex::new(&self.data))
     }
 
     /// xxh3 content fingerprint, computed once.
@@ -98,12 +124,28 @@ impl FileEntry {
     }
 }
 
+#[derive(Debug, Default)]
+struct CacheState {
+    /// Exact accounted bytes for entries currently present in `map`.
+    /// `u128` also represents the permitted one-object insertion overshoot.
+    total_bytes: u128,
+}
+
+type EvictionCandidate = (PathBuf, Arc<FileEntry>, u64);
+
 /// A cache of file contents keyed by absolute path, validated by `(mtime, size)`.
 pub struct FileCache {
     map: DashMap<PathBuf, Arc<FileEntry>>,
     loads: SingleFlight<PathBuf, Result<Arc<FileEntry>, ToolError>>,
-    /// Total bytes currently held (maintained on insert/remove — O(1) to read).
-    total_bytes: AtomicU64,
+    /// Serializes every map mutation with accounting and hard-cap enforcement.
+    ///
+    /// Invariant whenever this mutex is unlocked: `state.total_bytes` equals the
+    /// sum of `FileEntry::accounted_bytes` in `map`, and both configured hard
+    /// caps hold. An insertion may add only its one candidate while holding the
+    /// mutex, then synchronously evicts before unlocking.
+    state: Mutex<CacheState>,
+    max_bytes: u64,
+    max_entries: usize,
     /// Monotonic clock stamped onto entries on access, for LRU eviction.
     clock: AtomicU64,
     /// Always-on hit/miss counters (independent of the profiler) so the
@@ -119,11 +161,20 @@ impl Default for FileCache {
 }
 
 impl FileCache {
+    /// Build an effectively unbounded standalone cache. Engines use
+    /// [`with_limits`](Self::with_limits) so configuration caps are always live.
     pub fn new() -> Self {
+        Self::with_limits(u64::MAX, usize::MAX)
+    }
+
+    /// Build a cache with immutable hard resident-byte and entry-count caps.
+    pub fn with_limits(max_bytes: u64, max_entries: usize) -> Self {
         Self {
             map: DashMap::new(),
             loads: SingleFlight::new(),
-            total_bytes: AtomicU64::new(0),
+            state: Mutex::new(CacheState::default()),
+            max_bytes,
+            max_entries,
             clock: AtomicU64::new(1),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -147,42 +198,82 @@ impl FileCache {
         );
     }
 
-    /// Saturating subtract from `total_bytes` (never underflow-wraps, so a
-    /// racing miscount can't blow the counter up to ~u64::MAX and trigger a
-    /// runaway eviction).
-    fn sub_bytes(&self, n: u64) {
-        let mut cur = self.total_bytes.load(Ordering::Relaxed);
-        loop {
-            let new = cur.saturating_sub(n);
-            match self.total_bytes.compare_exchange_weak(
-                cur,
-                new,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => cur = actual,
-            }
+    /// Insert, replace, account, and synchronously restore both hard caps as one
+    /// serialized cache mutation. The returned object is usable regardless of
+    /// whether it is retained.
+    fn insert_accounted(&self, key: PathBuf, entry: Arc<FileEntry>) {
+        self.touch(&entry);
+        let mut state = self.state.lock();
+
+        let Some(new_bytes) = entry.accounted_bytes else {
+            self.remove_key_locked(&mut state, &key);
+            return;
+        };
+        if new_bytes > self.max_bytes || self.max_entries == 0 {
+            // An individually oversized replacement must also invalidate the
+            // prior value; retaining it would be stale in trust-cache mode.
+            self.remove_key_locked(&mut state, &key);
+            return;
+        }
+
+        if let Some(old) = self.map.insert(key, entry) {
+            Self::subtract_locked(&mut state, old.retained_bytes());
+        }
+        state.total_bytes += u128::from(new_bytes);
+
+        // The map may exceed either cap by this insertion alone while the gate
+        // is held. Eviction completes before any other mutation or accounting
+        // observer can proceed.
+        self.enforce_limits_locked(&mut state, self.max_bytes, self.max_entries);
+        debug_assert_eq!(state.total_bytes, self.accounted_map_bytes());
+        debug_assert!(state.total_bytes <= u128::from(self.max_bytes));
+        debug_assert!(self.map.len() <= self.max_entries);
+    }
+
+    fn subtract_locked(state: &mut CacheState, bytes: u64) {
+        state.total_bytes = state
+            .total_bytes
+            .checked_sub(u128::from(bytes))
+            .expect("file cache accounting invariant violated");
+    }
+
+    fn remove_key_locked(&self, state: &mut CacheState, path: &Path) -> bool {
+        if let Some((_, removed)) = self.map.remove(path) {
+            Self::subtract_locked(state, removed.retained_bytes());
+            true
+        } else {
+            false
         }
     }
 
-    /// Insert an entry, keeping `total_bytes` correct across replacement.
-    fn insert_accounted(&self, key: PathBuf, entry: Arc<FileEntry>) {
-        let new_size = entry.size;
-        self.touch(&entry);
-        self.total_bytes.fetch_add(new_size, Ordering::Relaxed);
-        if let Some(old) = self.map.insert(key, entry) {
-            self.sub_bytes(old.size);
-        }
+    fn remove_identity_locked(
+        &self,
+        state: &mut CacheState,
+        path: &Path,
+        expected: &Arc<FileEntry>,
+    ) -> Option<Arc<FileEntry>> {
+        let (_, removed) = self
+            .map
+            .remove_if(path, |_, current| Arc::ptr_eq(current, expected))?;
+        Self::subtract_locked(state, removed.retained_bytes());
+        Some(removed)
+    }
+
+    fn accounted_map_bytes(&self) -> u128 {
+        self.map
+            .iter()
+            .map(|entry| u128::from(entry.value().retained_bytes()))
+            .sum()
     }
 
     /// Number of entries currently held.
     pub fn len(&self) -> usize {
+        let _state = self.state.lock();
         self.map.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len() == 0
     }
 
     /// Fetch a file, serving from cache when the on-disk `(mtime, size)` is
@@ -265,16 +356,12 @@ impl FileCache {
         let key = path.to_path_buf();
         let loaded = self.loads.run(key.clone(), || {
             let bytes = std::fs::read(&key).map_err(|e| map_io(e, &key))?;
-            let entry = Arc::new(FileEntry {
-                path: key.clone(),
-                data: Arc::from(bytes.into_boxed_slice()),
+            let entry = Arc::new(FileEntry::new(
+                key.clone(),
+                Arc::from(bytes.into_boxed_slice()),
                 size,
                 mtime_ns,
-                hash: OnceLock::new(),
-                line_index: OnceLock::new(),
-                valid_utf8: OnceLock::new(),
-                last_access: AtomicU64::new(0),
-            });
+            ));
             Ok(entry)
         });
         let entry = loaded?;
@@ -285,34 +372,24 @@ impl FileCache {
     /// Update the cache to reflect a freshly-written file without re-reading it
     /// from disk. Called by `write`/`edit` right after they persist bytes.
     pub fn put_written(&self, path: &Path, bytes: Arc<[u8]>, size: u64, mtime_ns: i128) {
-        let entry = Arc::new(FileEntry {
-            path: path.to_path_buf(),
-            data: bytes,
-            size,
-            mtime_ns,
-            hash: OnceLock::new(),
-            line_index: OnceLock::new(),
-            valid_utf8: OnceLock::new(),
-            last_access: AtomicU64::new(0),
-        });
+        let entry = Arc::new(FileEntry::new(path.to_path_buf(), bytes, size, mtime_ns));
         self.insert_accounted(path.to_path_buf(), entry);
     }
 
-    /// Total bytes held across all entries (O(1)).
+    /// Accounted bytes held across all entries.
+    ///
+    /// This includes source bytes plus each entry's full possible line-index
+    /// allocation, whether or not that lazy index has been built yet.
     pub fn total_bytes(&self) -> u64 {
-        self.total_bytes.load(Ordering::Relaxed)
+        let state = self.state.lock();
+        u64::try_from(state.total_bytes)
+            .expect("settled file cache accounting must fit its u64 hard cap")
     }
 
-    /// Evict least-recently-used entries until the cache holds at most
-    /// `byte_budget` bytes. Returns `(entries_evicted, bytes_freed)`. Runs off
-    /// the hot path (the background optimizer calls it).
-    pub fn evict_to_bytes(&self, byte_budget: u64) -> (usize, u64) {
-        if self.total_bytes() <= byte_budget {
-            return (0, 0);
-        }
+    fn lru_snapshot(&self) -> Vec<EvictionCandidate> {
         // Snapshot each entry's *identity* (the Arc) + recency, oldest first, so
         // we only ever remove the exact entry we costed — never a replacement.
-        let mut items: Vec<(PathBuf, Arc<FileEntry>, u64)> = self
+        let mut items: Vec<EvictionCandidate> = self
             .map
             .iter()
             .map(|e| {
@@ -323,58 +400,112 @@ impl FileCache {
                 )
             })
             .collect();
-        items.sort_by_key(|(_, _, la)| *la);
+        items.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+        items
+    }
 
-        let mut freed = 0u64;
+    fn over_limits(&self, state: &CacheState, byte_budget: u64, max_entries: usize) -> bool {
+        state.total_bytes > u128::from(byte_budget) || self.map.len() > max_entries
+    }
+
+    fn evict_snapshot_locked(
+        &self,
+        state: &mut CacheState,
+        items: Vec<EvictionCandidate>,
+        byte_budget: u64,
+        max_entries: usize,
+    ) -> (usize, u128) {
         let mut evicted = 0usize;
+        let mut freed = 0u128;
         for (path, arc, _) in items {
-            // `total_bytes` already reflects prior removals — test it directly
-            // (do NOT also subtract `freed`, or eviction stops one entry short).
-            if self.total_bytes() <= byte_budget {
+            if !self.over_limits(state, byte_budget, max_entries) {
                 break;
             }
-            // Remove only if this exact entry is still present (not replaced by a
-            // concurrent write); subtract the actually-removed size.
-            if let Some((_, removed)) = self.map.remove_if(&path, |_, v| Arc::ptr_eq(v, &arc)) {
-                self.sub_bytes(removed.size);
-                freed += removed.size;
+            // The snapshot can be stale. Charge only a successful conditional
+            // removal of the exact Arc that was costed.
+            if let Some(removed) = self.remove_identity_locked(state, &path, &arc) {
+                freed += u128::from(removed.retained_bytes());
                 evicted += 1;
             }
         }
         (evicted, freed)
     }
 
-    /// Legacy entry-count bound (kept for callers that want a hard cap).
-    pub fn prune(&self, max_entries: usize) -> usize {
-        let len = self.map.len();
-        if len <= max_entries {
-            return 0;
+    fn enforce_limits_locked(
+        &self,
+        state: &mut CacheState,
+        byte_budget: u64,
+        max_entries: usize,
+    ) -> (usize, u128) {
+        let mut evicted = 0usize;
+        let mut freed = 0u128;
+        while self.over_limits(state, byte_budget, max_entries) {
+            let items = self.lru_snapshot();
+            let (round_evicted, round_freed) =
+                self.evict_snapshot_locked(state, items, byte_budget, max_entries);
+            assert!(
+                round_evicted > 0,
+                "file cache limits cannot be restored from current accounting"
+            );
+            evicted += round_evicted;
+            freed += round_freed;
         }
-        let mut to_drop = len - max_entries;
-        let mut dropped = 0;
-        self.map.retain(|_, v| {
-            if to_drop > 0 {
-                to_drop -= 1;
-                dropped += 1;
-                self.sub_bytes(v.size);
-                false
-            } else {
-                true
+        (evicted, freed)
+    }
+
+    fn evict_to_limits_with_first_snapshot_hook<F>(
+        &self,
+        byte_budget: u64,
+        max_entries: usize,
+        after_snapshot: F,
+    ) -> (usize, u64)
+    where
+        F: FnOnce(),
+    {
+        {
+            let state = self.state.lock();
+            if !self.over_limits(&state, byte_budget, max_entries) {
+                return (0, 0);
             }
-        });
-        dropped
+        }
+        // Deliberately snapshot before taking the mutation gate: optimizer work
+        // does not block inserts while collecting candidates. Arc identity on
+        // removal makes any intervening replacement safe.
+        let first_items = self.lru_snapshot();
+        after_snapshot();
+
+        let mut state = self.state.lock();
+        let (mut evicted, mut freed) =
+            self.evict_snapshot_locked(&mut state, first_items, byte_budget, max_entries);
+        let (retry_evicted, retry_freed) =
+            self.enforce_limits_locked(&mut state, byte_budget, max_entries);
+        evicted += retry_evicted;
+        freed += retry_freed;
+        debug_assert_eq!(state.total_bytes, self.accounted_map_bytes());
+        (
+            evicted,
+            u64::try_from(freed).expect("settled file-cache eviction fits u64"),
+        )
+    }
+
+    /// Evict least-recently-used entries until accounted cache bytes are at
+    /// most `byte_budget`. Returns `(entries_evicted, accounted_bytes_freed)`.
+    /// Runs off the hot path (the background optimizer calls it).
+    pub fn evict_to_bytes(&self, byte_budget: u64) -> (usize, u64) {
+        self.evict_to_limits_with_first_snapshot_hook(byte_budget, usize::MAX, || {})
+    }
+
+    /// Legacy entry-count bound (kept for callers that want a tighter cap).
+    pub fn prune(&self, max_entries: usize) -> usize {
+        self.evict_to_limits_with_first_snapshot_hook(u64::MAX, max_entries, || {})
+            .0
     }
 
     /// Drop a single path (called by fs-watch invalidation). Returns whether an
     /// entry was actually removed.
     pub fn invalidate(&self, path: &Path) -> bool {
-        match self.map.remove(path) {
-            Some((_, entry)) => {
-                self.sub_bytes(entry.size);
-                true
-            }
-            None => false,
-        }
+        let mut state = self.state.lock();
+        self.remove_key_locked(&mut state, path)
     }
 
     /// Drop `root` and every entry beneath it. Returns the number removed.
@@ -400,9 +531,10 @@ impl FileCache {
 
     /// Drop everything. Returns the number of entries removed.
     pub fn clear(&self) -> usize {
+        let mut state = self.state.lock();
         let n = self.map.len();
         self.map.clear();
-        self.total_bytes.store(0, Ordering::Relaxed);
+        state.total_bytes = 0;
         n
     }
 }
@@ -427,11 +559,27 @@ fn map_io(e: std::io::Error, path: &Path) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
 
     fn write_file(dir: &Path, name: &str, size: usize) -> PathBuf {
         let p = dir.join(name);
         std::fs::write(&p, vec![b'a'; size]).unwrap();
         p
+    }
+
+    fn accounted(size: usize) -> u64 {
+        size as u64 + LineIndex::max_heap_bytes(size).unwrap()
+    }
+
+    fn bytes(size: usize, value: u8) -> Arc<[u8]> {
+        Arc::from(vec![value; size].into_boxed_slice())
+    }
+
+    fn assert_settled(cache: &FileCache) {
+        let state = cache.state.lock();
+        assert_eq!(state.total_bytes, cache.accounted_map_bytes());
+        assert!(state.total_bytes <= u128::from(cache.max_bytes));
+        assert!(cache.map.len() <= cache.max_entries);
     }
 
     #[test]
@@ -445,17 +593,18 @@ mod tests {
         cache.get(&a).unwrap();
         cache.get(&b).unwrap();
         cache.get(&c).unwrap();
-        assert_eq!(cache.total_bytes(), 3000);
+        let one = accounted(1000);
+        assert_eq!(cache.total_bytes(), 3 * one);
 
         // Re-access a and b so c becomes least-recently-used.
         cache.get(&a).unwrap();
         cache.get(&b).unwrap();
 
-        // Budget of 2000 → exactly one eviction, and it must be c (the LRU).
-        let (evicted, freed) = cache.evict_to_bytes(2000);
+        // A two-entry budget evicts exactly c, the LRU.
+        let (evicted, freed) = cache.evict_to_bytes(2 * one);
         assert_eq!(evicted, 1);
-        assert_eq!(freed, 1000);
-        assert!(cache.total_bytes() <= 2000);
+        assert_eq!(freed, one);
+        assert_eq!(cache.total_bytes(), 2 * one);
 
         // a and b remain cached (trusted hit); c was evicted (re-read → miss).
         assert!(
@@ -472,54 +621,71 @@ mod tests {
         cache.get(&a).unwrap();
         cache.get(&b).unwrap();
         cache.get(&c).unwrap();
-        assert_eq!(cache.total_bytes(), 3000);
-        cache.evict_to_bytes(1000);
-        assert!(
-            cache.total_bytes() <= 1000,
-            "budget must be reached, not one short"
-        );
+        assert_eq!(cache.total_bytes(), 3 * one);
+        cache.evict_to_bytes(one);
+        assert_eq!(cache.total_bytes(), one, "budget must be reached exactly");
     }
 
     #[test]
-    fn total_bytes_consistent_under_concurrency() {
+    fn byte_cap_is_synchronous_on_every_insertion() {
+        let cache = FileCache::with_limits(2 * accounted(64), 10);
+        for i in 0..3 {
+            cache.put_written(
+                Path::new(match i {
+                    0 => "/a",
+                    1 => "/b",
+                    _ => "/c",
+                }),
+                bytes(64, b'a' + i),
+                64,
+                i128::from(i),
+            );
+            assert_settled(&cache);
+        }
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.total_bytes(), 2 * accounted(64));
+    }
+
+    #[test]
+    fn entry_cap_is_synchronous_on_every_insertion() {
+        let cache = FileCache::with_limits(10 * accounted(64), 2);
+        for i in 0..3 {
+            let path = PathBuf::from(format!("/{i}"));
+            cache.put_written(&path, bytes(64, b'x'), 64, i128::from(i));
+            assert_settled(&cache);
+        }
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.total_bytes(), 2 * accounted(64));
+    }
+
+    #[test]
+    fn hard_caps_and_accounting_remain_exact_under_concurrency() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(FileCache::new());
-        let paths: Vec<PathBuf> = (0..16)
-            .map(|i| write_file(dir.path(), &format!("f{i}"), 100 + i * 10))
-            .collect();
+        let one = accounted(64);
+        let cache = Arc::new(FileCache::with_limits(4 * one, 4));
+        let paths: Vec<PathBuf> = (0..12).map(|i| dir.path().join(format!("f{i}"))).collect();
+        let start = Arc::new(Barrier::new(8));
 
         let mut handles = Vec::new();
-        for t in 0..8u64 {
+        for t in 0..8usize {
             let cache = Arc::clone(&cache);
             let paths = paths.clone();
+            let start = Arc::clone(&start);
             handles.push(std::thread::spawn(move || {
-                for round in 0..300u64 {
-                    let p = &paths[((t * 7 + round) as usize) % paths.len()];
-                    let _ = cache.get(p);
-                    if round % 5 == 0 {
-                        cache.invalidate(p);
-                    }
-                    if round % 11 == 0 {
-                        let b: Arc<[u8]> = Arc::from(vec![b'z'; 50].into_boxed_slice());
-                        cache.put_written(p, b, 50, round as i128);
-                    }
-                    if round % 13 == 0 {
-                        cache.evict_to_bytes(400);
-                    }
+                start.wait();
+                for round in 0..200usize {
+                    let p = &paths[(t * 7 + round) % paths.len()];
+                    cache.put_written(p, bytes(64, t as u8), 64, round as i128);
+                    assert_settled(&cache);
                 }
             }));
         }
         for h in handles {
             h.join().unwrap();
         }
-        // After all mutation stops, total_bytes must equal the real sum — no
-        // drift, no underflow-wrap.
-        let actual: u64 = cache.map.iter().map(|e| e.value().size).sum();
-        assert_eq!(
-            cache.total_bytes(),
-            actual,
-            "total_bytes drifted from the true sum"
-        );
+        assert_settled(&cache);
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.total_bytes(), 4 * one);
     }
 
     #[test]
@@ -528,14 +694,100 @@ mod tests {
         let cache = FileCache::new();
         let a = write_file(dir.path(), "a", 500);
         cache.get(&a).unwrap();
-        assert_eq!(cache.total_bytes(), 500);
+        assert_eq!(cache.total_bytes(), accounted(500));
 
         // put_written replaces the entry with a different size.
         let bytes: Arc<[u8]> = Arc::from(vec![b'x'; 800].into_boxed_slice());
         cache.put_written(&a, bytes, 800, 12345);
-        assert_eq!(cache.total_bytes(), 800);
+        assert_eq!(cache.total_bytes(), accounted(800));
 
         cache.invalidate(&a);
         assert_eq!(cache.total_bytes(), 0);
+    }
+
+    #[test]
+    fn individually_oversized_object_is_returned_but_never_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "oversized", 65);
+        let cache = FileCache::with_limits(accounted(65) - 1, 8);
+
+        let (first, first_hit) = cache.get(&path).unwrap();
+        assert!(!first_hit);
+        assert_eq!(first.bytes(), &[b'a'; 65]);
+        assert!(cache.is_empty());
+        assert_eq!(cache.total_bytes(), 0);
+
+        let (second, second_hit) = cache.get(&path).unwrap();
+        assert!(!second_hit, "an oversized object must be read again");
+        assert_eq!(second.bytes(), first.bytes());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn oversized_replacement_drops_the_prior_cached_identity() {
+        let path = Path::new("/replacement");
+        let cache = FileCache::with_limits(accounted(32), 8);
+        cache.put_written(path, bytes(16, b'a'), 16, 1);
+        assert_eq!(cache.len(), 1);
+
+        cache.put_written(path, bytes(33, b'b'), 33, 2);
+        assert!(cache.is_empty());
+        assert_eq!(cache.total_bytes(), 0);
+    }
+
+    #[test]
+    fn line_index_worst_case_is_reserved_before_lazy_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lines");
+        let source = vec![b'\n'; 128];
+        std::fs::write(&path, &source).unwrap();
+        let reserved = accounted(source.len());
+        let cache = FileCache::with_limits(reserved, 1);
+
+        let (entry, _) = cache.get(&path).unwrap();
+        assert_eq!(cache.total_bytes(), reserved);
+        let index = entry.line_index();
+        assert_eq!(
+            index.heap_bytes(),
+            LineIndex::max_heap_bytes(source.len()).unwrap()
+        );
+        assert_eq!(cache.total_bytes(), reserved);
+        assert_settled(&cache);
+    }
+
+    #[test]
+    fn stale_concurrent_eviction_never_removes_or_charges_replacement() {
+        let one = accounted(64);
+        let cache = Arc::new(FileCache::with_limits(3 * one, 3));
+        let victim = PathBuf::from("/victim");
+        let other = PathBuf::from("/other");
+        cache.put_written(&victim, bytes(64, b'v'), 64, 1);
+        cache.put_written(&other, bytes(64, b'o'), 64, 1);
+
+        let snapshot_ready = Arc::new(Barrier::new(2));
+        let replacement_ready = Arc::new(Barrier::new(2));
+        let worker_cache = Arc::clone(&cache);
+        let worker_snapshot = Arc::clone(&snapshot_ready);
+        let worker_replacement = Arc::clone(&replacement_ready);
+        let evictor = std::thread::spawn(move || {
+            worker_cache.evict_to_limits_with_first_snapshot_hook(one, usize::MAX, || {
+                worker_snapshot.wait();
+                worker_replacement.wait();
+            })
+        });
+
+        snapshot_ready.wait();
+        cache.put_written(&victim, bytes(64, b'n'), 64, 2);
+        let replacement = Arc::clone(cache.map.get(&victim).unwrap().value());
+        replacement_ready.wait();
+
+        assert_eq!(evictor.join().unwrap(), (1, one));
+        let current = cache.map.get(&victim).unwrap();
+        assert!(Arc::ptr_eq(current.value(), &replacement));
+        assert_eq!(current.bytes(), &[b'n'; 64]);
+        assert!(!cache.map.contains_key(&other));
+        drop(current);
+        assert_eq!(cache.total_bytes(), one);
+        assert_settled(&cache);
     }
 }

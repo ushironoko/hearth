@@ -126,13 +126,17 @@ pub struct Engine {
 impl Engine {
     /// Build an engine with the given configuration, starting the optimizer.
     pub fn new(config: EngineConfig) -> Self {
-        let files = Arc::new(FileCache::new());
+        let files = Arc::new(FileCache::with_limits(
+            config.max_cache_bytes,
+            config.max_cached_files,
+        ));
         let walks = Arc::new(WalkCache::new(config.walk_threads));
         let invalidations = Arc::new(InvalidationLog::new());
         let tuning = Arc::new(Tuning::default());
-        // Normalize bounds so a misconfigured min>max can never panic `clamp`.
-        let min_bytes = config.min_cache_bytes;
-        let max_bytes = config.max_cache_bytes.max(min_bytes);
+        // The configured maximum is a safety ceiling, never raised to satisfy a
+        // misconfigured adaptive floor.
+        let max_bytes = config.max_cache_bytes;
+        let min_bytes = config.min_cache_bytes.min(max_bytes);
         // Start the adaptive budget at the floor; the optimizer grows it toward
         // the ceiling for warm, high-reuse workloads.
         tuning.cache_byte_budget.store(min_bytes, Ordering::Relaxed);
