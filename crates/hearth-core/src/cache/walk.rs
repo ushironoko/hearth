@@ -43,10 +43,12 @@ pub struct WalkCache {
     max_files: usize,
     max_path_bytes: usize,
     max_resident_path_bytes: usize,
+    max_visited_entries: usize,
     clock: AtomicU64,
     /// Serializes insert/evict and invalidation so the count cap is restored
     /// synchronously before a mutation returns.
     mutation: Mutex<()>,
+    build: Mutex<()>,
     generation: AtomicU64,
 }
 
@@ -72,8 +74,10 @@ impl WalkCache {
             max_files,
             max_path_bytes,
             max_resident_path_bytes: max_path_bytes,
+            max_visited_entries: max_files.saturating_mul(4).max(max_files),
             clock: AtomicU64::new(1),
             mutation: Mutex::new(()),
+            build: Mutex::new(()),
             generation: AtomicU64::new(0),
         }
     }
@@ -98,6 +102,11 @@ impl WalkCache {
             return (Arc::clone(entry.value()), true);
         }
         crate::profiler::count("cache.walk.miss", 1);
+        let _build = self.build.lock();
+        if let Some(entry) = self.map.get(&key) {
+            self.touch(entry.value());
+            return (Arc::clone(entry.value()), true);
+        }
         let generation = self.generation.load(Ordering::Acquire);
         let files = self.build(root, opts);
         let retained_path_bytes = files.iter().map(|path| path.as_os_str().len()).sum();
@@ -173,6 +182,9 @@ impl WalkCache {
             files: Vec<PathBuf>,
             path_bytes: usize,
         }
+        let visited = AtomicU64::new(0);
+        let max_visited = self.max_visited_entries as u64;
+        builder.filter_entry(move |_| visited.fetch_add(1, Ordering::Relaxed) < max_visited);
         let sink = Mutex::new(Sink {
             files: Vec::new(),
             path_bytes: 0,

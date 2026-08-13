@@ -219,6 +219,7 @@ fn push_import(
 }
 
 fn normalized_path(node: Node<'_>, source: &[u8]) -> Option<String> {
+    const MAX_NORMALIZED_PATH_BYTES: usize = 64 * 1024;
     enum Frame<'tree> {
         Visit(Node<'tree>),
         JoinScoped { has_path: bool },
@@ -242,16 +243,25 @@ fn normalized_path(node: Node<'_>, source: &[u8]) -> Option<String> {
                 }
                 pending.push(Frame::Visit(name));
             }
-            Frame::Visit(node) => values.push(node_text(node, source)),
+            Frame::Visit(node) => values.push(
+                node_text(node, source).filter(|value| value.len() <= MAX_NORMALIZED_PATH_BYTES),
+            ),
             Frame::JoinScoped { has_path } => {
                 let path = has_path.then(|| values.pop().flatten()).flatten();
                 let Some(name) = values.pop().flatten() else {
                     values.push(None);
                     continue;
                 };
-                values.push(Some(
-                    path.map_or(name.clone(), |path| join_path(&path, &name)),
-                ));
+                let combined_len = path
+                    .as_ref()
+                    .map_or(name.len(), |path| path.len().saturating_add(2 + name.len()));
+                if combined_len > MAX_NORMALIZED_PATH_BYTES {
+                    values.push(None);
+                } else {
+                    values.push(Some(
+                        path.map_or(name.clone(), |path| join_path(&path, &name)),
+                    ));
+                }
             }
         }
     }
