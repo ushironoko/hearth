@@ -94,7 +94,11 @@ pub fn bash_stream(
             .or_else(|| engine.config().shell.clone())
             .unwrap_or_default();
         let start = Instant::now();
-        let mut emitter = Emitter::new(params.collect_output, on_chunk);
+        let mut emitter = Emitter::new(
+            params.collect_output,
+            engine.config().max_bash_output_bytes,
+            on_chunk,
+        );
 
         // Opt-in warm-shell fast path.
         // A pooled shell inherited the daemon environment before this call, so
@@ -144,6 +148,9 @@ struct Emitter<'a> {
     on_chunk: &'a mut dyn FnMut(BashChunk),
     seq: u64,
     collect: bool,
+    max_bytes: usize,
+    emitted_bytes: usize,
+    output_truncated: bool,
     stdout: String,
     stderr: String,
     out_decoder: Utf8Stream,
@@ -151,11 +158,14 @@ struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
-    fn new(collect: bool, on_chunk: &'a mut dyn FnMut(BashChunk)) -> Self {
+    fn new(collect: bool, max_bytes: usize, on_chunk: &'a mut dyn FnMut(BashChunk)) -> Self {
         Self {
             on_chunk,
             seq: 0,
             collect,
+            max_bytes,
+            emitted_bytes: 0,
+            output_truncated: false,
             stdout: String::new(),
             stderr: String::new(),
             out_decoder: Utf8Stream::default(),
@@ -171,10 +181,26 @@ impl<'a> Emitter<'a> {
         self.emit(channel, text);
     }
 
-    fn emit(&mut self, channel: BashChannel, text: String) {
+    fn emit(&mut self, channel: BashChannel, mut text: String) {
         if text.is_empty() {
             return;
         }
+        let remaining = self.max_bytes.saturating_sub(self.emitted_bytes);
+        if text.len() > remaining {
+            let mut end = remaining.min(text.len());
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            self.output_truncated = true;
+        }
+        if remaining == 0 {
+            self.output_truncated = true;
+        }
+        if text.is_empty() {
+            return;
+        }
+        self.emitted_bytes += text.len();
         if self.collect {
             match channel {
                 BashChannel::Stdout => self.stdout.push_str(&text),
@@ -212,6 +238,7 @@ impl<'a> Emitter<'a> {
             aborted,
             duration_us: start.elapsed().as_micros() as u64,
             chunks: self.seq,
+            output_truncated: self.output_truncated,
         }
     }
 }

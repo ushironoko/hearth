@@ -613,6 +613,8 @@ pub struct BashResult {
     pub duration_us: i64,
     /// How many chunks were delivered to the stream callback.
     pub chunks: i64,
+    /// True when output beyond the engine hard cap was drained and discarded.
+    pub output_truncated: bool,
 }
 
 impl From<proto::BashResult> for BashResult {
@@ -626,6 +628,7 @@ impl From<proto::BashResult> for BashResult {
             aborted: r.aborted,
             duration_us: as_i64(r.duration_us),
             chunks: as_i64(r.chunks),
+            output_truncated: r.output_truncated,
         }
     }
 }

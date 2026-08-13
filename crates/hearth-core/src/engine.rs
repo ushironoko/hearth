@@ -27,6 +27,9 @@ pub struct EngineConfig {
     /// Default shell for `bash`. `None` means `/bin/sh -c`. A per-call
     /// `BashParams::shell` overrides this.
     pub shell: Option<ShellSpec>,
+    /// Hard cap on collected Bash stdout + stderr bytes. Pipes continue to be
+    /// drained after the cap so a noisy child cannot deadlock.
+    pub max_bash_output_bytes: usize,
     /// Use the pooled warm-shell fast path for `bash` (opt-in). Default false:
     /// each command spawns a fresh `/bin/sh -c` (always correct). The warm pool
     /// avoids the per-command spawn but falls back to a fresh spawn on any
@@ -64,6 +67,7 @@ impl Default for EngineConfig {
             default_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             bash_timeout_ms: 120_000,
             shell: None,
+            max_bash_output_bytes: 16 * 1024 * 1024,
             warm_shell: false,
             walk_threads: threads,
             max_cached_walks: 64,

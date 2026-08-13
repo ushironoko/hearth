@@ -136,6 +136,29 @@ fn output_without_a_trailing_newline_is_preserved_exactly() {
 }
 
 #[test]
+fn output_cap_truncates_without_deadlocking_pipe_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = hearth_core::Engine::new(hearth_core::EngineConfig {
+        default_cwd: dir.path().to_path_buf(),
+        enable_optimizer: false,
+        enable_watch: false,
+        max_bash_output_bytes: 1024,
+        ..hearth_core::EngineConfig::default()
+    });
+    let (result, chunks) = collect(
+        &eng,
+        &BashParams::new("head -c 200000 /dev/zero | tr '\\0' x; printf done 1>&2"),
+        &CancelToken::none(),
+    );
+
+    assert_eq!(result.exit_code, 0);
+    assert!(result.output_truncated);
+    assert_eq!(result.stdout.len() + result.stderr.len(), 1024);
+    let streamed: usize = chunks.iter().map(|chunk| chunk.text.len()).sum();
+    assert_eq!(streamed, 1024);
+}
+
+#[test]
 fn large_output_on_both_pipes_does_not_deadlock() {
     let dir = tempfile::tempdir().unwrap();
     for eng in [engine(dir.path()), warm_engine(dir.path())] {

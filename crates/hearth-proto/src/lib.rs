@@ -496,6 +496,10 @@ pub struct BashResult {
     /// Number of chunks emitted to the stream callback. A streaming caller can
     /// assert it observed exactly this many.
     pub chunks: u64,
+    /// True when stdout/stderr exceeded the engine's hard collection/streaming
+    /// cap. Pipes were still drained, but bytes beyond the cap were discarded.
+    #[serde(default)]
+    pub output_truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
