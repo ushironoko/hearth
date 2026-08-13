@@ -30,7 +30,10 @@ const MAX_GLOBS: usize = 256;
 const MAX_GLOB_BYTES: usize = 16 * 1024;
 const MAX_CONTEXT_LINES: u32 = 10_000;
 const MAX_MATCHES: u64 = 1_000_000;
+const DEFAULT_MAX_MATCHES: u64 = 100_000;
+const MAX_GREP_FILES: usize = 1_000_000;
 const MAX_MATCHER_CACHE_ENTRIES: usize = 256;
+const MAX_MATCHER_CACHE_KEY_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn grep(engine: &Engine, params: &GrepParams) -> ToolResult<GrepResult> {
     grep_cancellable(engine, params, &CancelToken::none())
@@ -73,6 +76,9 @@ pub fn grep_cancellable(
             };
             engine.watch_root(&root);
             let (entry, hit) = engine.walks().get(&root, key);
+            if entry.files.len() > MAX_GREP_FILES {
+                return Err(ToolError::invalid("grep file set exceeds 1000000 files"));
+            }
             let files = Arc::clone(&entry.files);
             let idx: Vec<usize> = (0..files.len())
                 .filter(|&i| glob_filter.is_match(&files[i]))
@@ -83,9 +89,8 @@ pub fn grep_cancellable(
         // If a healthy watcher covers this root and trust_watch is on, warm
         // hits skip the per-file freshness stat.
         let trust = engine.stat_free(&root);
-        let limiter = params
-            .max_total_count
-            .map(|limit| Limiter::new(indices.len(), limit));
+        let total_limit = params.max_total_count.unwrap_or(DEFAULT_MAX_MATCHES);
+        let limiter = Some(Limiter::new(indices.len(), total_limit));
         let searched = AtomicU64::new(0);
         let threads = engine.config().walk_threads.min(indices.len().max(1));
         let (tx, rx) = crossbeam_channel::unbounded::<(usize, usize)>();
@@ -154,10 +159,7 @@ pub fn grep_cancellable(
         cancel.check()?;
 
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        let limit_reached = match params.max_total_count {
-            Some(limit) => apply_total_limit(&mut files, limit, params.after_context as u64),
-            None => false,
-        };
+        let limit_reached = apply_total_limit(&mut files, total_limit, params.after_context as u64);
         let total_matches: u64 = files.iter().map(|f| f.match_count).sum();
         let files_searched = searched.load(Ordering::Relaxed);
 
@@ -341,7 +343,10 @@ impl MatcherCache {
         if let Some(existing) = self.regex.get(&key) {
             return Ok(Arc::clone(existing.value()));
         }
-        if self.regex.len() >= MAX_MATCHER_CACHE_ENTRIES {
+        if self.regex.len() >= MAX_MATCHER_CACHE_ENTRIES
+            || regex_key_bytes(&self.regex).saturating_add(key.pattern.len())
+                > MAX_MATCHER_CACHE_KEY_BYTES
+        {
             self.regex.clear();
         }
         self.regex.insert(key, Arc::clone(&m));
@@ -357,12 +362,26 @@ impl MatcherCache {
         if let Some(existing) = self.globs.get(globs) {
             return Ok(Arc::clone(existing.value()));
         }
-        if self.globs.len() >= MAX_MATCHER_CACHE_ENTRIES {
+        let key_bytes = globs.iter().map(String::len).sum::<usize>();
+        if self.globs.len() >= MAX_MATCHER_CACHE_ENTRIES
+            || glob_key_bytes(&self.globs).saturating_add(key_bytes) > MAX_MATCHER_CACHE_KEY_BYTES
+        {
             self.globs.clear();
         }
         self.globs.insert(globs.to_vec(), Arc::clone(&g));
         Ok(g)
     }
+}
+
+fn regex_key_bytes(cache: &DashMap<RegexKey, Arc<RegexMatcher>>) -> usize {
+    cache.iter().map(|entry| entry.key().pattern.len()).sum()
+}
+
+fn glob_key_bytes(cache: &DashMap<Vec<String>, Arc<GlobFilter>>) -> usize {
+    cache
+        .iter()
+        .map(|entry| entry.key().iter().map(String::len).sum::<usize>())
+        .sum()
 }
 
 fn build_matcher(params: &GrepParams) -> ToolResult<RegexMatcher> {
