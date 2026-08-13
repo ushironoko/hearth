@@ -1531,7 +1531,10 @@ fn traverse_rdeps(
             continue;
         }
         let remaining = MAX_GRAPH_RESULTS as usize - edges.len();
-        let rdeps = graph.rdeps_bounded(current.as_str(), remaining)?;
+        let rdeps = graph.rdeps_bounded(current.as_str(), remaining.saturating_add(1))?;
+        if rdeps.edges.len() > remaining {
+            return None;
+        }
         guarantee = weakest_guarantee(guarantee, rdeps.guarantee);
         for edge in rdeps.edges {
             if edges.len() >= MAX_GRAPH_RESULTS as usize {
@@ -1598,7 +1601,10 @@ fn traverse_neighborhood(
         }
 
         let remaining = MAX_GRAPH_RESULTS as usize - reached.len();
-        let rdeps = graph.rdeps_bounded(current.as_str(), remaining)?;
+        let rdeps = graph.rdeps_bounded(current.as_str(), remaining.saturating_add(1))?;
+        if rdeps.edges.len() > remaining {
+            return None;
+        }
         for edge in rdeps.edges {
             if graph_path_escapes_view(root, edge.from.as_str(), caller_view) {
                 escaped_view = true;
