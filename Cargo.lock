@@ -807,6 +807,7 @@ dependencies = [
  "compact_str 0.10.0",
  "crossbeam-channel",
  "dashmap",
+ "getrandom",
  "globset",
  "grep-matcher",
  "grep-regex",

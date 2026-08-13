@@ -99,6 +99,7 @@ bytes = "=1.12.1"
 
 # --- Errors / util ---
 thiserror = "=2.0.19"
+getrandom = "=0.4.3"
 libc = "=0.2.189"
 nix = { version = "=0.31.3", features = ["socket", "uio"] }
 clap = { version = "=4.6.4", features = ["derive"] }
