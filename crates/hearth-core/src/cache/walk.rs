@@ -32,6 +32,7 @@ struct CacheKey {
 pub struct WalkEntry {
     pub root: PathBuf,
     pub files: Arc<Vec<PathBuf>>,
+    retained_path_bytes: usize,
     last_access: AtomicU64,
 }
 
@@ -41,6 +42,7 @@ pub struct WalkCache {
     max_entries: usize,
     max_files: usize,
     max_path_bytes: usize,
+    max_resident_path_bytes: usize,
     clock: AtomicU64,
     /// Serializes insert/evict and invalidation so the count cap is restored
     /// synchronously before a mutation returns.
@@ -68,6 +70,7 @@ impl WalkCache {
             max_entries,
             max_files,
             max_path_bytes,
+            max_resident_path_bytes: max_path_bytes,
             clock: AtomicU64::new(1),
             mutation: Mutex::new(()),
         }
@@ -94,9 +97,11 @@ impl WalkCache {
         }
         crate::profiler::count("cache.walk.miss", 1);
         let files = self.build(root, opts);
+        let retained_path_bytes = files.iter().map(|path| path.as_os_str().len()).sum();
         let entry = Arc::new(WalkEntry {
             root: root.to_path_buf(),
             files: Arc::new(files),
+            retained_path_bytes,
             last_access: AtomicU64::new(0),
         });
         self.touch(&entry);
@@ -115,7 +120,14 @@ impl WalkCache {
     }
 
     fn evict_locked(&self) {
-        while self.map.len() > self.max_entries {
+        while self.map.len() > self.max_entries
+            || self
+                .map
+                .iter()
+                .map(|entry| entry.value().retained_path_bytes)
+                .sum::<usize>()
+                > self.max_resident_path_bytes
+        {
             let victim = self
                 .map
                 .iter()
