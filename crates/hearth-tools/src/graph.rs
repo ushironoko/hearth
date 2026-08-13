@@ -39,6 +39,7 @@ use xxhash_rust::xxh3::Xxh3;
 const MAX_GRAPH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_GRAPH_ROOTS: usize = 16;
 const MAX_GRAPH_RESIDENT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_GRAPH_ACTIVE_BUILDS: usize = 2;
 const MAX_RDEPS_REPAIR: usize = 256;
 const MAX_RDEPS_GREP_CANDIDATES: u64 = 1024;
 const MAX_SWEEP_PUBLISH_REBUILDS: usize = 3;
@@ -159,6 +160,7 @@ struct GraphState {
     registry: Arc<LanguageRegistry>,
     roots: DashMap<PathBuf, Arc<RootGraph>>,
     access_clock: AtomicU64,
+    active_builds: Mutex<usize>,
 }
 
 impl Default for GraphState {
@@ -169,6 +171,7 @@ impl Default for GraphState {
             registry: Arc::new(LanguageRegistry::bundled()),
             roots: DashMap::new(),
             access_clock: AtomicU64::new(1),
+            active_builds: Mutex::new(0),
         }
     }
 }
@@ -228,11 +231,33 @@ impl GraphState {
         }
     }
 
+    fn reserve_build(self: &Arc<Self>) -> ToolResult<GraphBuildPermit> {
+        let mut active = self.active_builds.lock();
+        if *active >= MAX_GRAPH_ACTIVE_BUILDS {
+            return Err(ToolError::invalid("graph build capacity is exhausted"));
+        }
+        *active += 1;
+        Ok(GraphBuildPermit {
+            graph_state: Arc::clone(self),
+        })
+    }
+
     fn estimated_bytes(&self) -> u64 {
         self.roots
             .iter()
             .map(|entry| entry.value().estimated_bytes())
             .sum()
+    }
+}
+
+struct GraphBuildPermit {
+    graph_state: Arc<GraphState>,
+}
+
+impl Drop for GraphBuildPermit {
+    fn drop(&mut self) {
+        let mut active = self.graph_state.active_builds.lock();
+        *active = active.saturating_sub(1);
     }
 }
 
@@ -490,7 +515,7 @@ struct ReadyAnswer {
 
 fn query_ready_root(
     engine: &Engine,
-    graph_state: &GraphState,
+    graph_state: &Arc<GraphState>,
     root_path: &Path,
     root: &Arc<RootGraph>,
     params: &GraphParams,
@@ -617,7 +642,7 @@ fn query_ready_root(
 #[allow(clippy::too_many_arguments)]
 fn sweep_and_answer(
     engine: &Engine,
-    graph_state: &GraphState,
+    graph_state: &Arc<GraphState>,
     root_path: &Path,
     root: &Arc<RootGraph>,
     params: &GraphParams,
@@ -626,6 +651,7 @@ fn sweep_and_answer(
     cold: bool,
 ) -> ToolResult<ReadyAnswer> {
     let started = Instant::now();
+    let _build_permit = graph_state.reserve_build()?;
     let mut cold_guard = cold.then(|| ColdBuildGuard::new(root));
     if cold {
         run_graph_test_hook(root_path, GraphTestPoint::ColdBuildStarted);
