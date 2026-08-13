@@ -173,14 +173,23 @@ impl WalkCache {
         if !self.preflight(root, opts) {
             return (Vec::new(), false);
         }
+        // A second preflight immediately before the real walk narrows mutation
+        // races. Correctness under an actively hostile concurrent filesystem is
+        // not claimed; the per-UID daemon is not a sandbox boundary.
+        if !self.preflight(root, opts) {
+            return (Vec::new(), false);
+        }
         let mut builder = WalkBuilder::new(root);
         builder
             .hidden(!opts.hidden)
             .git_ignore(opts.respect_gitignore)
-            .git_global(opts.respect_gitignore)
-            .git_exclude(opts.respect_gitignore)
+            // Parent/global/exclude rule discovery reaches outside the bounded
+            // root and cannot be pre-accounted safely. Root-local ignore files
+            // remain supported and are covered by the preflight byte budget.
+            .git_global(false)
+            .git_exclude(false)
             .ignore(opts.respect_gitignore)
-            .parents(opts.respect_gitignore)
+            .parents(false)
             .follow_links(opts.follow_symlinks)
             .threads(self.threads);
 
