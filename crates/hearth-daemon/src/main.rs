@@ -34,6 +34,9 @@ const MAX_DRAIN_TIMEOUT_MS: u64 = 60_000;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const IDLE_CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONTROL_FRAME_BYTES: u32 = 4096;
+const MAX_OVERLOAD_CONTROL_CONNECTIONS: usize = 4;
+const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const RESPONSE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(not(feature = "profiling"))]
 #[global_allocator]
@@ -289,6 +292,7 @@ fn main() -> ExitCode {
 fn run(args: Args) -> io::Result<LifecycleState> {
     validate_daemon_uid(effective_uid())?;
     let connections = ConnectionPool::new(args.max_connections)?;
+    let controls = ConnectionPool::new(MAX_OVERLOAD_CONTROL_CONNECTIONS)?;
     let frames = FrameBudget::new(args.max_in_flight_frame_bytes)?;
     let drain_timeout = validate_drain_timeout(args.drain_timeout_ms)?;
     let endpoint = match args.socket.as_deref() {
@@ -330,14 +334,18 @@ fn run(args: Args) -> io::Result<LifecycleState> {
                 }
                 let Some(permit) = connections.try_acquire() else {
                     // Keep shutdown reachable even if clients occupy every
-                    // ordinary permit. This overload lane accepts exactly one
-                    // frame and dispatches only the authenticated control
-                    // request; all data-plane operations are rejected.
+                    // ordinary permit. The overload lane is independently
+                    // bounded and uses short I/O deadlines.
+                    let Some(control_permit) = controls.try_acquire() else {
+                        drop(stream);
+                        continue;
+                    };
                     let control_lifecycle = Arc::clone(&lifecycle);
                     let control_frames = Arc::clone(&frames);
                     match std::thread::Builder::new()
                         .name("hearthd-overload-control".into())
                         .spawn(move || {
+                            let _permit = control_permit;
                             handle_overload_control(stream, control_lifecycle, control_frames);
                         }) {
                         Ok(worker) => workers.push(worker),
@@ -376,7 +384,10 @@ fn run(args: Args) -> io::Result<LifecycleState> {
     // Closing the listener is the admission boundary. Existing connection
     // threads finish the request they already admitted, then observe Draining.
     bound.stop_admitting();
-    let drained = connections.wait_for_empty(drain_timeout);
+    let start = Instant::now();
+    let data_drained = connections.wait_for_empty(drain_timeout);
+    let controls_drained = controls.wait_for_empty(drain_timeout.saturating_sub(start.elapsed()));
+    let drained = data_drained && controls_drained;
     lifecycle.finish_drain(drained);
     join_workers(workers, drained);
 
@@ -437,6 +448,11 @@ fn handle_overload_control(
     lifecycle: Arc<Lifecycle>,
     frames: Arc<FrameBudget>,
 ) {
+    if stream.set_read_timeout(Some(CONTROL_IO_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(CONTROL_IO_TIMEOUT)).is_err()
+    {
+        return;
+    }
     let mut requests =
         hearth_tools::transport::RequestReceiver::with_max_frame(&stream, CONTROL_FRAME_BYTES);
     let Ok((hello, fd)) = requests.recv_request() else {
@@ -494,6 +510,9 @@ fn handle_conn(
     lifecycle: Arc<Lifecycle>,
     frames: Arc<FrameBudget>,
 ) {
+    if stream.set_write_timeout(Some(RESPONSE_IO_TIMEOUT)).is_err() {
+        return;
+    }
     let mut writer = &stream;
     let mut requests = hearth_tools::transport::RequestReceiver::new(&stream);
     let mut negotiated = false;
@@ -565,7 +584,7 @@ fn handle_conn(
         // Zero-copy fast path: if the client passed its stdout fd with a Read,
         // write the cached content straight to that fd and return only metadata.
         let resp = if let (Some(fd), Request::Read(params)) = (fd.as_ref(), &req) {
-            stream_read(&engine, params, fd)
+            stream_read(&engine, params, fd, &lifecycle.cancel)
         } else {
             dispatch_cancellable(&engine, req, &lifecycle.cancel)
         };
@@ -576,9 +595,14 @@ fn handle_conn(
 }
 
 /// Run `read`, then write its content directly to the client-supplied fd.
-fn stream_read(engine: &Engine, params: &ReadParams, fd: &OwnedFd) -> Response {
-    match hearth_tools::read(engine, params) {
-        Ok(result) => match write_all_fd(fd.as_raw_fd(), result.content.as_bytes()) {
+fn stream_read(
+    engine: &Engine,
+    params: &ReadParams,
+    fd: &OwnedFd,
+    cancel: &CancelToken,
+) -> Response {
+    match hearth_tools::read_cancellable(engine, params, cancel) {
+        Ok(result) => match write_all_fd(fd.as_raw_fd(), result.content.as_bytes(), cancel) {
             Ok(()) => Response::Streamed(StreamedResult {
                 bytes_written: result.content.len() as u64,
                 total_lines: result.total_lines,
@@ -590,15 +614,66 @@ fn stream_read(engine: &Engine, params: &ReadParams, fd: &OwnedFd) -> Response {
 }
 
 /// Write all bytes to a raw fd without taking ownership (so it is not closed).
-fn write_all_fd(fd: i32, mut bytes: &[u8]) -> io::Result<()> {
+fn write_all_fd(fd: i32, mut bytes: &[u8], cancel: &CancelToken) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    struct RestoreFlags(i32, i32);
+    impl Drop for RestoreFlags {
+        fn drop(&mut self) {
+            // SAFETY: best-effort restoration on the still-owned descriptor.
+            unsafe { libc::fcntl(self.0, libc::F_SETFL, self.1) };
+        }
+    }
+    let _restore = RestoreFlags(fd, flags);
+    let deadline = Instant::now() + RESPONSE_IO_TIMEOUT;
     while !bytes.is_empty() {
-        // SAFETY: `bytes` is valid for its advertised length and `fd` remains
-        // borrowed/owned by the caller for the duration of this call.
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "shutdown cancelled output",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "streamed output deadline expired",
+            ));
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` points to one initialized descriptor record.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            continue;
+        }
+        if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "streamed output peer closed",
+            ));
+        }
+        // SAFETY: `bytes` is valid for its advertised length and poll reported
+        // the nonblocking borrowed fd writable for this attempt.
         let written =
             unsafe { libc::write(fd, bytes.as_ptr().cast::<std::ffi::c_void>(), bytes.len()) };
         if written < 0 {
             let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
                 continue;
             }
             return Err(error);
