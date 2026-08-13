@@ -8,11 +8,10 @@ use clap::{Args, Parser, Subcommand};
 use hearth_core::{Engine, EngineConfig};
 use hearth_proto::*;
 use hearth_tools::dispatch;
-use hearth_tools::transport::{read_msg, send_request_with_fd};
+use hearth_tools::transport::{connect_verified, read_msg, send_request_with_fd};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 const DEFAULT_GRAPH_LIMIT: u64 = 200;
@@ -376,25 +375,40 @@ fn socket_path(global: &Global) -> PathBuf {
 }
 
 fn run(global: &Global, req: Request) -> Response {
+    if global.no_daemon {
+        return dispatch_inline(req);
+    }
+
+    // Connecting and authenticating the server happen before delivery. Only a
+    // failure here is safe to fall back from: no request byte reached a daemon.
+    let stream = match connect_verified(&socket_path(global)) {
+        Ok(stream) => stream,
+        Err(_) => return dispatch_inline(req),
+    };
+
     // A read destined for stdout can be streamed: pass our stdout fd so the
     // daemon writes the content straight to it, skipping payload serialization.
-    let stream_to_stdout = matches!(req, Request::Read(_)) && !global.json;
-    if !global.no_daemon
-        && let Ok(stream) = UnixStream::connect(socket_path(global))
-    {
-        let fd = if stream_to_stdout {
-            Some(std::io::stdout().as_raw_fd())
-        } else {
-            None
-        };
-        if send_request_with_fd(&stream, &req, fd).is_ok() {
-            let mut rd = &stream;
-            if let Ok(resp) = read_msg::<_, Response>(&mut rd) {
-                return resp;
-            }
-        }
+    let fd = if matches!(req, Request::Read(_)) && !global.json {
+        Some(std::io::stdout().as_raw_fd())
+    } else {
+        None
+    };
+    if let Err(error) = send_request_with_fd(&stream, &req, fd) {
+        return Response::Error(ToolError::indeterminate(format!(
+            "daemon request delivery may have begun; request was not replayed: {error}"
+        )));
     }
-    // Inline fallback: a fresh, one-shot engine (cold).
+
+    let mut reader = &stream;
+    match read_msg::<_, Response>(&mut reader) {
+        Ok(response) => response,
+        Err(error) => Response::Error(ToolError::indeterminate(format!(
+            "daemon response was lost or invalid; request was not replayed: {error}"
+        ))),
+    }
+}
+
+fn dispatch_inline(req: Request) -> Response {
     let engine = Engine::new(EngineConfig {
         enable_optimizer: false,
         enable_watch: false,
