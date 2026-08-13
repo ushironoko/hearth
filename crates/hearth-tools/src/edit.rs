@@ -14,6 +14,7 @@ use hearth_proto::{
 use std::sync::Arc;
 
 const MAX_BATCH_EDITS: usize = 10_000;
+const MAX_DIFF_LINES: usize = 1_000_000;
 
 /// Replace `old_string` with `new_string` in a file. Without `replace_all`, the
 /// match must be unique. Operates on the cached buffer, then writes atomically.
@@ -182,13 +183,20 @@ pub fn edit_batch_cancellable(
         if diff_budget > engine.config().max_edit_result_bytes {
             return Err(ToolError::invalid("edit response exceeds byte limit"));
         }
+        let old_line_count = edit_text::split_line_count(&content);
+        let new_line_count = edit_text::split_line_count(&applied.new_content);
+        if !params.skip_diff
+            && (old_line_count > MAX_DIFF_LINES as u64 || new_line_count > MAX_DIFF_LINES as u64)
+        {
+            return Err(ToolError::invalid(
+                "edit diff exceeds 1000000 lines; pass skipDiff",
+            ));
+        }
         let (hunks, first_changed_line) = if params.skip_diff {
             (Vec::new(), None)
         } else {
             edit_text::diff_hunks(&content, &applied.new_content, params.diff_context)
         };
-        let old_line_count = edit_text::split_line_count(&content);
-        let new_line_count = edit_text::split_line_count(&applied.new_content);
 
         // Restore the file's own byte conventions only at the very end, so
         // matching and diffing both ran over one canonical representation.
