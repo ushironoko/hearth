@@ -24,7 +24,10 @@ pub fn read_bytes_cancellable(
         cancel.check()?;
         let path = resolve_path(engine, &params.path);
         let trust = engine.stat_free(&path);
-        let (entry, _hit) = engine.files().get_trusting(&path, trust)?;
+        let (entry, _hit) = engine
+            .files()
+            .get_bounded_trusting(&path, engine.config().max_tool_file_bytes, trust)?
+            .ok_or_else(|| ToolError::invalid("file exceeds read byte limit"))?;
         cancel.check()?;
         Ok(entry.bytes().to_vec())
     })
@@ -45,7 +48,10 @@ pub fn read_cancellable(
         cancel.check()?;
         let path = resolve_path(engine, &params.path);
         let trust = engine.stat_free(&path);
-        let (entry, cache_hit) = engine.files().get_trusting(&path, trust)?;
+        let (entry, cache_hit) = engine
+            .files()
+            .get_bounded_trusting(&path, engine.config().max_tool_file_bytes, trust)?
+            .ok_or_else(|| ToolError::invalid("file exceeds read byte limit"))?;
         cancel.check()?;
 
         let idx = entry.line_index();

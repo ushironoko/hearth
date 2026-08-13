@@ -13,6 +13,8 @@ use hearth_proto::{
 };
 use std::sync::Arc;
 
+const MAX_BATCH_EDITS: usize = 10_000;
+
 /// Replace `old_string` with `new_string` in a file. Without `replace_all`, the
 /// match must be unique. Operates on the cached buffer, then writes atomically.
 pub fn edit(engine: &Engine, params: &EditParams) -> ToolResult<EditResult> {
@@ -41,7 +43,10 @@ pub fn edit_cancellable(
         let _guard = engine.lock_path(&path);
         cancel.check()?;
 
-        let (entry, _hit) = engine.files().get(&path)?;
+        let (entry, _hit) = engine
+            .files()
+            .get_bounded(&path, engine.config().max_tool_file_bytes)?
+            .ok_or_else(|| ToolError::invalid("file exceeds edit byte limit"))?;
 
         // Editing requires valid UTF-8; refuse binary/invalid content.
         let text = std::str::from_utf8(entry.bytes()).map_err(|_| {
@@ -62,6 +67,14 @@ pub fn edit_cancellable(
             .with_path(params.path.clone()));
         }
 
+        let replacements = if params.replace_all { count } else { 1 };
+        validate_result_size(
+            text.len(),
+            params.old_string.len(),
+            params.new_string.len(),
+            replacements,
+            engine.config().max_edit_result_bytes,
+        )?;
         let (new_text, replacements) = if params.replace_all {
             (
                 text.replace(&params.old_string, &params.new_string),
@@ -106,13 +119,19 @@ pub fn edit_batch_cancellable(
                 "edits must contain at least one replacement",
             ));
         }
+        if params.edits.len() > MAX_BATCH_EDITS {
+            return Err(ToolError::invalid("edit batch exceeds 10000 replacements"));
+        }
 
         let requested = resolve_path(engine, &params.path);
         let (path, followed_symlink) = resolve_write_target(&requested, params.follow_symlinks);
         let _guard = engine.lock_path(&path);
         cancel.check()?;
 
-        let (entry, _hit) = engine.files().get(&path)?;
+        let (entry, _hit) = engine
+            .files()
+            .get_bounded(&path, engine.config().max_tool_file_bytes)?
+            .ok_or_else(|| ToolError::invalid("file exceeds edit byte limit"))?;
         let raw = std::str::from_utf8(entry.bytes()).map_err(|_| {
             ToolError::new(ErrorKind::InvalidInput, "file is not valid UTF-8")
                 .with_path(params.path.clone())
@@ -130,6 +149,15 @@ pub fn edit_batch_cancellable(
         // common case matches and diffs without copying the file at all. `entry`
         // is held until the commit for exactly that reason.
         let content = edit_text::normalize_to_lf(without_bom);
+
+        let added = params
+            .edits
+            .iter()
+            .try_fold(0usize, |total, edit| total.checked_add(edit.new_text.len()))
+            .ok_or_else(|| ToolError::invalid("edit result size overflow"))?;
+        if content.len().saturating_add(added) > engine.config().max_edit_result_bytes {
+            return Err(ToolError::invalid("edit result exceeds byte limit"));
+        }
 
         cancel.check()?;
         let applied = edit_text::apply_edits_opts(
@@ -149,7 +177,15 @@ pub fn edit_batch_cancellable(
 
         // Restore the file's own byte conventions only at the very end, so
         // matching and diffing both ran over one canonical representation.
-        let mut final_text = String::with_capacity(applied.new_content.len() + 3);
+        let final_capacity = applied
+            .new_content
+            .len()
+            .checked_add(3)
+            .ok_or_else(|| ToolError::invalid("edit result size overflow"))?;
+        if final_capacity > engine.config().max_edit_result_bytes {
+            return Err(ToolError::invalid("edit result exceeds byte limit"));
+        }
+        let mut final_text = String::with_capacity(final_capacity);
         if had_bom {
             final_text.push('\u{FEFF}');
         }
@@ -177,6 +213,29 @@ pub fn edit_batch_cancellable(
             original_content,
         })
     })
+}
+
+fn validate_result_size(
+    original: usize,
+    old_len: usize,
+    new_len: usize,
+    replacements: usize,
+    limit: usize,
+) -> ToolResult<()> {
+    let removed = old_len
+        .checked_mul(replacements)
+        .ok_or_else(|| ToolError::invalid("edit result size overflow"))?;
+    let added = new_len
+        .checked_mul(replacements)
+        .ok_or_else(|| ToolError::invalid("edit result size overflow"))?;
+    let result = original
+        .checked_sub(removed)
+        .and_then(|size| size.checked_add(added))
+        .ok_or_else(|| ToolError::invalid("edit result size overflow"))?;
+    if result > limit {
+        return Err(ToolError::invalid("edit result exceeds byte limit"));
+    }
+    Ok(())
 }
 
 /// Attach the caller's path to an error raised by the text layer, which only
