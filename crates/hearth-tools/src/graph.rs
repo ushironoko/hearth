@@ -1470,6 +1470,9 @@ fn traverse_deps(
         let deps = graph.deps(current.as_str())?;
         guarantee = weakest_guarantee(guarantee, deps.guarantee);
         for edge in deps.edges {
+            if edges.len() >= MAX_GRAPH_RESULTS as usize {
+                return None;
+            }
             if let EdgeTargetOwned::Path(target) = &edge.to {
                 if graph_path_escapes_view(root, target.as_str(), caller_view) {
                     escaped_view = true;
@@ -1530,6 +1533,9 @@ fn traverse_rdeps(
         let rdeps = graph.rdeps(current.as_str())?;
         guarantee = weakest_guarantee(guarantee, rdeps.guarantee);
         for edge in rdeps.edges {
+            if edges.len() >= MAX_GRAPH_RESULTS as usize {
+                return None;
+            }
             if graph_path_escapes_view(root, edge.from.as_str(), caller_view) {
                 escaped_view = true;
                 continue;
@@ -1582,6 +1588,9 @@ fn traverse_neighborhood(
                 escaped_view = true;
                 continue;
             }
+            if reached.len() >= MAX_GRAPH_RESULTS as usize {
+                return None;
+            }
             if reached.insert(target.clone()) {
                 queue.push_back((target, distance + 1));
             }
@@ -1592,6 +1601,9 @@ fn traverse_neighborhood(
             if graph_path_escapes_view(root, edge.from.as_str(), caller_view) {
                 escaped_view = true;
                 continue;
+            }
+            if reached.len() >= MAX_GRAPH_RESULTS as usize {
+                return None;
             }
             if reached.insert(edge.from.clone()) {
                 queue.push_back((edge.from, distance + 1));
@@ -1609,14 +1621,23 @@ fn traverse_neighborhood(
         if depth == 0 {
             continue;
         }
-        edges.extend(deps.edges.into_iter().filter_map(|edge| {
-            let EdgeTargetOwned::Path(target) = &edge.to else {
-                return None;
-            };
-            reached
-                .contains(target.as_str())
-                .then_some((edge, deps.guarantee))
-        }));
+        if edges.len() >= MAX_GRAPH_RESULTS as usize {
+            return None;
+        }
+        let remaining = MAX_GRAPH_RESULTS as usize - edges.len();
+        edges.extend(
+            deps.edges
+                .into_iter()
+                .filter_map(|edge| {
+                    let EdgeTargetOwned::Path(target) = &edge.to else {
+                        return None;
+                    };
+                    reached
+                        .contains(target.as_str())
+                        .then_some((edge, deps.guarantee))
+                })
+                .take(remaining),
+        );
     }
     if depth != 0 {
         guarantee = weakest_guarantee(guarantee, graph.rdeps(path)?.guarantee);
@@ -2487,6 +2508,7 @@ fn definitions_result(
                 .as_ref()
                 .is_none_or(|allowed| allowed.contains(found.path))
         })
+        .take(limit.saturating_add(1))
         .filter_map(|found| {
             let hash = state.index.file_hash(found.path)?;
             Some(graph_symbol(root, found.path, hash, found.symbol))
