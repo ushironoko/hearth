@@ -182,7 +182,9 @@ impl WalkCache {
         let mut builder = WalkBuilder::new(root);
         builder
             .hidden(!opts.hidden)
-            .git_ignore(opts.respect_gitignore)
+            // `ignore` resolves .gitignore through ancestor repositories even
+            // with parents(false), which cannot be bounded to this root.
+            .git_ignore(false)
             // Parent/global/exclude rule discovery reaches outside the bounded
             // root and cannot be pre-accounted safely. Root-local ignore files
             // remain supported and are covered by the preflight byte budget.
@@ -262,15 +264,16 @@ impl WalkCache {
                     return false;
                 }
                 let name = entry.file_name();
-                if matches!(
-                    name.to_str(),
-                    Some(".gitignore" | ".ignore" | ".rgignore" | ".git-blame-ignore-revs")
-                ) {
-                    ignore_bytes = ignore_bytes.saturating_add(
-                        entry
-                            .metadata()
-                            .map_or(MAX_IGNORE_BYTES + 1, |meta| meta.len()),
-                    );
+                if matches!(name.to_str(), Some(".ignore" | ".rgignore")) {
+                    let metadata = std::fs::symlink_metadata(&path).ok();
+                    if metadata
+                        .as_ref()
+                        .is_none_or(|meta| !meta.file_type().is_file())
+                    {
+                        return false;
+                    }
+                    ignore_bytes = ignore_bytes
+                        .saturating_add(metadata.map_or(MAX_IGNORE_BYTES + 1, |meta| meta.len()));
                     if ignore_bytes > MAX_IGNORE_BYTES {
                         return false;
                     }

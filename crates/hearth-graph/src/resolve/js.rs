@@ -23,6 +23,7 @@ use super::{
 use crate::imports::{ImportKind, RawImport};
 
 const MAX_TSCONFIG_BYTES: usize = 1024 * 1024;
+const MAX_RESOLVER_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TSCONFIG_EXTENDS_ENTRIES: usize = 32;
 const MAX_TSCONFIG_EXTENDS_VISITS: usize = 256;
 
@@ -716,11 +717,19 @@ impl FileSystem for SharedFileSystem {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_RESOLVER_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resolver config must be a regular file no larger than 1 MiB",
+            ));
+        }
         self.0.read(path)
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
-        self.0.read_to_string(path)
+        let bytes = self.read(path)?;
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     fn metadata(&self, path: &Path) -> io::Result<oxc_resolver::FileMetadata> {
