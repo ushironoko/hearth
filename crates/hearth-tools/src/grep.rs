@@ -32,6 +32,7 @@ const MAX_CONTEXT_LINES: u32 = 10_000;
 const MAX_MATCHES: u64 = 1_000_000;
 const DEFAULT_MAX_MATCHES: u64 = 100_000;
 const MAX_GREP_FILES: usize = 1_000_000;
+const MAX_GREP_SEARCH_HEAP_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MATCHER_CACHE_ENTRIES: usize = 256;
 const MAX_MATCHER_CACHE_KEY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -420,6 +421,7 @@ fn build_searcher(params: &GrepParams) -> Searcher {
         .before_context(params.before_context as usize)
         .after_context(params.after_context as usize)
         .binary_detection(BinaryDetection::quit(0))
+        .heap_limit(Some(MAX_GREP_SEARCH_HEAP_BYTES))
         .build()
 }
 

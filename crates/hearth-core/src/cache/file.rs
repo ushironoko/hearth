@@ -15,6 +15,7 @@ use dashmap::DashMap;
 use hearth_proto::ToolError;
 use parking_lot::Mutex;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -331,7 +332,11 @@ impl FileCache {
             self.touch(entry.value());
             return Ok(Some((Arc::clone(entry.value()), true)));
         }
-        let mut file = std::fs::File::open(path).map_err(|e| map_io(e, path))?;
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+        let mut file = options.open(path).map_err(|e| map_io(e, path))?;
         let meta = file.metadata().map_err(|e| map_io(e, path))?;
         if !meta.is_file() {
             return Err(

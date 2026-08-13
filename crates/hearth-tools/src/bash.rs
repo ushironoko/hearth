@@ -104,7 +104,11 @@ pub fn bash_stream(
         // A pooled shell inherited the daemon environment before this call, so
         // it cannot truthfully implement env_clear. Route such calls through
         // the fresh-spawn path, where Command::env_clear is authoritative.
-        if engine.config().warm_shell && !params.env_clear {
+        let warm_compatible = spec.program == "/bin/sh"
+            && spec.transport == ShellTransport::Arg
+            && spec.args == ["-c"]
+            && params.command.len() <= 4096;
+        if engine.config().warm_shell && !params.env_clear && warm_compatible {
             let pool = engine.extension::<WarmShellPool>();
             let dispatch = pool.run(
                 &spec.program,
