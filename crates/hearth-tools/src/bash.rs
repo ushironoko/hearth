@@ -38,6 +38,7 @@ const CANCEL_POLL: Duration = Duration::from_millis(10);
 
 /// How long to wait for a killed process group to be reaped before giving up.
 const REAP_GRACE: Duration = Duration::from_secs(5);
+const MAX_WARM_SHELL_CONTEXT_BYTES: usize = 1024 * 1024;
 
 /// Maximum caller-selectable command timeout. Long builds remain supported,
 /// while hostile `u64::MAX` input can never overflow `Instant` arithmetic or
@@ -104,10 +105,18 @@ pub fn bash_stream(
         // A pooled shell inherited the daemon environment before this call, so
         // it cannot truthfully implement env_clear. Route such calls through
         // the fresh-spawn path, where Command::env_clear is authoritative.
+        let warm_context_bytes = cwd.len().saturating_add(
+            params
+                .env
+                .iter()
+                .map(|(key, value)| key.len().saturating_add(value.len()))
+                .sum::<usize>(),
+        );
         let warm_compatible = spec.program == "/bin/sh"
             && spec.transport == ShellTransport::Arg
             && spec.args == ["-c"]
-            && params.command.len() <= 4096;
+            && params.command.len() <= 4096
+            && warm_context_bytes <= MAX_WARM_SHELL_CONTEXT_BYTES;
         if engine.config().warm_shell && !params.env_clear && warm_compatible {
             let pool = engine.extension::<WarmShellPool>();
             let dispatch = pool.run(

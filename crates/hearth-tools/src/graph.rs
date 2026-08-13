@@ -1933,7 +1933,7 @@ fn sort_rdep_entries(entries: &mut [GraphRdepEntry]) {
 #[allow(clippy::too_many_arguments)]
 fn verify_rdeps_query(
     engine: &Engine,
-    graph_state: &GraphState,
+    graph_state: &Arc<GraphState>,
     root_path: &Path,
     root: &Arc<RootGraph>,
     params: &GraphParams,
@@ -2064,7 +2064,7 @@ fn verify_rdeps_query(
 #[allow(clippy::too_many_arguments)]
 fn run_rdeps_repair(
     engine: &Engine,
-    graph_state: &GraphState,
+    graph_state: &Arc<GraphState>,
     root_path: &Path,
     root: &Arc<RootGraph>,
     params: &GraphParams,
@@ -2073,6 +2073,7 @@ fn run_rdeps_repair(
     cancel: &CancelToken,
 ) -> ToolResult<RdepsRepairOutcome> {
     run_graph_test_hook(root_path, GraphTestPoint::RdepsRepairStarted);
+    let _repair_permit = graph_state.reserve_build()?;
     let RdepsGrepCandidates {
         candidates,
         limit_reached,
@@ -2081,6 +2082,7 @@ fn run_rdeps_repair(
     let mut approximate_entries = Vec::new();
     let mut prepared = Vec::new();
     let mut repaired = 0_usize;
+    let mut repair_bytes = 0usize;
     let mut repair_truncated = limit_reached;
     let mut generation_changed = false;
     let mut view_excluded = false;
@@ -2159,6 +2161,12 @@ fn run_rdeps_repair(
             entry.content_hash(),
             &mut parser_pool,
         );
+        let bytes = entry.bytes().len();
+        if bytes > MAX_GRAPH_BUILD_BYTES.saturating_sub(repair_bytes) {
+            repair_truncated = true;
+            break;
+        }
+        repair_bytes += bytes;
         if analysis.language.is_none() {
             approximate_entries.push(approximate_rdep_entry(root_path, root, &candidate));
             continue;
@@ -2244,17 +2252,12 @@ fn rdeps_grep_candidates(
         candidates: grep
             .files
             .into_iter()
-            .map(|hit| {
-                let line = hit
-                    .lines
-                    .iter()
-                    .find(|line| line.is_match)
-                    .expect("content-mode grep hits contain a matching line")
-                    .line_number;
-                RdepsGrepCandidate {
+            .filter_map(|hit| {
+                let line = hit.lines.iter().find(|line| line.is_match)?.line_number;
+                Some(RdepsGrepCandidate {
                     path: PathBuf::from(hit.path),
                     line,
-                }
+                })
             })
             .collect(),
         limit_reached: grep.limit_reached,

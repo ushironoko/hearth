@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 const MAX_BATCH_EDITS: usize = 10_000;
 const MAX_DIFF_LINES: usize = 1_000_000;
+const MAX_NORMALIZED_INPUT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Replace `old_string` with `new_string` in a file. Without `replace_all`, the
 /// match must be unique. Operates on the cached buffer, then writes atomically.
@@ -122,6 +123,14 @@ pub fn edit_batch_cancellable(
         }
         if params.edits.len() > MAX_BATCH_EDITS {
             return Err(ToolError::invalid("edit batch exceeds 10000 replacements"));
+        }
+        if params.edits.iter().any(|edit| {
+            edit.old_text.len() > MAX_NORMALIZED_INPUT_BYTES
+                || edit.new_text.len() > MAX_NORMALIZED_INPUT_BYTES
+        }) {
+            return Err(ToolError::invalid(
+                "edit normalized input exceeds 8 MiB per replacement",
+            ));
         }
         let requested = resolve_path(engine, &params.path);
         let (path, followed_symlink) = resolve_write_target(&requested, params.follow_symlinks);

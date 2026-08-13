@@ -47,6 +47,7 @@ pub struct WalkCache {
     /// Serializes insert/evict and invalidation so the count cap is restored
     /// synchronously before a mutation returns.
     mutation: Mutex<()>,
+    generation: AtomicU64,
 }
 
 impl WalkCache {
@@ -73,6 +74,7 @@ impl WalkCache {
             max_resident_path_bytes: max_path_bytes,
             clock: AtomicU64::new(1),
             mutation: Mutex::new(()),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -96,6 +98,7 @@ impl WalkCache {
             return (Arc::clone(entry.value()), true);
         }
         crate::profiler::count("cache.walk.miss", 1);
+        let generation = self.generation.load(Ordering::Acquire);
         let files = self.build(root, opts);
         let retained_path_bytes = files.iter().map(|path| path.as_os_str().len()).sum();
         let entry = Arc::new(WalkEntry {
@@ -107,6 +110,9 @@ impl WalkCache {
         self.touch(&entry);
 
         let _mutation = self.mutation.lock();
+        if self.generation.load(Ordering::Acquire) != generation {
+            return (entry, false);
+        }
         if self.max_entries == 0 {
             return (entry, false);
         }
@@ -204,6 +210,7 @@ impl WalkCache {
     /// number of entries dropped.
     pub fn invalidate_under(&self, path: &Path) -> usize {
         let _mutation = self.mutation.lock();
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let before = self.map.len();
         self.map
             .retain(|k, _| !path.starts_with(&k.root) && !k.root.starts_with(path));
@@ -213,6 +220,7 @@ impl WalkCache {
     /// Drop every cached walk. Returns the number of entries removed.
     pub fn clear(&self) -> usize {
         let _mutation = self.mutation.lock();
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let n = self.map.len();
         self.map.clear();
         n
