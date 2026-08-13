@@ -76,11 +76,7 @@ pub fn dispatch(engine: &Engine, req: hearth_proto::Request) -> hearth_proto::Re
             p.recursive,
             p.scope,
         )),
-        Request::ClearCaches => {
-            let result = engine.clear_caches();
-            graph::graph_clear(engine);
-            Response::Invalidate(result)
-        }
+        Request::ClearCaches => Response::Invalidate(engine.clear_caches()),
         Request::Ping => Response::Pong,
         Request::Stats => Response::Stats(engine.profiler_report()),
         Request::Shutdown => Response::ShuttingDown,

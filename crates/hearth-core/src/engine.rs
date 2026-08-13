@@ -319,13 +319,32 @@ impl Engine {
         result
     }
 
-    /// Drop every cached file and walk.
-    pub fn clear_caches(&self) -> InvalidateResult {
+    /// Drop filesystem-derived file and walk state across every root.
+    ///
+    /// Bash uses this conservative reset because an unrestricted command can
+    /// mutate outside cwd. It deliberately preserves non-filesystem extensions
+    /// such as the warm-shell pool; tool-owned graph state is detached by the
+    /// tool layer alongside this call.
+    pub fn clear_filesystem_caches(&self) -> InvalidateResult {
         let result = InvalidateResult {
             files_invalidated: self.inner.files.clear() as u64,
             walks_invalidated: self.inner.walks.clear() as u64,
         };
         self.inner.invalidations.record_wipe();
+        result
+    }
+
+    /// Drop all resident cache state owned by this engine.
+    ///
+    /// Besides filesystem entries this detaches tool extensions (compiled
+    /// matchers, graph roots, warm shells, and path-lock registries) and stops
+    /// the current watcher. Active callers may keep an already-cloned Arc until
+    /// they settle, but future calls start from empty state. Watching restarts
+    /// lazily on the next `watch_root` call.
+    pub fn clear_caches(&self) -> InvalidateResult {
+        let result = self.clear_filesystem_caches();
+        self.inner.extensions.clear();
+        self.inner.watch.lock().take();
         result
     }
 

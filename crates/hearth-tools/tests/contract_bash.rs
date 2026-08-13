@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{engine, warm_engine};
+use common::{engine, trusting_engine, warm_engine};
 use hearth_core::CancelToken;
 use hearth_proto::*;
 use hearth_tools::{bash, bash_cancellable, bash_stream};
@@ -46,6 +46,58 @@ fn wait_for_exit(pid: i32, limit: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn dispatched_bash_globally_invalidates_trusted_file_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = trusting_engine(dir.path());
+    let inside = dir.path().join("inside.txt");
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("outside.txt");
+    std::fs::write(&inside, "old-inside").unwrap();
+    std::fs::write(&outside, "old-outside").unwrap();
+
+    for path in [&inside, &outside] {
+        hearth_tools::read(&eng, &ReadParams::new(path.display().to_string())).unwrap();
+    }
+    assert_eq!(eng.files().len(), 2);
+
+    let command = format!(
+        "printf new-inside > '{}'; printf new-outside > '{}'",
+        inside.display(),
+        outside.display()
+    );
+    bash(&eng, &BashParams::new(command)).unwrap();
+
+    assert_eq!(
+        eng.files().len(),
+        0,
+        "Bash must clear cwd-external state too"
+    );
+    let inside_read =
+        hearth_tools::read(&eng, &ReadParams::new(inside.display().to_string())).unwrap();
+    let outside_read =
+        hearth_tools::read(&eng, &ReadParams::new(outside.display().to_string())).unwrap();
+    assert_eq!(inside_read.content, "new-inside");
+    assert_eq!(outside_read.content, "new-outside");
+}
+
+#[test]
+fn a_pre_cancelled_bash_preserves_caches_because_nothing_was_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = trusting_engine(dir.path());
+    let path = dir.path().join("cached.txt");
+    std::fs::write(&path, "cached").unwrap();
+    hearth_tools::read(&eng, &ReadParams::new(path.display().to_string())).unwrap();
+    assert_eq!(eng.files().len(), 1);
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let err = bash_cancellable(&eng, &BashParams::new("exit 0"), &cancel).unwrap_err();
+
+    assert_eq!(err.kind, ErrorKind::Cancelled);
+    assert_eq!(eng.files().len(), 1);
 }
 
 #[test]

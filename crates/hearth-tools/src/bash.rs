@@ -72,6 +72,11 @@ pub fn bash_stream(
 ) -> ToolResult<BashResult> {
     profile!("tool.bash", {
         cancel.check()?;
+        // An unrestricted command can mutate any path reachable by this UID,
+        // not merely cwd. Once this call is admitted, conservatively discard
+        // every filesystem-derived cache even on timeout, cancellation,
+        // indeterminate completion, spawn failure, or unwind.
+        let _invalidate = BashInvalidation(engine);
         let cwd = params
             .cwd
             .clone()
@@ -122,6 +127,16 @@ pub fn bash_stream(
         let exit = spawn_bash(&spec, &cwd, params, timeout, cancel, &mut emitter)?;
         Ok(emitter.finish(exit.code, exit.signal, exit.timed_out, exit.aborted, start))
     })
+}
+
+/// Clears filesystem-derived resident state when an admitted Bash call exits.
+struct BashInvalidation<'a>(&'a Engine);
+
+impl Drop for BashInvalidation<'_> {
+    fn drop(&mut self) {
+        self.0.clear_filesystem_caches();
+        crate::graph::graph_clear(self.0);
+    }
 }
 
 /// Accumulates output and hands it to the caller as ordered chunks.
