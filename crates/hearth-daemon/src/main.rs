@@ -19,7 +19,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -581,17 +581,55 @@ fn handle_conn(
             lifecycle.begin_draining();
         }
 
+        let request_cancel = CancelToken::new();
+        let monitor_stop = Arc::new(AtomicBool::new(false));
+        let monitor =
+            start_disconnect_monitor(&stream, &request_cancel, &lifecycle.cancel, &monitor_stop);
         // Zero-copy fast path: if the client passed its stdout fd with a Read,
         // write the cached content straight to that fd and return only metadata.
         let resp = if let (Some(fd), Request::Read(params)) = (fd.as_ref(), &req) {
-            stream_read(&engine, params, fd, &lifecycle.cancel)
+            stream_read(&engine, params, fd, &request_cancel)
         } else {
-            dispatch_cancellable(&engine, req, &lifecycle.cancel)
+            dispatch_cancellable(&engine, req, &request_cancel)
         };
+        monitor_stop.store(true, Ordering::Release);
+        let _ = monitor.join();
         if write_msg(&mut writer, &resp).is_err() || is_shutdown {
             break;
         }
     }
+}
+
+fn start_disconnect_monitor(
+    stream: &UnixStream,
+    cancel: &CancelToken,
+    shutdown: &CancelToken,
+    stop: &Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let fd = stream.as_raw_fd();
+    let cancel = cancel.clone();
+    let shutdown = shutdown.clone();
+    let stop = Arc::clone(stop);
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) && !cancel.is_cancelled() {
+            if shutdown.is_cancelled() {
+                cancel.cancel();
+                break;
+            }
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            };
+            // SAFETY: the connection thread joins this monitor before dropping
+            // the stream, so `fd` remains valid throughout polling.
+            let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
+            if ready > 0 && pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                cancel.cancel();
+                break;
+            }
+        }
+    })
 }
 
 /// Run `read`, then write its content directly to the client-supplied fd.
