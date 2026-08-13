@@ -3,6 +3,15 @@
 - 対象: `hearth` commit `fbf85e8`
 - 対象コンポーネント: `hearth-daemon`、daemon transport、daemon から到達可能な `hearth-tools` / `hearth-core` / `hearth-graph`
 - 監査方式: ソース追跡、脅威モデリング、既存テスト/CI確認、Codex による独立観点の並列レビュー
+- 修正追跡: `security/hearth-hardening` branch。各 finding の「確認済み」は監査時点を示し、修正 commit と regression test が付くまで解消扱いにしない。
+
+### Remediation log
+
+| Commit | 対象 | 検証 |
+|---|---|---|
+| `39a4960` | HD-08/HD-10 の secure temp 部分: CSPRNG 名、exclusive/no-follow/CLOEXEC、初期 0600、identity-safe cleanup/publish、permission failure fatal、write/symlink matrix | `cargo test -p hearth-tools --no-fail-fast`; `cargo clippy -p hearth-tools --all-targets -- -D warnings` |
+
+未完了 finding は引き続き open である。特に transport、endpoint、resource caps、Bash/cache、shutdown は後続 commit と adversarial test の証拠が必要。
 
 ## 1. 結論
 
@@ -71,6 +80,7 @@ peer UID、private directory、socket `0600` は主に別UIDを防ぐ対策で�
 4. **passiveなmalicious repository/content**: 巨大tree/file、静的symlink、parser/watcher負荷、意図しないroot外参照を誘発する。
 5. **active filesystem attacker**: target directoryでtemp作成、symlink swap、renameを並行実行する。HD-08/HD-10のrace成立にはこの能力が必要である。
 6. **偽 daemon**: CLI request を取得し、偽 response を返し、渡された stdout FD を保持・書き込む。
+7. **LLM または LLM 制御 adapter**: 敵対意思がなくても、巨大な数値/vector/string、誤った path、長時間 command、並列burst、結果不明のmutation再試行を生成し得る低信頼client。daemon内部のhard limitと、adapterのallowed root/operation/environment/approval policyの両方が必要。
 
 同一 UID 攻撃は一般には「権限昇格」ではない。ただし daemon が root/別 UID、より強い sandbox entitlement、秘密を含む環境、別 workspace の state を持つ場合は、実質的な権限境界の破壊になる。
 

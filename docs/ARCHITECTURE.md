@@ -421,6 +421,30 @@ stat records. A wipe makes it discard every stat record and revalidate the
 whole selected universe, so missing history cannot leave a stale graph entry
 trusted.
 
+## Security and authority model
+
+The daemon is a same-UID performance component, not a privilege, tenant, or
+workspace boundary. Its single predictable endpoint per UID is deliberate: one
+warm engine can serve that user's repositories. Consequently any accepted
+client can request operations against every path and command available to that
+UID. The daemon must not run as root, a more privileged service identity, or a
+multi-tenant/shared service. Endpoint DAC and peer credentials exclude other
+UIDs; they do not defend against a compromised same-UID process.
+
+An LLM or LLM-controlled adapter is an untrusted protocol-input source even
+when the model is benign: extreme sizes, invented paths, long Bash commands,
+parallel bursts, and non-idempotent retry are expected failure modes. The
+adapter, not this warm-cache engine, owns least-authority policy: allowed
+lexical roots and resolved symlink targets, operation grants, environment
+allowlists, budgets, and human approval. Direct unrestricted daemon access is
+equivalent to the OS user's read/write/execute authority.
+
+The CLI's delivery contract is at-most-once. It may fall back inline only before
+any request byte could have reached the daemon. A later transport failure is
+indeterminate and is never replayed. FD-streamed Read can have emitted a valid
+partial prefix before such a failure; the contract is non-duplication, not
+atomic stdout.
+
 ## Surfaces
 
 * **Daemon/CLI**: length-prefixed msgpack (`transport.rs`) over a Unix socket.
@@ -456,9 +480,14 @@ trusted.
   opt-in for callers that own their workspace.
 * **Cooperative, not preemptive, cancellation** — a mutation always finishes or
   never starts, rather than being interrupted somewhere in between.
-* **No automatic invalidation after `bash`** — the adapter knows the blast
-  radius; guessing it in the engine would either be unsound or drop the whole
-  cache on every command.
+* **Global filesystem-derived invalidation after unrestricted `bash`** — a
+  command can leave cwd, use absolute paths, or follow symlinks, so cwd-only
+  invalidation is unsound. A narrower write set requires a future enforced
+  sandbox/declared-write protocol.
+* **Tracked process groups, not a portable descendant sandbox** — timeout and
+  shutdown terminate/reap groups Hearth owns. A descendant that deliberately
+  double-forks and creates a new session can escape POSIX process-group
+  tracking; preventing that requires an external sandbox/service manager.
 * **One engine per process, not shared across processes** — the caches are
   in-process memory; sharing them would mean re-introducing the daemon's IPC cost
   on the path where Hearth is fastest.

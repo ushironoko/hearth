@@ -38,6 +38,25 @@ Three surfaces, one core:
 Full design in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); full benchmark
 methodology in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
+### Security model for agents and LLM clients
+
+`hearthd` is a same-user performance service, **not** a privilege, tenant, or
+workspace boundary. A client that can reach it can request every operation the
+daemon's OS user can perform, including arbitrary paths and shell commands. Do
+not run it as root, under a more privileged UID, or as a shared service.
+
+An LLM is an untrusted input producer even when it is not malicious: it can
+invent paths, emit extreme numeric/vector values, retry ambiguous mutations,
+launch long-running commands, and create parallel load. An adapter that exposes
+Hearth to an LLM must enforce allowed roots and operations, environment
+allowlists, request/output/deadline budgets, and approval for Bash or mutations
+where appropriate. Without those controls, the LLM deliberately has the OS
+user's read/write/execute authority and can reach daemon-inherited secrets.
+
+See [`SECURITY.md`](SECURITY.md) for deployment requirements and
+[`docs/SECURITY_AUDIT_HEARTHD.md`](docs/SECURITY_AUDIT_HEARTHD.md) for the
+source-level threat model and remediation status.
+
 ---
 
 ## Why Hearth
@@ -185,7 +204,10 @@ bun  bench/harness/bun/compare.js          # fair vs Bun fs
 ./target/release/hearth  --socket /tmp/hearth.sock stop
 ```
 
-The CLI falls back to an in-process (cold) engine when no daemon is reachable.
+The CLI falls back to an in-process (cold) engine only when it cannot connect
+or can prove no request byte was sent. Once delivery may have begun it returns
+an indeterminate error instead of replaying the operation. A streamed read may
+already have emitted a partial, non-duplicated prefix in that case.
 
 **Node.js** (where read/grep/edit win in-process):
 
