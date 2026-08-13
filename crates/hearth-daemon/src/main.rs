@@ -14,7 +14,7 @@ use hearth_tools::dispatch_cancellable;
 use hearth_tools::transport::{
     effective_uid, prepare_default_endpoint, validate_endpoint_path, verify_peer_uid, write_msg,
 };
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -37,6 +37,47 @@ const CONTROL_FRAME_BYTES: u32 = 4096;
 const MAX_OVERLOAD_CONTROL_CONNECTIONS: usize = 4;
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const RESPONSE_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct DeadlineWriter<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl DeadlineWriter<'_> {
+    fn new(stream: &UnixStream, timeout: Duration) -> DeadlineWriter<'_> {
+        DeadlineWriter {
+            stream,
+            deadline: Instant::now() + timeout,
+        }
+    }
+}
+
+impl Write for DeadlineWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "response frame deadline expired",
+                ));
+            }
+            self.stream.set_write_timeout(Some(remaining))?;
+            match self.stream.write(bytes) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_response(stream: &UnixStream, response: &Response, timeout: Duration) -> io::Result<()> {
+    write_msg(&mut DeadlineWriter::new(stream, timeout), response)
+}
 
 #[cfg(not(feature = "profiling"))]
 #[global_allocator]
@@ -459,23 +500,24 @@ fn handle_overload_control(
         return;
     };
     drop(fd);
-    let mut writer = &stream;
     if !matches!(
         hello,
         Request::Hello(hearth_proto::ProtocolHello { version })
             if version == hearth_proto::PROTOCOL_VERSION
     ) {
-        let _ = write_msg(
-            &mut writer,
+        let _ = write_response(
+            &stream,
             &Response::Error(ToolError::invalid("compatible protocol hello required")),
+            CONTROL_IO_TIMEOUT,
         );
         return;
     }
-    if write_msg(
-        &mut writer,
+    if write_response(
+        &stream,
         &Response::Hello(hearth_proto::ProtocolAck {
             version: hearth_proto::PROTOCOL_VERSION,
         }),
+        CONTROL_IO_TIMEOUT,
     )
     .is_err()
     {
@@ -492,14 +534,15 @@ fn handle_overload_control(
     drop(fd);
     if matches!(request, Request::Shutdown) {
         lifecycle.begin_draining();
-        let _ = write_msg(&mut writer, &Response::ShuttingDown);
+        let _ = write_response(&stream, &Response::ShuttingDown, CONTROL_IO_TIMEOUT);
     } else {
-        let _ = write_msg(
-            &mut writer,
+        let _ = write_response(
+            &stream,
             &Response::Error(ToolError::new(
                 hearth_proto::ErrorKind::Io,
                 "daemon connection limit reached",
             )),
+            CONTROL_IO_TIMEOUT,
         );
     }
 }
@@ -513,7 +556,6 @@ fn handle_conn(
     if stream.set_write_timeout(Some(RESPONSE_IO_TIMEOUT)).is_err() {
         return;
     }
-    let mut writer = &stream;
     let mut requests = hearth_tools::transport::RequestReceiver::new(&stream);
     let mut negotiated = false;
     loop {
@@ -560,18 +602,19 @@ fn handle_conn(
                     "protocol hello is required before operations",
                 )),
             };
-            if write_msg(&mut writer, &response).is_err() || !negotiated {
+            if write_response(&stream, &response, RESPONSE_IO_TIMEOUT).is_err() || !negotiated {
                 break;
             }
             continue;
         }
 
         if matches!(req, Request::Hello(_)) {
-            let _ = write_msg(
-                &mut writer,
+            let _ = write_response(
+                &stream,
                 &Response::Error(ToolError::invalid(
                     "protocol hello is only valid as the first request",
                 )),
+                RESPONSE_IO_TIMEOUT,
             );
             break;
         }
@@ -594,7 +637,7 @@ fn handle_conn(
         };
         monitor_stop.store(true, Ordering::Release);
         let _ = monitor.join();
-        if write_msg(&mut writer, &resp).is_err() || is_shutdown {
+        if write_response(&stream, &resp, RESPONSE_IO_TIMEOUT).is_err() || is_shutdown {
             break;
         }
     }
