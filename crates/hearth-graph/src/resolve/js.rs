@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, io,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -450,7 +452,7 @@ fn resolver_options(
     let tsconfig = configured_tsconfig.clone().map(|config_file| {
         TsconfigDiscovery::Manual(TsconfigOptions {
             config_file,
-            references: TsconfigReferences::Auto,
+            references: TsconfigReferences::Disabled,
         })
     });
     let common_conditions: Vec<String> = condition_names
@@ -725,14 +727,28 @@ impl FileSystem for SharedFileSystem {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if !metadata.file_type().is_file() || metadata.len() > MAX_RESOLVER_FILE_BYTES {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > MAX_RESOLVER_FILE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "resolver config must be a regular file no larger than 1 MiB",
             ));
         }
-        self.0.read(path)
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.by_ref()
+            .take(MAX_RESOLVER_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_RESOLVER_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resolver config exceeds 1 MiB",
+            ));
+        }
+        Ok(bytes)
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {

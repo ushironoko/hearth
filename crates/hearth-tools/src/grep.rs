@@ -490,9 +490,16 @@ fn search_one(
         .files()
         .get_bounded_trusting(path, MAX_GREP_CACHE_BYTES, trust)
     {
-        Ok(Some((entry, _hit))) => searcher
-            .search_slice(matcher, entry.bytes(), &mut sink)
-            .is_ok(),
+        Ok(Some((entry, _hit))) => {
+            if entry.is_binary() {
+                false
+            } else {
+                searcher
+                    .search_slice(matcher, entry.bytes(), &mut sink)
+                    .is_ok()
+                    && !sink.output_full
+            }
+        }
         Ok(None) | Err(_) => false,
     };
     if !searched_ok || !sink.found {

@@ -48,6 +48,7 @@ smallvec.workspace = true
 rustc-hash.workspace = true
 parking_lot.workspace = true
 xxhash-rust.workspace = true
+libc = "0.2"
 
 tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
