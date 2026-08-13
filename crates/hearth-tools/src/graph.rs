@@ -3035,7 +3035,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
 
     fn engine() -> Engine {
@@ -3603,47 +3603,21 @@ mod tests {
     }
 
     #[test]
-    fn busy_root_overshoot_converges_on_the_next_query() {
-        let parent = tempfile::tempdir().unwrap();
-        let engine = engine();
-        let release = Arc::new(Barrier::new(MAX_GRAPH_ROOTS + 2));
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let mut handles = Vec::new();
-        let mut roots = Vec::new();
+    fn graph_build_reservations_are_bounded_and_released() {
+        let state = Arc::new(GraphState::default());
+        let first = state.reserve_build().unwrap();
+        let second = state.reserve_build().unwrap();
+        let error = match state.reserve_build() {
+            Ok(_) => panic!("third graph build reservation must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("capacity"));
 
-        for index in 0..=MAX_GRAPH_ROOTS {
-            let root = parent.path().join(format!("root-{index}"));
-            seed(&root, "src/lib.rs");
-            roots.push(root.clone());
-            let hook: GraphTestHook = {
-                let entered_tx = entered_tx.clone();
-                let release = Arc::clone(&release);
-                Arc::new(move |point| {
-                    if point == GraphTestPoint::ColdBuildStarted {
-                        entered_tx.send(()).unwrap();
-                        release.wait();
-                    }
-                })
-            };
-            graph_test_set_hook(&root, Some(hook));
-            let query = query(&root);
-            let thread_engine = engine.clone();
-            handles.push(std::thread::spawn(move || graph(&thread_engine, &query)));
-            entered_rx.recv().unwrap();
-        }
-
-        assert_eq!(graph_test_root_count(&engine), MAX_GRAPH_ROOTS + 1);
-        release.wait();
-        for handle in handles {
-            assert!(handle.join().unwrap().is_ok());
-        }
-        for root in &roots {
-            graph_test_set_hook(root, None);
-        }
-
-        graph(&engine, &query(roots.last().unwrap())).unwrap();
-        assert_eq!(graph_test_root_count(&engine), MAX_GRAPH_ROOTS);
-        assert_eq!(graph_clear(&engine), MAX_GRAPH_ROOTS as u64);
+        drop(first);
+        let replacement = state.reserve_build().unwrap();
+        drop(second);
+        drop(replacement);
+        assert_eq!(*state.active_builds.lock(), 0);
     }
 
     #[test]
