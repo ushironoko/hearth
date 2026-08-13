@@ -147,6 +147,11 @@ pub fn edit_batch_cancellable(
             ToolError::new(ErrorKind::InvalidInput, "file is not valid UTF-8")
                 .with_path(params.path.clone())
         })?;
+        if !raw.is_ascii() && raw.len() > MAX_NORMALIZED_INPUT_BYTES {
+            return Err(ToolError::invalid(
+                "non-ASCII edit target exceeds 8 MiB normalization limit",
+            ));
+        }
         let matching_work = params
             .edits
             .len()

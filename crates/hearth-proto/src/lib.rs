@@ -1197,7 +1197,7 @@ pub struct InvalidateResult {
 
 /// Current daemon transport contract. A client negotiates this before sending
 /// an operation, so incompatible peers fail before mutation or FD transfer.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
