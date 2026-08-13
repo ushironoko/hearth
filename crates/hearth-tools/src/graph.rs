@@ -41,6 +41,11 @@ const MAX_GRAPH_ROOTS: usize = 16;
 const MAX_RDEPS_REPAIR: usize = 256;
 const MAX_RDEPS_GREP_CANDIDATES: u64 = 1024;
 const MAX_SWEEP_PUBLISH_REBUILDS: usize = 3;
+const MAX_GRAPH_FILES: usize = 100_000;
+const MAX_GRAPH_PATH_BYTES: usize = 64 * 1024;
+const MAX_GRAPH_QUERY_BYTES: usize = 1024 * 1024;
+const MAX_GRAPH_DEPTH: u32 = 64;
+const MAX_GRAPH_RESULTS: u64 = 100_000;
 
 /// Run a graph query without a live cancellation token.
 pub fn graph(engine: &Engine, params: &GraphParams) -> ToolResult<GraphResult> {
@@ -55,6 +60,7 @@ pub fn graph_cancellable(
 ) -> ToolResult<GraphResult> {
     profile!("tool.graph", {
         cancel.check()?;
+        validate_graph_params(params)?;
         let root_path = resolve_path(engine, &params.root);
         let metadata = std::fs::metadata(&root_path)
             .map_err(|_| ToolError::not_found(root_path.display().to_string()))?;
@@ -98,6 +104,43 @@ pub fn graph_cancellable(
         }
         Ok(answer.result)
     })
+}
+
+fn validate_graph_params(params: &GraphParams) -> ToolResult<()> {
+    if params.root.len() > MAX_GRAPH_PATH_BYTES {
+        return Err(ToolError::invalid("graph root path exceeds 64 KiB"));
+    }
+    if params.files.len() > MAX_GRAPH_FILES {
+        return Err(ToolError::invalid(
+            "graph files view exceeds 100000 entries",
+        ));
+    }
+    if params
+        .files
+        .iter()
+        .any(|path| path.len() > MAX_GRAPH_PATH_BYTES)
+    {
+        return Err(ToolError::invalid("graph file path exceeds 64 KiB"));
+    }
+    let (text_len, depth, limit) = match &params.op {
+        GraphOp::Symbols { path } | GraphOp::Outline { path } => (path.len(), 0, 0),
+        GraphOp::Search { query, limit } => (query.len(), 0, *limit),
+        GraphOp::Definitions { name, limit } => (name.len(), 0, *limit),
+        GraphOp::Deps { path, depth }
+        | GraphOp::Rdeps { path, depth, .. }
+        | GraphOp::Neighborhood { path, depth } => (path.len(), *depth, 0),
+        GraphOp::Status => (0, 0, 0),
+    };
+    if text_len > MAX_GRAPH_QUERY_BYTES {
+        return Err(ToolError::invalid("graph query text exceeds 1 MiB"));
+    }
+    if depth > MAX_GRAPH_DEPTH {
+        return Err(ToolError::invalid("graph depth exceeds 64"));
+    }
+    if limit > MAX_GRAPH_RESULTS {
+        return Err(ToolError::invalid("graph result limit exceeds 100000"));
+    }
+    Ok(())
 }
 
 /// Drop every graph root associated with `engine`.

@@ -312,6 +312,7 @@ impl Limiter {
 pub struct MatcherCache {
     regex: DashMap<RegexKey, Arc<RegexMatcher>>,
     globs: DashMap<Vec<String>, Arc<GlobFilter>>,
+    mutation: Mutex<()>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -336,6 +337,10 @@ impl MatcherCache {
             return Ok(Arc::clone(m.value()));
         }
         let m = Arc::new(build_matcher(params)?);
+        let _mutation = self.mutation.lock();
+        if let Some(existing) = self.regex.get(&key) {
+            return Ok(Arc::clone(existing.value()));
+        }
         if self.regex.len() >= MAX_MATCHER_CACHE_ENTRIES {
             self.regex.clear();
         }
@@ -348,6 +353,10 @@ impl MatcherCache {
             return Ok(Arc::clone(g.value()));
         }
         let g = Arc::new(GlobFilter::new(globs)?);
+        let _mutation = self.mutation.lock();
+        if let Some(existing) = self.globs.get(globs) {
+            return Ok(Arc::clone(existing.value()));
+        }
         if self.globs.len() >= MAX_MATCHER_CACHE_ENTRIES {
             self.globs.clear();
         }
