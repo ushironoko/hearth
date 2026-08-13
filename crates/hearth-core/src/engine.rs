@@ -34,6 +34,8 @@ pub struct EngineConfig {
     pub warm_shell: bool,
     /// Threads used by the parallel directory walker.
     pub walk_threads: usize,
+    /// Hard cap on retained directory-walk snapshots.
+    pub max_cached_walks: usize,
     /// Start an fs-watcher on searched roots to proactively invalidate caches.
     pub enable_watch: bool,
     /// Skip the per-hit freshness `stat` on warm reads/greps. This is a
@@ -64,6 +66,7 @@ impl Default for EngineConfig {
             shell: None,
             warm_shell: false,
             walk_threads: threads,
+            max_cached_walks: 64,
             enable_watch: false,
             trust_cache: false,
             enable_optimizer: true,
@@ -130,7 +133,10 @@ impl Engine {
             config.max_cache_bytes,
             config.max_cached_files,
         ));
-        let walks = Arc::new(WalkCache::new(config.walk_threads));
+        let walks = Arc::new(WalkCache::with_limit(
+            config.walk_threads,
+            config.max_cached_walks,
+        ));
         let invalidations = Arc::new(InvalidationLog::new());
         let tuning = Arc::new(Tuning::default());
         // The configured maximum is a safety ceiling, never raised to satisfy a

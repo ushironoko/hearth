@@ -11,6 +11,7 @@ use ignore::{WalkBuilder, WalkState};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The walk-affecting knobs. Globs are *not* here: they post-filter the cached
 /// list, so one walk serves every glob over the same tree.
@@ -31,19 +32,39 @@ struct CacheKey {
 pub struct WalkEntry {
     pub root: PathBuf,
     pub files: Arc<Vec<PathBuf>>,
+    last_access: AtomicU64,
 }
 
 pub struct WalkCache {
     map: DashMap<CacheKey, Arc<WalkEntry>>,
     threads: usize,
+    max_entries: usize,
+    clock: AtomicU64,
+    /// Serializes insert/evict and invalidation so the count cap is restored
+    /// synchronously before a mutation returns.
+    mutation: Mutex<()>,
 }
 
 impl WalkCache {
     pub fn new(threads: usize) -> Self {
+        Self::with_limit(threads, usize::MAX)
+    }
+
+    pub fn with_limit(threads: usize, max_entries: usize) -> Self {
         Self {
             map: DashMap::new(),
             threads: threads.max(1),
+            max_entries,
+            clock: AtomicU64::new(1),
+            mutation: Mutex::new(()),
         }
+    }
+
+    fn touch(&self, entry: &WalkEntry) {
+        entry.last_access.store(
+            self.clock.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 
     /// Get (or build) the file list for `root` under `opts`. `hit` reports
@@ -54,6 +75,7 @@ impl WalkCache {
             opts,
         };
         if let Some(entry) = self.map.get(&key) {
+            self.touch(entry.value());
             crate::profiler::count("cache.walk.hit", 1);
             return (Arc::clone(entry.value()), true);
         }
@@ -62,9 +84,46 @@ impl WalkCache {
         let entry = Arc::new(WalkEntry {
             root: root.to_path_buf(),
             files: Arc::new(files),
+            last_access: AtomicU64::new(0),
         });
+        self.touch(&entry);
+
+        let _mutation = self.mutation.lock();
+        if self.max_entries == 0 {
+            return (entry, false);
+        }
+        if let Some(existing) = self.map.get(&key) {
+            self.touch(existing.value());
+            return (Arc::clone(existing.value()), true);
+        }
         self.map.insert(key, Arc::clone(&entry));
+        self.evict_locked();
         (entry, false)
+    }
+
+    fn evict_locked(&self) {
+        while self.map.len() > self.max_entries {
+            let victim = self
+                .map
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.key().clone(),
+                        Arc::clone(entry.value()),
+                        entry.value().last_access.load(Ordering::Relaxed),
+                    )
+                })
+                .min_by(|left, right| {
+                    left.2
+                        .cmp(&right.2)
+                        .then_with(|| left.0.root.cmp(&right.0.root))
+                });
+            let Some((key, identity, _)) = victim else {
+                break;
+            };
+            self.map
+                .remove_if(&key, |_, current| Arc::ptr_eq(current, &identity));
+        }
     }
 
     fn build(&self, root: &Path, opts: WalkKey) -> Vec<PathBuf> {
@@ -102,10 +161,8 @@ impl WalkCache {
     /// an ancestor of `path` (whose file list may now be wrong) and walks rooted
     /// beneath it (which `path` may have just replaced wholesale). Returns the
     /// number of entries dropped.
-    ///
-    /// Called by the fs-watcher on a structural change, and directly by
-    /// `write`/`edit` when they create a path or touch an ignore file.
     pub fn invalidate_under(&self, path: &Path) -> usize {
+        let _mutation = self.mutation.lock();
         let before = self.map.len();
         self.map
             .retain(|k, _| !path.starts_with(&k.root) && !k.root.starts_with(path));
@@ -114,6 +171,7 @@ impl WalkCache {
 
     /// Drop every cached walk. Returns the number of entries removed.
     pub fn clear(&self) -> usize {
+        let _mutation = self.mutation.lock();
         let n = self.map.len();
         self.map.clear();
         n
@@ -125,5 +183,52 @@ impl WalkCache {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> WalkKey {
+        WalkKey {
+            respect_gitignore: false,
+            hidden: true,
+            follow_symlinks: false,
+        }
+    }
+
+    #[test]
+    fn entry_cap_is_synchronous_and_lru() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = (0..3)
+            .map(|i| {
+                let root = dir.path().join(format!("r{i}"));
+                std::fs::create_dir(&root).unwrap();
+                std::fs::write(root.join("file"), b"x").unwrap();
+                root
+            })
+            .collect();
+        let cache = WalkCache::with_limit(1, 2);
+
+        cache.get(&roots[0], key());
+        cache.get(&roots[1], key());
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&roots[0], key()).1, "root zero should become MRU");
+        cache.get(&roots[2], key());
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&roots[0], key()).1, "MRU entry must survive");
+        assert!(!cache.get(&roots[1], key()).1, "LRU entry must be evicted");
+    }
+
+    #[test]
+    fn zero_limit_returns_walk_without_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+        let cache = WalkCache::with_limit(1, 0);
+        let (entry, hit) = cache.get(dir.path(), key());
+        assert!(!hit);
+        assert_eq!(entry.files.len(), 1);
+        assert!(cache.is_empty());
     }
 }
