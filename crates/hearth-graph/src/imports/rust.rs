@@ -134,6 +134,17 @@ fn push_use_leaf(
     imports: &mut Vec<RawImport>,
     specifier_bytes: &mut usize,
 ) {
+    if imports.len() >= MAX_RUST_IMPORTS {
+        return;
+    }
+    let prefix_len = prefix.0.map_or(0, |index| prefixes[index].rendered_len);
+    let append_segment = segment != "self" || prefix.0.is_none();
+    let projected_len = prefix_len
+        .saturating_add(usize::from(prefix.0.is_some() && append_segment) * 2)
+        .saturating_add(append_segment as usize * segment.len());
+    if projected_len > MAX_RUST_IMPORT_SPECIFIER_BYTES.saturating_sub(*specifier_bytes) {
+        return;
+    }
     let specifier = render_use_path(prefix, prefixes, segment);
     push_import(
         node,
