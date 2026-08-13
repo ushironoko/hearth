@@ -87,7 +87,7 @@ fn validated_runtime_env(name: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    Some(path)
+    fs::canonicalize(path).ok()
 }
 
 pub fn default_socket_path() -> PathBuf {

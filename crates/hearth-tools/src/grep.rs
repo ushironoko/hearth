@@ -23,7 +23,7 @@ use hearth_proto::{
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const MAX_PATTERN_BYTES: usize = 1024 * 1024;
 const MAX_GLOBS: usize = 256;
@@ -98,6 +98,8 @@ pub fn grep_cancellable(
         let total_limit = params.max_total_count.unwrap_or(DEFAULT_MAX_MATCHES);
         let limiter = Some(Limiter::new(indices.len(), total_limit));
         let searched = AtomicU64::new(0);
+        let result_bytes = AtomicUsize::new(0);
+        let result_exhausted = AtomicBool::new(false);
         let threads = engine.config().walk_threads.min(indices.len().max(1));
         let (tx, rx) = crossbeam_channel::unbounded::<(usize, usize)>();
         for (slot, &i) in indices.iter().enumerate() {
@@ -115,13 +117,15 @@ pub fn grep_cancellable(
                     let all_files = Arc::clone(&all_files);
                     let limiter = limiter.as_ref();
                     let searched = &searched;
+                    let result_bytes = &result_bytes;
+                    let result_exhausted = &result_exhausted;
                     let params = &params;
                     let engine_ref = engine;
                     scope.spawn(move || {
                         let mut searcher = build_searcher(params);
                         let mut local: Vec<FileMatches> = Vec::new();
                         while let Ok((slot, i)) = rx.recv() {
-                            if cancel.is_cancelled() {
+                            if cancel.is_cancelled() || result_exhausted.load(Ordering::Acquire) {
                                 break;
                             }
                             // Stop once every file that could sort *before* an
@@ -141,7 +145,22 @@ pub fn grep_cancellable(
                             );
                             let count = found.as_ref().map(|f| f.match_count).unwrap_or(0);
                             if let Some(fm) = found {
-                                local.push(fm);
+                                let bytes = file_matches_bytes(&fm);
+                                let reserved = result_bytes.fetch_update(
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                    |current| {
+                                        current.checked_add(bytes).filter(|&next| {
+                                            next <= engine_ref.config().max_grep_output_bytes
+                                        })
+                                    },
+                                );
+                                if reserved.is_ok() {
+                                    local.push(fm);
+                                } else {
+                                    result_exhausted.store(true, Ordering::Release);
+                                    break;
+                                }
                             }
                             if let Some(l) = limiter {
                                 l.complete(slot, count);
@@ -166,12 +185,7 @@ pub fn grep_cancellable(
 
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let limit_reached = apply_total_limit(&mut files, total_limit, params.after_context as u64);
-        let result_bytes = files.iter().fold(0usize, |total, file| {
-            total
-                .saturating_add(file.path.len())
-                .saturating_add(file.lines.iter().map(|line| line.text.len()).sum::<usize>())
-        });
-        if result_bytes > engine.config().max_grep_output_bytes {
+        if result_exhausted.load(Ordering::Acquire) {
             return Err(ToolError::invalid("grep result exceeds global byte limit"));
         }
         let total_matches: u64 = files.iter().map(|f| f.match_count).sum();
@@ -190,6 +204,15 @@ pub fn grep_cancellable(
             root_is_dir,
         })
     })
+}
+
+fn file_matches_bytes(file: &FileMatches) -> usize {
+    file.path.len().saturating_add(
+        file.lines
+            .iter()
+            .map(|line| line.text.len().saturating_add(size_of::<GrepLine>()))
+            .sum::<usize>(),
+    )
 }
 
 fn validate_params(params: &GrepParams) -> ToolResult<()> {

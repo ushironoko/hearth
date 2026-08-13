@@ -365,6 +365,10 @@ fn run(args: Args) -> io::Result<LifecycleState> {
         reap_finished_workers(&mut workers);
         match bound.listener().accept() {
             Ok((stream, _address)) => {
+                if let Err(error) = stream.set_nonblocking(false) {
+                    eprintln!("hearthd: failed to restore blocking connection mode: {error}");
+                    continue;
+                }
                 if !lifecycle.is_accepting() {
                     drop(stream);
                     break;

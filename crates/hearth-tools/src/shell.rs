@@ -444,6 +444,8 @@ fn run_once(
     };
     let mut settled_at: Option<Instant> = None;
     let mut killed: Option<Dispatch> = None;
+    let mut kill_deadline: Option<Instant> = None;
+    let mut killed_job: Option<i32> = None;
     let mut broken = false;
 
     loop {
@@ -451,36 +453,55 @@ fn run_once(
         if complete || broken {
             break;
         }
-        // Once the command has settled, only wait out the idle grace for
-        // stragglers rather than the full timeout.
-        if let Some(at) = settled_at
-            && at.elapsed() >= IDLE_GRACE
-        {
+        // Once the command has settled naturally, wait out an idle grace.
+        if killed.is_none() && settled_at.is_some_and(|at| at.elapsed() >= IDLE_GRACE) {
+            break;
+        }
+        // After cancellation/timeout, output can no longer extend the hard
+        // reap grace. A delayed P record is killed as soon as it arrives.
+        if kill_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
         if killed.is_none() {
             if cancel.is_cancelled() {
                 kill_job(&ctrl, shell);
+                killed_job = ctrl.job_pgid;
                 killed = Some(Dispatch::Aborted);
-                settled_at = Some(Instant::now());
+                let now = Instant::now();
+                settled_at = Some(now);
+                kill_deadline = now.checked_add(IDLE_GRACE);
             } else if Instant::now() >= deadline {
                 kill_job(&ctrl, shell);
+                killed_job = ctrl.job_pgid;
                 killed = Some(Dispatch::TimedOut);
-                settled_at = Some(Instant::now());
+                let now = Instant::now();
+                settled_at = Some(now);
+                kill_deadline = now.checked_add(IDLE_GRACE);
             }
         }
 
-        let wait = next_wait(deadline, settled_at, cancel);
+        let wait = next_wait(deadline, settled_at, cancel).min(
+            kill_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::MAX),
+        );
         match shell.rx.recv_timeout(wait) {
             Ok(Raw::Data(src, bytes)) => {
-                if settled_at.is_some() {
-                    settled_at = Some(Instant::now()); // a straggler: re-arm
+                if settled_at.is_some() && killed.is_none() {
+                    settled_at = Some(Instant::now()); // natural straggler: re-arm
                 }
                 match src {
                     Src::Out => out.push(&bytes, &mut |b| on_bytes(BashChannel::Stdout, b)),
                     Src::Err => err.push(&bytes, &mut |b| on_bytes(BashChannel::Stderr, b)),
                     Src::Ctrl => {
                         ctrl.push(&bytes);
+                        if killed.is_some()
+                            && ctrl.job_pgid.is_some()
+                            && ctrl.job_pgid != killed_job
+                        {
+                            kill_job(&ctrl, shell);
+                            killed_job = ctrl.job_pgid;
+                        }
                         if ctrl.exit_code.is_some() && killed.is_none() {
                             // The command finished on its own; anything still
                             // arriving is a detached descendant's output.
