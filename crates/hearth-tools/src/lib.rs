@@ -53,6 +53,19 @@ pub fn dispatch_cancellable(
 ) -> hearth_proto::Response {
     use hearth_proto::{Request, Response};
     match req {
+        Request::Hello(hello) => {
+            if hello.version == hearth_proto::PROTOCOL_VERSION {
+                Response::Hello(hearth_proto::ProtocolAck {
+                    version: hearth_proto::PROTOCOL_VERSION,
+                })
+            } else {
+                Response::Error(hearth_proto::ToolError::invalid(format!(
+                    "unsupported protocol version {}; expected {}",
+                    hello.version,
+                    hearth_proto::PROTOCOL_VERSION
+                )))
+            }
+        }
         Request::Read(p) => match read_cancellable(engine, &p, cancel) {
             Ok(r) => Response::Read(r),
             Err(e) => Response::Error(e),

@@ -1191,6 +1191,22 @@ pub struct InvalidateResult {
 // Envelope for the daemon transport
 // ---------------------------------------------------------------------------
 
+/// Current daemon transport contract. A client negotiates this before sending
+/// an operation, so incompatible peers fail before mutation or FD transfer.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolHello {
+    pub version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolAck {
+    pub version: u32,
+}
+
 /// A request sent to the resident daemon.
 ///
 /// Externally tagged (the default) so it round-trips cleanly through msgpack —
@@ -1198,6 +1214,8 @@ pub struct InvalidateResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Request {
+    /// Must be the first request on every daemon connection.
+    Hello(ProtocolHello),
     Read(ReadParams),
     Write(WriteParams),
     Edit(EditParams),
@@ -1221,6 +1239,7 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Response {
+    Hello(ProtocolAck),
     Read(ReadResult),
     Write(WriteResult),
     Edit(EditResult),

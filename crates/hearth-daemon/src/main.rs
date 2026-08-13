@@ -436,15 +436,42 @@ fn handle_overload_control(
     lifecycle: Arc<Lifecycle>,
     frames: Arc<FrameBudget>,
 ) {
-    let Some(_frame_permit) = frames.try_acquire() else {
-        return;
-    };
     let mut requests = hearth_tools::transport::RequestReceiver::new(&stream);
-    let Ok((request, fd)) = requests.recv_request() else {
+    let Ok((hello, fd)) = requests.recv_request() else {
         return;
     };
     drop(fd);
     let mut writer = &stream;
+    if !matches!(
+        hello,
+        Request::Hello(hearth_proto::ProtocolHello { version })
+            if version == hearth_proto::PROTOCOL_VERSION
+    ) {
+        let _ = write_msg(
+            &mut writer,
+            &Response::Error(ToolError::invalid("compatible protocol hello required")),
+        );
+        return;
+    }
+    if write_msg(
+        &mut writer,
+        &Response::Hello(hearth_proto::ProtocolAck {
+            version: hearth_proto::PROTOCOL_VERSION,
+        }),
+    )
+    .is_err()
+    {
+        return;
+    }
+
+    // The overload lane is a tiny fixed-shape Hello + Shutdown control path;
+    // it must remain reachable even when data-plane frame slots are exhausted.
+    // It still participates in the configured budget when a slot is free.
+    let _operation_permit = frames.try_acquire();
+    let Ok((request, fd)) = requests.recv_request() else {
+        return;
+    };
+    drop(fd);
     if matches!(request, Request::Shutdown) {
         lifecycle.begin_draining();
         let _ = write_msg(&mut writer, &Response::ShuttingDown);
@@ -467,6 +494,7 @@ fn handle_conn(
 ) {
     let mut writer = &stream;
     let mut requests = hearth_tools::transport::RequestReceiver::new(&stream);
+    let mut negotiated = false;
     loop {
         if !lifecycle.is_accepting() {
             break;
@@ -488,6 +516,42 @@ fn handle_conn(
             Err(_) => break,
         };
         if !lifecycle.is_accepting() {
+            break;
+        }
+
+        if !negotiated {
+            let response = match req {
+                Request::Hello(hearth_proto::ProtocolHello { version })
+                    if version == hearth_proto::PROTOCOL_VERSION =>
+                {
+                    negotiated = true;
+                    Response::Hello(hearth_proto::ProtocolAck {
+                        version: hearth_proto::PROTOCOL_VERSION,
+                    })
+                }
+                Request::Hello(hearth_proto::ProtocolHello { version }) => {
+                    Response::Error(ToolError::invalid(format!(
+                        "unsupported protocol version {version}; expected {}",
+                        hearth_proto::PROTOCOL_VERSION
+                    )))
+                }
+                _ => Response::Error(ToolError::invalid(
+                    "protocol hello is required before operations",
+                )),
+            };
+            if write_msg(&mut writer, &response).is_err() || !negotiated {
+                break;
+            }
+            continue;
+        }
+
+        if matches!(req, Request::Hello(_)) {
+            let _ = write_msg(
+                &mut writer,
+                &Response::Error(ToolError::invalid(
+                    "protocol hello is only valid as the first request",
+                )),
+            );
             break;
         }
 
@@ -584,6 +648,18 @@ mod tests {
         let worker =
             std::thread::spawn(move || handle_overload_control(server, worker_lifecycle, frames));
 
+        hearth_tools::transport::send_request_with_fd(
+            &client,
+            &Request::Hello(hearth_proto::ProtocolHello {
+                version: hearth_proto::PROTOCOL_VERSION,
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            hearth_tools::transport::read_msg::<_, Response>(&mut client).unwrap(),
+            Response::Hello(_)
+        ));
         hearth_tools::transport::send_request_with_fd(&client, &Request::Shutdown, None).unwrap();
         let response = hearth_tools::transport::read_msg::<_, Response>(&mut client).unwrap();
         worker.join().unwrap();
@@ -659,8 +735,20 @@ mod tests {
         let worker =
             std::thread::spawn(move || handle_conn(server, engine, worker_lifecycle, frames));
 
-        hearth_tools::transport::send_request_with_fd(&client, &Request::Shutdown, None).unwrap();
+        hearth_tools::transport::send_request_with_fd(
+            &client,
+            &Request::Hello(hearth_proto::ProtocolHello {
+                version: hearth_proto::PROTOCOL_VERSION,
+            }),
+            None,
+        )
+        .unwrap();
         let mut reader = &client;
+        assert!(matches!(
+            hearth_tools::transport::read_msg::<_, Response>(&mut reader).unwrap(),
+            Response::Hello(_)
+        ));
+        hearth_tools::transport::send_request_with_fd(&client, &Request::Shutdown, None).unwrap();
         let response: Response = hearth_tools::transport::read_msg(&mut reader).unwrap();
         worker.join().unwrap();
 

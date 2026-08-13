@@ -388,6 +388,32 @@ fn run(global: &Global, req: Request) -> Response {
         Err(_) => return dispatch_inline(req),
     };
 
+    // Negotiate before any operation or FD transfer. A mismatch is therefore
+    // a safe pre-dispatch failure, never an ambiguous mutation outcome.
+    let hello = Request::Hello(ProtocolHello {
+        version: PROTOCOL_VERSION,
+    });
+    if let Err(error) = send_request_with_fd(&stream, &hello, None) {
+        return Response::Error(ToolError::indeterminate(format!(
+            "protocol handshake delivery may have begun: {error}"
+        )));
+    }
+    let mut reader = &stream;
+    match read_msg::<_, Response>(&mut reader) {
+        Ok(Response::Hello(ProtocolAck { version })) if version == PROTOCOL_VERSION => {}
+        Ok(Response::Error(error)) => return Response::Error(error),
+        Ok(_) => {
+            return Response::Error(ToolError::invalid(
+                "daemon returned an incompatible protocol handshake",
+            ));
+        }
+        Err(error) => {
+            return Response::Error(ToolError::indeterminate(format!(
+                "protocol handshake response was lost or invalid: {error}"
+            )));
+        }
+    }
+
     // A read destined for stdout can be streamed: pass our stdout fd so the
     // daemon writes the content straight to it, skipping payload serialization.
     let fd = if matches!(req, Request::Read(_)) && !global.json {
@@ -401,7 +427,6 @@ fn run(global: &Global, req: Request) -> Response {
         )));
     }
 
-    let mut reader = &stream;
     match read_msg::<_, Response>(&mut reader) {
         Ok(response) => response,
         Err(error) => Response::Error(ToolError::indeterminate(format!(
@@ -431,6 +456,10 @@ fn render(global: &Global, cmd: &Cmd, resp: &Response) -> i32 {
     }
     let count_mode = matches!(cmd, Cmd::Grep { count: true, .. });
     match resp {
+        Response::Hello(_) => {
+            eprintln!("error: unexpected protocol handshake response");
+            1
+        }
         Response::Read(r) => {
             print!("{}", r.content);
             0
