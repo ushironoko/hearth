@@ -60,6 +60,11 @@ pub fn grep_cancellable(
         let meta = std::fs::metadata(&root)
             .map_err(|_| ToolError::not_found(root.display().to_string()))?;
         let root_is_dir = meta.is_dir();
+        if !root_is_dir && !meta.is_file() {
+            return Err(ToolError::invalid(
+                "grep target must be a regular file or directory",
+            ));
+        }
 
         // Resolve the target set as a shared slice + the indices passing the
         // glob filter — no per-file PathBuf clones (the walk's Arc is reused).
@@ -455,7 +460,11 @@ fn search_one(
         Ok(Some((entry, _hit))) => searcher
             .search_slice(matcher, entry.bytes(), &mut sink)
             .is_ok(),
-        _ => searcher.search_path(matcher, path, &mut sink).is_ok(),
+        Ok(None) => {
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+                && searcher.search_path(matcher, path, &mut sink).is_ok()
+        }
+        Err(_) => false,
     };
     if !searched_ok || !sink.found {
         return None;
@@ -499,8 +508,12 @@ impl CollectSink<'_> {
             return;
         }
         let text = trim_eol(bytes);
-        let remaining = self.max_output_bytes.saturating_sub(self.blob.len());
-        if text.len() > remaining {
+        let retained = self
+            .blob
+            .len()
+            .saturating_add(self.spans.len().saturating_mul(size_of::<LineSpan>()));
+        let remaining = self.max_output_bytes.saturating_sub(retained);
+        if text.len().saturating_add(size_of::<LineSpan>()) > remaining {
             self.output_full = true;
             return;
         }

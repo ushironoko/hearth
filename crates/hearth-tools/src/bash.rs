@@ -358,7 +358,7 @@ fn spawn_bash(
         });
     }
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(8);
     if let Some(mut pipe) = child.stdout.take() {
         let tx = tx.clone();
         std::thread::spawn(move || pump(&mut pipe, BashChannel::Stdout, tx));
@@ -439,7 +439,7 @@ fn spawn_bash(
     })
 }
 
-fn pump<R: Read>(pipe: &mut R, channel: BashChannel, tx: mpsc::Sender<Ev>) {
+fn pump<R: Read>(pipe: &mut R, channel: BashChannel, tx: mpsc::SyncSender<Ev>) {
     let mut chunk = vec![0_u8; 65_536];
     loop {
         match pipe.read(&mut chunk) {

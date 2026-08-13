@@ -49,7 +49,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 /// How long to keep reading after the command settled but the pipes are still
@@ -171,7 +171,7 @@ fn spawn_shell(program: &str) -> std::io::Result<WarmShell> {
     // One reader thread per pipe, alive for the shell's whole life. They send
     // raw bytes; the per-command logic does the delimiter search. Threads exit
     // on EOF or once the receiver is dropped.
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(8);
     spawn_reader(stdout, Src::Out, tx.clone());
     spawn_reader(stderr, Src::Err, tx.clone());
     spawn_reader(ctrl, Src::Ctrl, tx);
@@ -212,7 +212,11 @@ fn control_pipe() -> std::io::Result<(RawFd, RawFd)> {
     Ok((fds[0], fds[1]))
 }
 
-fn spawn_reader<R: Read + AsRawFd + Send + 'static>(mut reader: R, src: Src, tx: Sender<Raw>) {
+fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
+    mut reader: R,
+    src: Src,
+    tx: mpsc::SyncSender<Raw>,
+) {
     let _ = std::thread::Builder::new()
         .name("hearth-shell-reader".into())
         .spawn(move || {
@@ -306,6 +310,12 @@ struct Control {
 
 impl Control {
     fn push(&mut self, bytes: &[u8]) {
+        const MAX_CONTROL_BUFFER: usize = 4096;
+        if bytes.len() > MAX_CONTROL_BUFFER.saturating_sub(self.buf.len()) {
+            self.buf.clear();
+            self.exit_code = None;
+            return;
+        }
         self.buf.extend_from_slice(bytes);
         while let Some(nl) = memchr::memchr(b'\n', &self.buf) {
             let line: Vec<u8> = self.buf.drain(..=nl).collect();

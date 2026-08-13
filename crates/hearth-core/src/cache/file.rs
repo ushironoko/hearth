@@ -14,6 +14,7 @@ use crate::singleflight::SingleFlight;
 use dashmap::DashMap;
 use hearth_proto::ToolError;
 use parking_lot::Mutex;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -322,12 +323,16 @@ impl FileCache {
         trust: bool,
     ) -> Result<Option<(Arc<FileEntry>, bool)>, ToolError> {
         if trust && let Some(entry) = self.map.get(path) {
+            if entry.bytes().len() as u64 > max_bytes {
+                return Ok(None);
+            }
             crate::profiler::count("cache.file.hit_trusted", 1);
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.touch(entry.value());
             return Ok(Some((Arc::clone(entry.value()), true)));
         }
-        let meta = std::fs::metadata(path).map_err(|e| map_io(e, path))?;
+        let mut file = std::fs::File::open(path).map_err(|e| map_io(e, path))?;
+        let meta = file.metadata().map_err(|e| map_io(e, path))?;
         if !meta.is_file() {
             return Err(
                 ToolError::invalid(format!("not a regular file: {}", path.display()))
@@ -341,6 +346,9 @@ impl FileCache {
             && entry.size == size
             && entry.mtime_ns == mtime_ns
         {
+            if entry.bytes().len() as u64 > max_bytes {
+                return Ok(None);
+            }
             crate::profiler::count("cache.file.hit", 1);
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.touch(entry.value());
@@ -355,12 +363,26 @@ impl FileCache {
         self.misses.fetch_add(1, Ordering::Relaxed);
         let key = path.to_path_buf();
         let loaded = self.loads.run(key.clone(), || {
-            let bytes = std::fs::read(&key).map_err(|e| map_io(e, &key))?;
+            let max_read = max_bytes.saturating_add(1);
+            let mut bytes = Vec::with_capacity(usize::try_from(size.min(max_bytes)).unwrap_or(0));
+            file.by_ref()
+                .take(max_read)
+                .read_to_end(&mut bytes)
+                .map_err(|e| map_io(e, &key))?;
+            if bytes.len() as u64 > max_bytes {
+                return Err(ToolError::invalid("file exceeds byte limit"));
+            }
+            let after = file.metadata().map_err(|e| map_io(e, &key))?;
+            let final_size = after.len();
+            if final_size != bytes.len() as u64 {
+                return Err(ToolError::invalid("file changed while being read"));
+            }
+            let final_mtime_ns = mtime_nanos(&after);
             let entry = Arc::new(FileEntry::new(
                 key.clone(),
                 Arc::from(bytes.into_boxed_slice()),
-                size,
-                mtime_ns,
+                final_size,
+                final_mtime_ns,
             ));
             Ok(entry)
         });
