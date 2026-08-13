@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 const SOCKET_NAME: &str = "hearth.sock";
 const PORTABLE_SOCKET_PATH_LIMIT: usize = 100;
 const MAX_REQUEST_FRAME_DURATION: Duration = Duration::from_secs(30);
+const MAX_DECODE_VALUES: usize = 1_000_000;
+const MAX_DECODE_DEPTH: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct ValidatedEndpoint {
@@ -301,6 +303,136 @@ pub fn read_msg<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
     rmp_serde::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn validate_msgpack_structure(bytes: &[u8]) -> io::Result<()> {
+    fn read_uint(bytes: &[u8], pos: &mut usize, width: usize) -> io::Result<u64> {
+        let end = pos
+            .checked_add(width)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated msgpack"))?;
+        let mut value = 0u64;
+        for &byte in &bytes[*pos..end] {
+            value = (value << 8) | u64::from(byte);
+        }
+        *pos = end;
+        Ok(value)
+    }
+    fn skip(bytes: &[u8], pos: &mut usize, len: u64) -> io::Result<()> {
+        let len = usize::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "msgpack length overflow"))?;
+        *pos = pos
+            .checked_add(len)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated msgpack"))?;
+        Ok(())
+    }
+
+    let mut pos = 0usize;
+    let mut values = 0usize;
+    let mut stack = vec![1u64];
+    while let Some(remaining) = stack.last_mut() {
+        if *remaining == 0 {
+            stack.pop();
+            continue;
+        }
+        *remaining -= 1;
+        values = values.saturating_add(1);
+        if values > MAX_DECODE_VALUES || stack.len() > MAX_DECODE_DEPTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "msgpack structure exceeds decode budget",
+            ));
+        }
+        let marker = *bytes
+            .get(pos)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated msgpack"))?;
+        pos += 1;
+        match marker {
+            0x00..=0x7f
+            | 0xc0
+            | 0xc2
+            | 0xc3
+            | 0xca
+            | 0xcb
+            | 0xcc
+            | 0xcd
+            | 0xce
+            | 0xcf
+            | 0xd0
+            | 0xd1
+            | 0xd2
+            | 0xd3
+            | 0xe0..=0xff => {
+                let width = match marker {
+                    0xca | 0xce | 0xd2 => 4,
+                    0xcb | 0xcf | 0xd3 => 8,
+                    0xcc | 0xd0 => 1,
+                    0xcd | 0xd1 => 2,
+                    _ => 0,
+                };
+                skip(bytes, &mut pos, width)?;
+            }
+            0xa0..=0xbf => skip(bytes, &mut pos, u64::from(marker & 0x1f))?,
+            0x90..=0x9f => stack.push(u64::from(marker & 0x0f)),
+            0x80..=0x8f => stack.push(u64::from(marker & 0x0f) * 2),
+            0xc4 | 0xd9 => {
+                let len = read_uint(bytes, &mut pos, 1)?;
+                skip(bytes, &mut pos, len)?;
+            }
+            0xc5 | 0xda => {
+                let len = read_uint(bytes, &mut pos, 2)?;
+                skip(bytes, &mut pos, len)?;
+            }
+            0xc6 | 0xdb => {
+                let len = read_uint(bytes, &mut pos, 4)?;
+                skip(bytes, &mut pos, len)?;
+            }
+            0xdc => {
+                let len = read_uint(bytes, &mut pos, 2)?;
+                stack.push(len);
+            }
+            0xdd => {
+                let len = read_uint(bytes, &mut pos, 4)?;
+                stack.push(len);
+            }
+            0xde => {
+                let len = read_uint(bytes, &mut pos, 2)?;
+                stack.push(len.saturating_mul(2));
+            }
+            0xdf => {
+                let len = read_uint(bytes, &mut pos, 4)?;
+                stack.push(len.saturating_mul(2));
+            }
+            0xd4 => skip(bytes, &mut pos, 2)?,
+            0xd5 => skip(bytes, &mut pos, 3)?,
+            0xd6 => skip(bytes, &mut pos, 5)?,
+            0xd7 => skip(bytes, &mut pos, 9)?,
+            0xd8 => skip(bytes, &mut pos, 17)?,
+            0xc7..=0xc9 => {
+                let width = match marker {
+                    0xc7 => 1,
+                    0xc8 => 2,
+                    _ => 4,
+                };
+                let len = read_uint(bytes, &mut pos, width)?;
+                skip(bytes, &mut pos, len.saturating_add(1))?;
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported msgpack marker",
+                ));
+            }
+        }
+    }
+    if pos != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing msgpack values",
+        ));
+    }
+    Ok(())
 }
 
 fn errno_io(e: nix::errno::Errno) -> io::Error {
@@ -812,6 +944,7 @@ impl<'a> RequestReceiver<'a> {
 
         let body_start = self.start + 4;
         let body_end = self.start + frame_len;
+        validate_msgpack_structure(&self.bytes[body_start..body_end])?;
         let request: Request = rmp_serde::from_slice(&self.bytes[body_start..body_end])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 

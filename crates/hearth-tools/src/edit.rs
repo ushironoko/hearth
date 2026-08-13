@@ -124,12 +124,14 @@ pub fn edit_batch_cancellable(
         if params.edits.len() > MAX_BATCH_EDITS {
             return Err(ToolError::invalid("edit batch exceeds 10000 replacements"));
         }
-        if params.edits.iter().any(|edit| {
-            edit.old_text.len() > MAX_NORMALIZED_INPUT_BYTES
-                || edit.new_text.len() > MAX_NORMALIZED_INPUT_BYTES
-        }) {
+        let normalized_input_bytes = params.edits.iter().try_fold(0usize, |total, edit| {
+            total
+                .checked_add(edit.old_text.len())?
+                .checked_add(edit.new_text.len())
+        });
+        if normalized_input_bytes.is_none_or(|bytes| bytes > MAX_NORMALIZED_INPUT_BYTES) {
             return Err(ToolError::invalid(
-                "edit normalized input exceeds 8 MiB per replacement",
+                "edit aggregate normalized input exceeds 8 MiB",
             ));
         }
         let requested = resolve_path(engine, &params.path);

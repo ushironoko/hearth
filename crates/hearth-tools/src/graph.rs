@@ -929,6 +929,32 @@ fn sweep_snapshot(root: &Path, state: &RootState) -> SweepSnapshot {
     }
 }
 
+fn analysis_bytes(analysis: &FileAnalysis) -> usize {
+    analysis
+        .path
+        .len()
+        .saturating_add(
+            analysis
+                .language
+                .as_ref()
+                .map_or(0, |language| language.len()),
+        )
+        .saturating_add(
+            analysis
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.len().saturating_add(size_of::<Symbol>()))
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            analysis
+                .imports
+                .iter()
+                .map(|import| import.specifier.len().saturating_add(size_of_val(import)))
+                .sum::<usize>(),
+        )
+}
+
 struct SweepUpsert {
     relative: CompactString,
     analysis: FileAnalysis,
@@ -1132,29 +1158,7 @@ fn build_sweep_delta(
                 .expect("classified graph universe paths are UTF-8"),
         );
         let analysis = analyze_source(source, absolute.as_str(), hash, &mut parser_pool);
-        let analysis_bytes = analysis
-            .path
-            .len()
-            .saturating_add(
-                analysis
-                    .language
-                    .as_ref()
-                    .map_or(0, |language| language.len()),
-            )
-            .saturating_add(
-                analysis
-                    .symbols
-                    .iter()
-                    .map(|symbol| symbol.name.len().saturating_add(size_of::<Symbol>()))
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                analysis
-                    .imports
-                    .iter()
-                    .map(|import| import.specifier.len().saturating_add(size_of_val(import)))
-                    .sum::<usize>(),
-            );
+        let analysis_bytes = analysis_bytes(&analysis);
         if analysis_bytes > MAX_GRAPH_BUILD_BYTES.saturating_sub(build_bytes) {
             return Err(ToolError::invalid("graph build exceeds byte limit"));
         }
@@ -2161,7 +2165,7 @@ fn run_rdeps_repair(
             entry.content_hash(),
             &mut parser_pool,
         );
-        let bytes = entry.bytes().len();
+        let bytes = analysis_bytes(&analysis);
         if bytes > MAX_GRAPH_BUILD_BYTES.saturating_sub(repair_bytes) {
             repair_truncated = true;
             break;

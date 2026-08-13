@@ -3,24 +3,28 @@ use tree_sitter::Node;
 
 use super::{ImportKind, RawImport};
 
+const MAX_RUST_IMPORTS: usize = 100_000;
+const MAX_RUST_IMPORT_SPECIFIER_BYTES: usize = 64 * 1024 * 1024;
+
 pub(crate) fn extract(source: &str, tree: &tree_sitter::Tree) -> Vec<RawImport> {
     let bytes = source.as_bytes();
     let mut imports = Vec::new();
     // Keeping inline-module specifiers as written loses some resolution
     // precision, which is acceptable while Rust outcomes are constitutively
     // Partial and their graph edges are Approximate.
-    visit(tree.root_node(), bytes, &mut imports);
+    let mut specifier_bytes = 0usize;
+    visit(tree.root_node(), bytes, &mut imports, &mut specifier_bytes);
     imports.sort_by_key(|import| import.span.0);
     imports
 }
 
-fn visit(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) {
+fn visit(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>, specifier_bytes: &mut usize) {
     let mut pending = vec![node];
     while let Some(node) = pending.pop() {
         match node.kind() {
             "use_declaration" => {
                 if let Some(argument) = node.child_by_field_name("argument") {
-                    expand_use_tree(argument, source, imports);
+                    expand_use_tree(argument, source, imports, specifier_bytes);
                 }
             }
             "mod_item" => {
@@ -28,7 +32,13 @@ fn visit(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) {
                     && let Some(name) = node.child_by_field_name("name")
                 {
                     let specifier = node_text(name, source);
-                    push_import(name, specifier, ImportKind::RustMod, imports);
+                    push_import(
+                        name,
+                        specifier,
+                        ImportKind::RustMod,
+                        imports,
+                        specifier_bytes,
+                    );
                 }
             }
             _ => {}
@@ -49,7 +59,12 @@ struct UsePrefixPart {
     rendered_len: usize,
 }
 
-fn expand_use_tree(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) {
+fn expand_use_tree(
+    node: Node<'_>,
+    source: &[u8],
+    imports: &mut Vec<RawImport>,
+    specifier_bytes: &mut usize,
+) {
     let mut prefixes = Vec::new();
     let mut pending = vec![(node, UsePrefix::default())];
     while let Some((node, prefix)) = pending.pop() {
@@ -72,7 +87,7 @@ fn expand_use_tree(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) 
                 if let Some(path) = node.child_by_field_name("path")
                     && let Some(segment) = normalized_path(path, source)
                 {
-                    push_use_leaf(path, prefix, &prefixes, &segment, imports);
+                    push_use_leaf(path, prefix, &prefixes, &segment, imports, specifier_bytes);
                 }
             }
             "use_wildcard" => {
@@ -80,11 +95,11 @@ fn expand_use_tree(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) 
                     .named_child(0)
                     .and_then(|path| normalized_path(path, source))
                     .map_or_else(|| "*".to_owned(), |path| format!("{path}::*"));
-                push_use_leaf(node, prefix, &prefixes, &segment, imports);
+                push_use_leaf(node, prefix, &prefixes, &segment, imports, specifier_bytes);
             }
             "identifier" | "scoped_identifier" | "crate" | "self" | "super" | "metavariable" => {
                 if let Some(segment) = normalized_path(node, source) {
-                    push_use_leaf(node, prefix, &prefixes, &segment, imports);
+                    push_use_leaf(node, prefix, &prefixes, &segment, imports, specifier_bytes);
                 }
             }
             _ => {}
@@ -117,9 +132,16 @@ fn push_use_leaf(
     prefixes: &[UsePrefixPart],
     segment: &str,
     imports: &mut Vec<RawImport>,
+    specifier_bytes: &mut usize,
 ) {
     let specifier = render_use_path(prefix, prefixes, segment);
-    push_import(node, Some(specifier), ImportKind::RustUse, imports);
+    push_import(
+        node,
+        Some(specifier),
+        ImportKind::RustUse,
+        imports,
+        specifier_bytes,
+    );
 }
 
 fn render_use_path(prefix: UsePrefix, prefixes: &[UsePrefixPart], segment: &str) -> String {
@@ -157,6 +179,7 @@ fn push_import(
     specifier: Option<String>,
     kind: ImportKind,
     imports: &mut Vec<RawImport>,
+    specifier_bytes: &mut usize,
 ) {
     let Some(specifier) = specifier else {
         return;
@@ -170,6 +193,12 @@ fn push_import(
     let Ok(line) = u32::try_from(node.start_position().row + 1) else {
         return;
     };
+    if imports.len() >= MAX_RUST_IMPORTS
+        || specifier.len() > MAX_RUST_IMPORT_SPECIFIER_BYTES.saturating_sub(*specifier_bytes)
+    {
+        return;
+    }
+    *specifier_bytes += specifier.len();
     imports.push(RawImport {
         specifier: CompactString::from(specifier),
         kind,
