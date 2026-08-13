@@ -32,6 +32,8 @@ struct CacheKey {
 pub struct WalkEntry {
     pub root: PathBuf,
     pub files: Arc<Vec<PathBuf>>,
+    /// False when the preflight or walker exhausted a hard work budget.
+    pub complete: bool,
     retained_path_bytes: usize,
     last_access: AtomicU64,
 }
@@ -74,7 +76,7 @@ impl WalkCache {
             max_files,
             max_path_bytes,
             max_resident_path_bytes: max_path_bytes,
-            max_visited_entries: max_files.saturating_mul(4).max(max_files),
+            max_visited_entries: max_files,
             clock: AtomicU64::new(1),
             mutation: Mutex::new(()),
             build: Mutex::new(()),
@@ -108,11 +110,12 @@ impl WalkCache {
             return (Arc::clone(entry.value()), true);
         }
         let generation = self.generation.load(Ordering::Acquire);
-        let files = self.build(root, opts);
+        let (files, complete) = self.build(root, opts);
         let retained_path_bytes = files.iter().map(|path| path.as_os_str().len()).sum();
         let entry = Arc::new(WalkEntry {
             root: root.to_path_buf(),
             files: Arc::new(files),
+            complete,
             retained_path_bytes,
             last_access: AtomicU64::new(0),
         });
@@ -122,7 +125,7 @@ impl WalkCache {
         if self.generation.load(Ordering::Acquire) != generation {
             return (entry, false);
         }
-        if self.max_entries == 0 {
+        if self.max_entries == 0 || !entry.complete {
             return (entry, false);
         }
         if let Some(existing) = self.map.get(&key) {
@@ -166,7 +169,10 @@ impl WalkCache {
         }
     }
 
-    fn build(&self, root: &Path, opts: WalkKey) -> Vec<PathBuf> {
+    fn build(&self, root: &Path, opts: WalkKey) -> (Vec<PathBuf>, bool) {
+        if !self.preflight(root, opts) {
+            return (Vec::new(), false);
+        }
         let mut builder = WalkBuilder::new(root);
         builder
             .hidden(!opts.hidden)
@@ -181,13 +187,24 @@ impl WalkCache {
         struct Sink {
             files: Vec<PathBuf>,
             path_bytes: usize,
+            exhausted: bool,
         }
-        let visited = AtomicU64::new(0);
+        let visited = Arc::new(AtomicU64::new(0));
+        let exhausted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let max_visited = self.max_visited_entries as u64;
-        builder.filter_entry(move |_| visited.fetch_add(1, Ordering::Relaxed) < max_visited);
+        let filter_visited = Arc::clone(&visited);
+        let filter_exhausted = Arc::clone(&exhausted);
+        builder.filter_entry(move |_| {
+            let admitted = filter_visited.fetch_add(1, Ordering::Relaxed) < max_visited;
+            if !admitted {
+                filter_exhausted.store(true, Ordering::Relaxed);
+            }
+            admitted
+        });
         let sink = Mutex::new(Sink {
             files: Vec::new(),
             path_bytes: 0,
+            exhausted: false,
         });
         builder.build_parallel().run(|| {
             Box::new(|result| {
@@ -200,6 +217,7 @@ impl WalkCache {
                     if sink.files.len() >= self.max_files
                         || path_bytes > self.max_path_bytes.saturating_sub(sink.path_bytes)
                     {
+                        sink.exhausted = true;
                         return WalkState::Quit;
                     }
                     sink.path_bytes += path_bytes;
@@ -213,7 +231,49 @@ impl WalkCache {
         // index order as path order when it applies a global match limit.
         let mut sink = sink.into_inner();
         sink.files.sort_unstable();
-        sink.files
+        let complete = !sink.exhausted && !exhausted.load(Ordering::Relaxed);
+        (sink.files, complete)
+    }
+
+    fn preflight(&self, root: &Path, opts: WalkKey) -> bool {
+        const MAX_IGNORE_BYTES: u64 = 16 * 1024 * 1024;
+        let mut stack = vec![root.to_path_buf()];
+        let mut visited = 0usize;
+        let mut path_bytes = root.as_os_str().len();
+        let mut ignore_bytes = 0u64;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                visited = visited.saturating_add(1);
+                let path = entry.path();
+                path_bytes = path_bytes.saturating_add(path.as_os_str().len());
+                if visited > self.max_visited_entries || path_bytes > self.max_path_bytes {
+                    return false;
+                }
+                let name = entry.file_name();
+                if matches!(
+                    name.to_str(),
+                    Some(".gitignore" | ".ignore" | ".rgignore" | ".git-blame-ignore-revs")
+                ) {
+                    ignore_bytes = ignore_bytes.saturating_add(
+                        entry
+                            .metadata()
+                            .map_or(MAX_IGNORE_BYTES + 1, |meta| meta.len()),
+                    );
+                    if ignore_bytes > MAX_IGNORE_BYTES {
+                        return false;
+                    }
+                }
+                let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    || (opts.follow_symlinks && path.metadata().is_ok_and(|meta| meta.is_dir()));
+                if is_dir {
+                    stack.push(path);
+                }
+            }
+        }
+        true
     }
 
     /// Invalidate every cached walk that overlaps `path` — both walks rooted at

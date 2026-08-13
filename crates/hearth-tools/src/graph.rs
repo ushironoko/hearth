@@ -1034,6 +1034,9 @@ fn build_sweep_delta(
         };
         engine.watch_root(root);
         let (entry, hit) = engine.walks().get(root, key);
+        if !entry.complete {
+            return Err(ToolError::invalid("graph walk exceeded its work budget"));
+        }
         if entry.files.len() > MAX_GRAPH_FILES {
             return Err(ToolError::invalid(
                 "graph implicit universe exceeds 100000 files",

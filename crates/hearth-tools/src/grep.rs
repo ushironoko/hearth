@@ -82,6 +82,9 @@ pub fn grep_cancellable(
             };
             engine.watch_root(&root);
             let (entry, hit) = engine.walks().get(&root, key);
+            if !entry.complete {
+                return Err(ToolError::invalid("grep walk exceeded its work budget"));
+            }
             if entry.files.len() > MAX_GREP_FILES {
                 return Err(ToolError::invalid("grep file set exceeds 1000000 files"));
             }

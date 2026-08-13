@@ -220,52 +220,33 @@ fn push_import(
 
 fn normalized_path(node: Node<'_>, source: &[u8]) -> Option<String> {
     const MAX_NORMALIZED_PATH_BYTES: usize = 64 * 1024;
-    enum Frame<'tree> {
-        Visit(Node<'tree>),
-        JoinScoped { has_path: bool },
-    }
 
-    let mut pending = vec![Frame::Visit(node)];
-    let mut values = Vec::new();
-    while let Some(frame) = pending.pop() {
-        match frame {
-            Frame::Visit(node) if node.kind() == "scoped_identifier" => {
-                let Some(name) = node.child_by_field_name("name") else {
-                    values.push(None);
-                    continue;
-                };
-                let path = node.child_by_field_name("path");
-                pending.push(Frame::JoinScoped {
-                    has_path: path.is_some(),
-                });
-                if let Some(path) = path {
-                    pending.push(Frame::Visit(path));
-                }
-                pending.push(Frame::Visit(name));
+    // Collect source-ordered leaf segments and join once. Rebuilding a growing
+    // prefix at every nested scoped identifier is quadratic.
+    let mut pending = vec![node];
+    let mut segments = Vec::new();
+    let mut rendered_len = 0usize;
+    while let Some(node) = pending.pop() {
+        if node.kind() == "scoped_identifier" {
+            let name = node.child_by_field_name("name")?;
+            if let Some(path) = node.child_by_field_name("path") {
+                pending.push(name);
+                pending.push(path);
+            } else {
+                pending.push(name);
             }
-            Frame::Visit(node) => values.push(
-                node_text(node, source).filter(|value| value.len() <= MAX_NORMALIZED_PATH_BYTES),
-            ),
-            Frame::JoinScoped { has_path } => {
-                let path = has_path.then(|| values.pop().flatten()).flatten();
-                let Some(name) = values.pop().flatten() else {
-                    values.push(None);
-                    continue;
-                };
-                let combined_len = path
-                    .as_ref()
-                    .map_or(name.len(), |path| path.len().saturating_add(2 + name.len()));
-                if combined_len > MAX_NORMALIZED_PATH_BYTES {
-                    values.push(None);
-                } else {
-                    values.push(Some(
-                        path.map_or(name.clone(), |path| join_path(&path, &name)),
-                    ));
-                }
-            }
+            continue;
         }
+        let segment = node_text(node, source)?;
+        rendered_len = rendered_len
+            .checked_add(usize::from(!segments.is_empty()) * 2)?
+            .checked_add(segment.len())?;
+        if rendered_len > MAX_NORMALIZED_PATH_BYTES {
+            return None;
+        }
+        segments.push(segment);
     }
-    values.pop().flatten()
+    Some(segments.join("::"))
 }
 
 fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -274,14 +255,4 @@ fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
-}
-
-fn join_path(prefix: &str, segment: &str) -> String {
-    if prefix.is_empty() {
-        segment.to_owned()
-    } else if segment.is_empty() {
-        prefix.to_owned()
-    } else {
-        format!("{prefix}::{segment}")
-    }
 }
