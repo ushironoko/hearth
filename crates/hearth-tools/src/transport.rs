@@ -15,9 +15,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const SOCKET_NAME: &str = "hearth.sock";
 const PORTABLE_SOCKET_PATH_LIMIT: usize = 100;
+const MAX_REQUEST_FRAME_DURATION: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct ValidatedEndpoint {
@@ -701,6 +703,7 @@ pub struct RequestReceiver<'a> {
     ancillary: VecDeque<AnchoredAncillary>,
     read_ahead: bool,
     poisoned: bool,
+    request_deadline: Option<Instant>,
 }
 
 impl<'a> RequestReceiver<'a> {
@@ -724,6 +727,7 @@ impl<'a> RequestReceiver<'a> {
             ancillary: VecDeque::new(),
             read_ahead,
             poisoned: false,
+            request_deadline: None,
         }
     }
 
@@ -736,7 +740,10 @@ impl<'a> RequestReceiver<'a> {
             ));
         }
 
-        match self.recv_request_inner() {
+        self.request_deadline = Instant::now().checked_add(MAX_REQUEST_FRAME_DURATION);
+        let result = self.recv_request_inner();
+        self.request_deadline = None;
+        match result {
             Ok(request) => Ok(request),
             Err(err) => {
                 self.poison();
@@ -755,6 +762,12 @@ impl<'a> RequestReceiver<'a> {
         let frame_len = 4usize
             .checked_add(len as usize)
             .ok_or_else(frame_too_large)?;
+        let available = self.bytes.len() - self.start;
+        if frame_len > available {
+            self.bytes
+                .try_reserve_exact(frame_len - available)
+                .map_err(|err| io::Error::new(io::ErrorKind::OutOfMemory, err))?;
+        }
         self.ensure_available(frame_len)?;
 
         let frame_start = self
@@ -826,6 +839,15 @@ impl<'a> RequestReceiver<'a> {
 
     fn ensure_available(&mut self, needed: usize) -> io::Result<()> {
         while self.bytes.len() - self.start < needed {
+            if self
+                .request_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "request frame deadline expired",
+                ));
+            }
             let missing = needed - (self.bytes.len() - self.start);
             let read_len = if self.read_ahead {
                 READ_CHUNK.max(missing).min(READ_CHUNK)
@@ -844,9 +866,12 @@ impl<'a> RequestReceiver<'a> {
                     "client hung up",
                 ));
             }
-            self.bytes
-                .try_reserve(received)
-                .map_err(|err| io::Error::new(io::ErrorKind::OutOfMemory, err))?;
+            let spare = self.bytes.capacity().saturating_sub(self.bytes.len());
+            if spare < received {
+                self.bytes
+                    .try_reserve_exact(received - spare)
+                    .map_err(|err| io::Error::new(io::ErrorKind::OutOfMemory, err))?;
+            }
             self.bytes.extend_from_slice(&chunk[..received]);
             if batch.present {
                 self.ancillary.push_back(AnchoredAncillary {

@@ -130,6 +130,7 @@ struct EngineInner {
     /// (e.g. a compiled-matcher cache) without `hearth-core` depending on their
     /// types.
     extensions: DashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+    path_locks: Arc<PathLocks>,
     opt_stop: Arc<AtomicBool>,
     // Kept alive for the engine's lifetime; the thread exits when `opt_stop` is set.
     #[allow(dead_code)]
@@ -202,6 +203,7 @@ impl Engine {
                 watch: Mutex::new(None),
                 watched_roots: Mutex::new(std::collections::HashSet::new()),
                 extensions: DashMap::new(),
+                path_locks: Arc::new(PathLocks::default()),
                 opt_stop,
                 opt_thread: Mutex::new(opt_thread),
             }),
@@ -319,7 +321,7 @@ impl Engine {
     /// the same file (or of a symlink alias of it) cannot interleave and lose
     /// an update. The guard releases on drop, including on unwind.
     pub fn lock_path(&self, path: &Path) -> PathGuard {
-        self.extension::<PathLocks>().lock(mutation_key(path))
+        self.inner.path_locks.lock(mutation_key(path))
     }
 
     // -- explicit cache invalidation --------------------------------------
@@ -394,10 +396,11 @@ impl Engine {
     /// Drop all resident cache state owned by this engine.
     ///
     /// Besides filesystem entries this detaches tool extensions (compiled
-    /// matchers, graph roots, warm shells, and path-lock registries) and stops
+    /// matchers, graph roots, and warm shells) and stops
     /// the current watcher. Active callers may keep an already-cloned Arc until
     /// they settle, but future calls start from empty state. Watching restarts
-    /// lazily on the next `watch_root` call.
+    /// lazily on the next `watch_root` call. The mutation lock registry is a
+    /// permanent synchronization primitive and is intentionally preserved.
     pub fn clear_caches(&self) -> InvalidateResult {
         let result = self.clear_filesystem_caches();
         self.inner.extensions.clear();

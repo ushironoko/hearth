@@ -123,7 +123,6 @@ pub fn edit_batch_cancellable(
         if params.edits.len() > MAX_BATCH_EDITS {
             return Err(ToolError::invalid("edit batch exceeds 10000 replacements"));
         }
-
         let requested = resolve_path(engine, &params.path);
         let (path, followed_symlink) = resolve_write_target(&requested, params.follow_symlinks);
         let _guard = engine.lock_path(&path);
@@ -137,6 +136,14 @@ pub fn edit_batch_cancellable(
             ToolError::new(ErrorKind::InvalidInput, "file is not valid UTF-8")
                 .with_path(params.path.clone())
         })?;
+        let matching_work = params
+            .edits
+            .len()
+            .checked_mul(raw.len())
+            .ok_or_else(|| ToolError::invalid("edit matching work overflow"))?;
+        if matching_work > 512 * 1024 * 1024 {
+            return Err(ToolError::invalid("edit batch matching work exceeds limit"));
+        }
 
         // The raw pre-edit text, BOM and line endings intact, snapshotted here
         // — while the mutation lock is held — so it and the commit below are

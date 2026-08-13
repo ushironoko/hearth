@@ -425,10 +425,10 @@ fn build_searcher(params: &GrepParams) -> Searcher {
         .build()
 }
 
-/// Files at or below this size are searched from (and pulled into) the shared
-/// cache; larger files are streamed via `search_path` so one search over a huge
-/// tree never floods the warm cache.
-const MAX_GREP_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+/// Hard per-file search bound. Every accepted file is read through the cache's
+/// nonblocking, same-FD bounded path and searched from an in-memory slice; no
+/// pathname is reopened after validation.
+const MAX_GREP_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 fn search_one(
@@ -451,10 +451,9 @@ fn search_one(
         output_full: false,
         cancel,
     };
-    // Fast path: search the cached bytes directly (no open()/read() syscalls on
-    // a warm file, and no freshness stat when `trust` is set). Oversize or
-    // uncacheable files fall back to grep-searcher's own IO. Unreadable/binary
-    // files are silently skipped, matching rg.
+    // Search only bytes returned by the cache's bounded same-FD loader. This
+    // avoids a validation/reopen race against FIFOs or device nodes. Oversize,
+    // unreadable, and binary files are skipped.
     let searched_ok = match engine
         .files()
         .get_bounded_trusting(path, MAX_GREP_CACHE_BYTES, trust)
@@ -462,11 +461,7 @@ fn search_one(
         Ok(Some((entry, _hit))) => searcher
             .search_slice(matcher, entry.bytes(), &mut sink)
             .is_ok(),
-        Ok(None) => {
-            std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
-                && searcher.search_path(matcher, path, &mut sink).is_ok()
-        }
-        Err(_) => false,
+        Ok(None) | Err(_) => false,
     };
     if !searched_ok || !sink.found {
         return None;

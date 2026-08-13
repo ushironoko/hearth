@@ -261,10 +261,17 @@ pub fn inplace_write(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<Wri
         let mut f = OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
             .mode(0o666)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
+        let metadata = f.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "in-place write target must be a regular file",
+            ));
+        }
+        f.set_len(0)?;
         f.write_all(bytes)?;
         f.flush()?;
         Ok(())
