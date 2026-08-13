@@ -25,6 +25,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 64;
+const MAX_CONNECTIONS: usize = 1024;
+const DEFAULT_MAX_IN_FLIGHT_FRAME_BYTES: usize = 512 * 1024 * 1024;
+const MIN_FRAME_RESERVATION_BYTES: usize = 256 * 1024 * 1024;
+const MAX_IN_FLIGHT_FRAME_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 5_000;
 const MAX_DRAIN_TIMEOUT_MS: u64 = 60_000;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -69,6 +73,10 @@ struct Args {
     /// Hard ceiling for simultaneously admitted client connections.
     #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
+    /// Aggregate memory reservation for admitted request frames. Each live
+    /// request receiver reserves one 256 MiB frame slot before allocating.
+    #[arg(long, default_value_t = DEFAULT_MAX_IN_FLIGHT_FRAME_BYTES)]
+    max_in_flight_frame_bytes: usize,
     /// Maximum time to drain admitted connections after shutdown starts.
     #[arg(long, default_value_t = DEFAULT_DRAIN_TIMEOUT_MS)]
     drain_timeout_ms: u64,
@@ -147,10 +155,10 @@ struct ConnectionPool {
 
 impl ConnectionPool {
     fn new(max: usize) -> io::Result<Arc<Self>> {
-        if max == 0 {
+        if max == 0 || max > MAX_CONNECTIONS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "max-connections must be greater than zero",
+                format!("max-connections must be between 1 and {MAX_CONNECTIONS}"),
             ));
         }
         Ok(Arc::new(Self {
@@ -197,6 +205,48 @@ impl ConnectionPool {
     }
 }
 
+struct FrameBudget {
+    slots: usize,
+    active: Mutex<usize>,
+}
+
+impl FrameBudget {
+    fn new(bytes: usize) -> io::Result<Arc<Self>> {
+        if !(MIN_FRAME_RESERVATION_BYTES..=MAX_IN_FLIGHT_FRAME_BYTES).contains(&bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max-in-flight-frame-bytes must be between 256 MiB and 4 GiB",
+            ));
+        }
+        Ok(Arc::new(Self {
+            slots: bytes / MIN_FRAME_RESERVATION_BYTES,
+            active: Mutex::new(0),
+        }))
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<FramePermit> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if *active >= self.slots {
+            return None;
+        }
+        *active += 1;
+        Some(FramePermit {
+            budget: Arc::clone(self),
+        })
+    }
+}
+
+struct FramePermit {
+    budget: Arc<FrameBudget>,
+}
+
+impl Drop for FramePermit {
+    fn drop(&mut self) {
+        let mut active = self.budget.active.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+    }
+}
+
 struct ConnectionPermit {
     pool: Arc<ConnectionPool>,
 }
@@ -238,6 +288,7 @@ fn main() -> ExitCode {
 fn run(args: Args) -> io::Result<LifecycleState> {
     validate_daemon_uid(effective_uid())?;
     let connections = ConnectionPool::new(args.max_connections)?;
+    let frames = FrameBudget::new(args.max_in_flight_frame_bytes)?;
     let drain_timeout = validate_drain_timeout(args.drain_timeout_ms)?;
     let endpoint = match args.socket.as_deref() {
         Some(path) => validate_endpoint_path(path)?,
@@ -286,11 +337,12 @@ fn run(args: Args) -> io::Result<LifecycleState> {
                 }
                 let worker_engine = engine.clone();
                 let worker_lifecycle = Arc::clone(&lifecycle);
+                let worker_frames = Arc::clone(&frames);
                 match std::thread::Builder::new()
                     .name("hearthd-connection".into())
                     .spawn(move || {
                         let _permit = permit;
-                        handle_conn(stream, worker_engine, worker_lifecycle);
+                        handle_conn(stream, worker_engine, worker_lifecycle, worker_frames);
                     }) {
                     Ok(worker) => workers.push(worker),
                     Err(error) => eprintln!("hearthd: failed to spawn connection thread: {error}"),
@@ -366,13 +418,21 @@ fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
     }
 }
 
-fn handle_conn(stream: UnixStream, engine: Engine, lifecycle: Arc<Lifecycle>) {
+fn handle_conn(
+    stream: UnixStream,
+    engine: Engine,
+    lifecycle: Arc<Lifecycle>,
+    frames: Arc<FrameBudget>,
+) {
     let mut writer = &stream;
     let mut requests = hearth_tools::transport::RequestReceiver::new(&stream);
     loop {
         if !lifecycle.is_accepting() {
             break;
         }
+        let Some(_frame_permit) = frames.try_acquire() else {
+            break;
+        };
         let (req, fd) = match requests.recv_request() {
             Ok(value) => value,
             Err(error)
@@ -475,6 +535,18 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_frame_budget_is_bounded_and_released() {
+        assert!(FrameBudget::new(MIN_FRAME_RESERVATION_BYTES - 1).is_err());
+        let budget = FrameBudget::new(MIN_FRAME_RESERVATION_BYTES * 2).unwrap();
+        let first = budget.try_acquire().unwrap();
+        let second = budget.try_acquire().unwrap();
+        assert!(budget.try_acquire().is_none());
+        drop(first);
+        assert!(budget.try_acquire().is_some());
+        drop(second);
+    }
+
+    #[test]
     fn drain_timeout_is_bounded() {
         assert_eq!(
             validate_drain_timeout(DEFAULT_DRAIN_TIMEOUT_MS).unwrap(),
@@ -525,7 +597,9 @@ mod tests {
         let lifecycle = Arc::new(Lifecycle::new());
         let worker_lifecycle = Arc::clone(&lifecycle);
         let (server, client) = UnixStream::pair().unwrap();
-        let worker = std::thread::spawn(move || handle_conn(server, engine, worker_lifecycle));
+        let frames = FrameBudget::new(DEFAULT_MAX_IN_FLIGHT_FRAME_BYTES).unwrap();
+        let worker =
+            std::thread::spawn(move || handle_conn(server, engine, worker_lifecycle, frames));
 
         hearth_tools::transport::send_request_with_fd(&client, &Request::Shutdown, None).unwrap();
         let mut reader = &client;

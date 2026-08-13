@@ -503,8 +503,9 @@ atomic stdout.
 
 | Resource | Default/hard maximum |
 |---|---:|
-| Daemon connections | 64 (configurable `--max-connections`) |
+| Daemon connections | 64 default; 1,024 maximum (`--max-connections`) |
 | Request/response frame | 256 MiB |
+| Aggregate admitted frame reservation | 512 MiB default; 4 GiB maximum |
 | Shutdown drain | 5 s default, 60 s maximum |
 | Bash timeout | 120 s default, 24 h maximum |
 | Bash collected/streamed output | 16 MiB total; excess drained and discarded |
