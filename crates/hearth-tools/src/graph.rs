@@ -38,6 +38,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 const MAX_GRAPH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_GRAPH_ROOTS: usize = 16;
+const MAX_GRAPH_RESIDENT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RDEPS_REPAIR: usize = 256;
 const MAX_RDEPS_GREP_CANDIDATES: u64 = 1024;
 const MAX_SWEEP_PUBLISH_REBUILDS: usize = 3;
@@ -173,7 +174,7 @@ impl Default for GraphState {
 }
 
 impl GraphState {
-    fn root(&self, path: &Path) -> RootQueryPin {
+    fn root(self: &Arc<Self>, path: &Path) -> RootQueryPin {
         let root = {
             let entry = self
                 .roots
@@ -185,8 +186,11 @@ impl GraphState {
         };
         self.touch(&root);
         run_graph_test_hook(path, GraphTestPoint::RootPinned);
-        self.evict_roots(path, &root);
-        RootQueryPin { root }
+        self.evict_roots();
+        RootQueryPin {
+            graph_state: Arc::clone(self),
+            root,
+        }
     }
 
     fn touch(&self, root: &RootGraph) {
@@ -196,18 +200,16 @@ impl GraphState {
         }
     }
 
-    fn evict_roots(&self, current_path: &Path, current_root: &Arc<RootGraph>) {
-        while self.roots.len() > MAX_GRAPH_ROOTS {
+    fn evict_roots(&self) {
+        while self.roots.len() > MAX_GRAPH_ROOTS
+            || self.estimated_bytes() > MAX_GRAPH_RESIDENT_BYTES
+        {
             // Inspect every candidate: a busy sweep may temporarily push the
             // map over the cap, but any later query retries the eviction.
             let victim = self
                 .roots
                 .iter()
-                .filter(|entry| {
-                    entry.key().as_path() != current_path
-                        && !Arc::ptr_eq(entry.value(), current_root)
-                        && entry.value().active_queries.load(Ordering::SeqCst) == 0
-                })
+                .filter(|entry| entry.value().active_queries.load(Ordering::SeqCst) == 0)
                 .filter_map(|entry| {
                     let last_access = entry.value().sweep.try_lock()?.last_access;
                     Some((entry.key().clone(), Arc::clone(entry.value()), last_access))
@@ -225,15 +227,26 @@ impl GraphState {
             }
         }
     }
+
+    fn estimated_bytes(&self) -> u64 {
+        self.roots
+            .iter()
+            .map(|entry| entry.value().estimated_bytes())
+            .sum()
+    }
 }
 
 struct RootQueryPin {
+    graph_state: Arc<GraphState>,
     root: Arc<RootGraph>,
 }
 
 impl Drop for RootQueryPin {
     fn drop(&mut self) {
         self.root.active_queries.fetch_sub(1, Ordering::SeqCst);
+        // A cold build may push resident bytes over budget after root()'s
+        // admission-time eviction. Retry once the query unpins the built root.
+        self.graph_state.evict_roots();
     }
 }
 
@@ -254,6 +267,11 @@ impl RootGraph {
             rdeps_flights: Mutex::new(FxHashMap::default()),
             active_queries: AtomicU64::new(0),
         }
+    }
+
+    fn estimated_bytes(&self) -> u64 {
+        let state = self.state.read();
+        state.estimated_bytes()
     }
 }
 
@@ -303,6 +321,29 @@ impl RootState {
             last_sweep_at: None,
             build_duration_us: None,
         }
+    }
+
+    fn estimated_bytes(&self) -> u64 {
+        let paths = self
+            .records
+            .keys()
+            .chain(self.config_records.keys())
+            .chain(self.supported_universe.iter())
+            .map(|path| path.len() as u64)
+            .sum::<u64>();
+        let nodes = self.graph.paths().count() as u64;
+        let edges = self.graph.edge_count() as u64;
+        let symbols = self.index.symbol_count() as u64;
+        let files = self.index.file_count() as u64;
+        // Conservative structural accounting. String capacities and allocator
+        // metadata vary by platform, so multiply logical payloads rather than
+        // claiming exact RSS. The hard root-count cap remains a second bound.
+        paths
+            .saturating_mul(3)
+            .saturating_add(nodes.saturating_mul(512))
+            .saturating_add(edges.saturating_mul(256))
+            .saturating_add(symbols.saturating_mul(512))
+            .saturating_add(files.saturating_mul(256))
     }
 }
 
