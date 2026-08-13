@@ -269,6 +269,10 @@ impl FrameBudget {
         }))
     }
 
+    fn has_capacity(&self) -> bool {
+        *self.active.lock().unwrap_or_else(|e| e.into_inner()) < self.slots
+    }
+
     fn try_acquire(self: &Arc<Self>) -> Option<FramePermit> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         if *active >= self.slots {
@@ -398,6 +402,25 @@ fn run(args: Args) -> io::Result<LifecycleState> {
                     }
                     continue;
                 };
+                if !frames.has_capacity() {
+                    drop(permit);
+                    let Some(control_permit) = controls.try_acquire() else {
+                        drop(stream);
+                        continue;
+                    };
+                    let control_lifecycle = Arc::clone(&lifecycle);
+                    let control_frames = Arc::clone(&frames);
+                    match std::thread::Builder::new()
+                        .name("hearthd-frame-overload-control".into())
+                        .spawn(move || {
+                            let _permit = control_permit;
+                            handle_overload_control(stream, control_lifecycle, control_frames);
+                        }) {
+                        Ok(worker) => workers.push(worker),
+                        Err(error) => eprintln!("hearthd: failed to spawn control thread: {error}"),
+                    }
+                    continue;
+                }
                 if let Err(error) = stream.set_read_timeout(Some(IDLE_CONNECTION_POLL_INTERVAL)) {
                     eprintln!("hearthd: failed to configure connection timeout: {error}");
                     continue;
