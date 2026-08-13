@@ -3621,7 +3621,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_insertions_do_not_evict_each_other() {
+    fn concurrent_insertions_preserve_the_hard_root_cap() {
         let parent = tempfile::tempdir().unwrap();
         let parent = parent.path().canonicalize().unwrap();
         let engine = engine();
@@ -3669,7 +3669,7 @@ mod tests {
 
         assert!(thread_a.join().unwrap().is_ok());
         assert!(thread_b.join().unwrap().is_ok());
-        assert_eq!(graph_test_root_count(&engine), MAX_GRAPH_ROOTS + 1);
+        assert!(graph_test_root_count(&engine) <= MAX_GRAPH_ROOTS);
 
         graph_test_set_hook(&root_a, None);
         graph_test_set_hook(&root_b, None);
