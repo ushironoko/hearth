@@ -48,6 +48,7 @@ const MAX_GRAPH_PATH_BYTES: usize = 64 * 1024;
 const MAX_GRAPH_QUERY_BYTES: usize = 1024 * 1024;
 const MAX_GRAPH_DEPTH: u32 = 64;
 const MAX_GRAPH_RESULTS: u64 = 100_000;
+const MAX_GRAPH_BUILD_BYTES: usize = 256 * 1024 * 1024;
 
 /// Run a graph query without a live cancellation token.
 pub fn graph(engine: &Engine, params: &GraphParams) -> ToolResult<GraphResult> {
@@ -1007,8 +1008,24 @@ fn build_sweep_delta(
         };
         engine.watch_root(root);
         let (entry, hit) = engine.walks().get(root, key);
+        if entry.files.len() > MAX_GRAPH_FILES {
+            return Err(ToolError::invalid(
+                "graph implicit universe exceeds 100000 files",
+            ));
+        }
         (entry.files.as_ref().clone(), hit)
     };
+
+    if universe
+        .iter()
+        .map(|path| path.as_os_str().len())
+        .sum::<usize>()
+        > MAX_GRAPH_QUERY_BYTES.saturating_mul(64)
+    {
+        return Err(ToolError::invalid(
+            "graph universe path bytes exceed 64 MiB",
+        ));
+    }
 
     let mut relative_universe = FxHashSet::default();
     let mut upserts = Vec::new();
@@ -1016,6 +1033,7 @@ fn build_sweep_delta(
     let mut excluded = FxHashSet::default();
     let mut supported_universe = FxHashSet::default();
     let mut parser_pool = ParserPool::new(registry);
+    let mut build_bytes = 0usize;
     let mut counters = RootCounters {
         universe_files: universe.len() as u64,
         walk_cache_hit,
@@ -1114,6 +1132,33 @@ fn build_sweep_delta(
                 .expect("classified graph universe paths are UTF-8"),
         );
         let analysis = analyze_source(source, absolute.as_str(), hash, &mut parser_pool);
+        let analysis_bytes = analysis
+            .path
+            .len()
+            .saturating_add(
+                analysis
+                    .language
+                    .as_ref()
+                    .map_or(0, |language| language.len()),
+            )
+            .saturating_add(
+                analysis
+                    .symbols
+                    .iter()
+                    .map(|symbol| symbol.name.len().saturating_add(size_of::<Symbol>()))
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                analysis
+                    .imports
+                    .iter()
+                    .map(|import| import.specifier.len().saturating_add(size_of_val(import)))
+                    .sum::<usize>(),
+            );
+        if analysis_bytes > MAX_GRAPH_BUILD_BYTES.saturating_sub(build_bytes) {
+            return Err(ToolError::invalid("graph build exceeds byte limit"));
+        }
+        build_bytes += analysis_bytes;
         if CancelSignal::is_cancelled(&cancel_signal) {
             return Err(ToolError::cancelled());
         }
@@ -1188,6 +1233,12 @@ fn answer_query(
                 &filter,
                 caller_view.as_ref(),
             )?;
+            if result.edges.len().saturating_add(result.unresolved.len())
+                > MAX_GRAPH_RESULTS as usize
+                || result.coverage.basis.len() > MAX_GRAPH_RESULTS as usize
+            {
+                return Err(ToolError::invalid("graph dependency result exceeds limit"));
+            }
             (GraphOutput::Deps(result), Some(guarantee))
         }
         GraphOp::Rdeps {
@@ -1204,6 +1255,13 @@ fn answer_query(
                 &filter,
                 caller_view.as_ref(),
             )?;
+            if result.importers.len() > MAX_GRAPH_RESULTS as usize
+                || result.coverage.basis.len() > MAX_GRAPH_RESULTS as usize
+            {
+                return Err(ToolError::invalid(
+                    "graph reverse dependency result exceeds limit",
+                ));
+            }
             let freshness_guarantee = graph_meta(root, state, freshness).guarantee;
             result.verified =
                 guarantee == Guarantee::Exact && freshness_guarantee == GraphGuarantee::Exact;
@@ -1219,6 +1277,13 @@ fn answer_query(
                 &filter,
                 caller_view.as_ref(),
             )?;
+            if result.nodes.len().saturating_add(result.edges.len()) > MAX_GRAPH_RESULTS as usize
+                || result.coverage.basis.len() > MAX_GRAPH_RESULTS as usize
+            {
+                return Err(ToolError::invalid(
+                    "graph neighborhood result exceeds limit",
+                ));
+            }
             (GraphOutput::Neighborhood(result), Some(guarantee))
         }
         GraphOp::Status => {
