@@ -2267,7 +2267,7 @@ fn rdeps_grep_candidates(
                 })
             })
             .collect(),
-        limit_reached: grep.limit_reached,
+        limit_reached: grep.limit_reached || grep.incomplete,
     })
 }
 

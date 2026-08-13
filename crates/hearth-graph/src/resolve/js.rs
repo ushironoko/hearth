@@ -26,6 +26,7 @@ const MAX_TSCONFIG_BYTES: usize = 1024 * 1024;
 const MAX_RESOLVER_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TSCONFIG_EXTENDS_ENTRIES: usize = 32;
 const MAX_TSCONFIG_EXTENDS_VISITS: usize = 256;
+const MAX_RESOLUTION_MEMO_ENTRIES: usize = 65_536;
 
 /// Configuration for JavaScript and TypeScript module resolution.
 #[derive(Debug, Clone)]
@@ -153,7 +154,11 @@ impl Resolve for JsResolver {
         let mut dependency_paths: Vec<PathBuf> = self.configured_tsconfig.iter().cloned().collect();
         let mut notes = Vec::new();
         let mut tsconfig_tracking_truncated = false;
-        let tsconfig = match resolver.find_tsconfig(from_path) {
+        let discovered = match &self.configured_tsconfig {
+            Some(configured) => resolver.find_tsconfig(configured),
+            None => resolver.find_tsconfig(from_path),
+        };
+        let tsconfig = match discovered {
             Ok(tsconfig) => tsconfig,
             Err(error) => {
                 if let Some(configured_tsconfig) = &self.configured_tsconfig {
@@ -251,6 +256,9 @@ impl JsResolver {
             outcome.dependencies.extend(dependencies.iter().cloned());
         }
         normalize_dependencies(&mut outcome.dependencies);
+        if memo.len() >= MAX_RESOLUTION_MEMO_ENTRIES && !memo.contains_key(&key) {
+            memo.clear();
+        }
         memo.insert(key, outcome.dependencies.clone());
         outcome
     }

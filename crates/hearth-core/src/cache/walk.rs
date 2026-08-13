@@ -199,6 +199,7 @@ impl WalkCache {
             files: Vec<PathBuf>,
             path_bytes: usize,
             exhausted: bool,
+            io_failed: bool,
         }
         let visited = Arc::new(AtomicU64::new(0));
         let exhausted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -216,12 +217,18 @@ impl WalkCache {
             files: Vec::new(),
             path_bytes: 0,
             exhausted: false,
+            io_failed: false,
         });
         builder.build_parallel().run(|| {
             Box::new(|result| {
-                if let Ok(entry) = result
-                    && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
-                {
+                let entry = match result {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        sink.lock().io_failed = true;
+                        return WalkState::Continue;
+                    }
+                };
+                if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     let path = entry.into_path();
                     let path_bytes = path.as_os_str().len();
                     let mut sink = sink.lock();
@@ -242,7 +249,7 @@ impl WalkCache {
         // index order as path order when it applies a global match limit.
         let mut sink = sink.into_inner();
         sink.files.sort_unstable();
-        let complete = !sink.exhausted && !exhausted.load(Ordering::Relaxed);
+        let complete = !sink.exhausted && !sink.io_failed && !exhausted.load(Ordering::Relaxed);
         (sink.files, complete)
     }
 
@@ -254,9 +261,12 @@ impl WalkCache {
         let mut ignore_bytes = 0u64;
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
+                return false;
             };
-            for entry in entries.flatten() {
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return false;
+                };
                 visited = visited.saturating_add(1);
                 let path = entry.path();
                 path_bytes = path_bytes.saturating_add(path.as_os_str().len());

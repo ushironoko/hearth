@@ -126,8 +126,16 @@ fn tracks_configured_selected_and_extended_tsconfigs() {
     );
 
     assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
-    for config in [configured, selected, first, second, grandparent] {
-        assert_dependency(&outcome, &config);
+    // Project-reference fan-out is deliberately not traversed recursively:
+    // expanding it before bounded tracking permits unbounded config work.
+    assert_dependency(&outcome, &configured);
+    for unexpanded in [selected, first, second, grandparent] {
+        assert!(
+            !outcome
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.as_str() == path_str(&unexpanded))
+        );
     }
 }
 

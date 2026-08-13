@@ -103,6 +103,7 @@ pub fn grep_cancellable(
         let searched = AtomicU64::new(0);
         let result_bytes = AtomicUsize::new(0);
         let result_exhausted = AtomicBool::new(false);
+        let incomplete = AtomicBool::new(false);
         let threads = engine.config().walk_threads.min(indices.len().max(1));
         let (tx, rx) = crossbeam_channel::unbounded::<(usize, usize)>();
         for (slot, &i) in indices.iter().enumerate() {
@@ -122,6 +123,7 @@ pub fn grep_cancellable(
                     let searched = &searched;
                     let result_bytes = &result_bytes;
                     let result_exhausted = &result_exhausted;
+                    let incomplete = &incomplete;
                     let params = &params;
                     let engine_ref = engine;
                     scope.spawn(move || {
@@ -137,7 +139,7 @@ pub fn grep_cancellable(
                                 break;
                             }
                             searched.fetch_add(1, Ordering::Relaxed);
-                            let found = search_one(
+                            let (found, complete) = search_one(
                                 &mut searcher,
                                 &matcher,
                                 engine_ref,
@@ -146,6 +148,9 @@ pub fn grep_cancellable(
                                 trust,
                                 cancel,
                             );
+                            if !complete {
+                                incomplete.store(true, Ordering::Release);
+                            }
                             let count = found.as_ref().map(|f| f.match_count).unwrap_or(0);
                             if let Some(fm) = found {
                                 let bytes = file_matches_bytes(&fm);
@@ -203,6 +208,7 @@ pub fn grep_cancellable(
             files_searched,
             walk_cache_hit: walk_hit,
             limit_reached,
+            incomplete: incomplete.load(Ordering::Acquire),
             root: root.display().to_string(),
             root_is_dir,
         })
@@ -465,7 +471,7 @@ fn search_one(
     params: &GrepParams,
     trust: bool,
     cancel: &CancelToken,
-) -> Option<FileMatches> {
+) -> (Option<FileMatches>, bool) {
     let mut sink = CollectSink {
         mode: params.mode,
         max_count: params.max_count,
@@ -490,13 +496,16 @@ fn search_one(
         Ok(None) | Err(_) => false,
     };
     if !searched_ok || !sink.found {
-        return None;
+        return (None, searched_ok);
     }
-    Some(FileMatches {
-        path: path.display().to_string(),
-        match_count: sink.match_count,
-        lines: sink.materialize(),
-    })
+    (
+        Some(FileMatches {
+            path: path.display().to_string(),
+            match_count: sink.match_count,
+            lines: sink.materialize(),
+        }),
+        true,
+    )
 }
 
 /// A span into [`CollectSink::blob`] describing one collected line.

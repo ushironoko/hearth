@@ -642,6 +642,9 @@ pub struct GrepResult {
     pub walk_cache_hit: bool,
     /// True when `maxTotalCount` capped the result. More matches exist.
     pub limit_reached: bool,
+    /// True when at least one selected file could not be searched completely.
+    #[serde(default)]
+    pub incomplete: bool,
     /// The resolved search root, so a caller can relativize `files[].path`
     /// exactly the way it intends without re-resolving the request path.
     pub root: String,
