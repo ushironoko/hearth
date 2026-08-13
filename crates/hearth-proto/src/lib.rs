@@ -554,7 +554,8 @@ pub struct GrepParams {
     /// Stop after this many matches **per file**. `None` is unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_count: Option<u64>,
-    /// Stop after this many matches **across all files**. `None` is unlimited.
+    /// Stop after this many matches **across all files**. `None` uses the
+    /// hard safety default of 100,000 matches.
     ///
     /// The kept matches are the first `maxTotalCount` in path order, which does
     /// not depend on how the parallel search happened to interleave.

@@ -619,6 +619,8 @@ export interface GrepResult {
   walkCacheHit: boolean
   /** True when `maxTotalCount` capped the result; more matches exist. */
   limitReached: boolean
+  /** True when at least one selected file could not be searched completely. */
+  incomplete: boolean
   /** The resolved search root. */
   root: string
   rootIsDir: boolean

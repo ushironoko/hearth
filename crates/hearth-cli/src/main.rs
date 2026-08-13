@@ -499,7 +499,17 @@ fn render(global: &Global, cmd: &Cmd, resp: &Response) -> i32 {
                 }
             }
             print!("{out}");
-            if g.total_matches == 0 { 1 } else { 0 }
+            if g.incomplete {
+                eprintln!("error: grep could not search every selected file completely");
+                2
+            } else if g.limit_reached {
+                eprintln!("warning: grep result limit reached");
+                0
+            } else if g.total_matches == 0 {
+                1
+            } else {
+                0
+            }
         }
         Response::EditBatch(r) => {
             eprintln!("{} replacement(s)", r.replacements);
