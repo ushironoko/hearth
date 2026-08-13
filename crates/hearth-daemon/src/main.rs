@@ -8,9 +8,9 @@ mod endpoint;
 
 use clap::Parser;
 use endpoint::BoundEndpoint;
-use hearth_core::{Engine, EngineConfig};
+use hearth_core::{CancelToken, Engine, EngineConfig};
 use hearth_proto::{ReadParams, Request, Response, StreamedResult, ToolError};
-use hearth_tools::dispatch;
+use hearth_tools::dispatch_cancellable;
 use hearth_tools::transport::{
     effective_uid, prepare_default_endpoint, validate_endpoint_path, verify_peer_uid, write_msg,
 };
@@ -85,12 +85,14 @@ enum LifecycleState {
 
 struct Lifecycle {
     state: AtomicU8,
+    cancel: CancelToken,
 }
 
 impl Lifecycle {
     fn new() -> Self {
         Self {
             state: AtomicU8::new(LifecycleState::Accepting as u8),
+            cancel: CancelToken::new(),
         }
     }
 
@@ -109,6 +111,7 @@ impl Lifecycle {
     }
 
     fn begin_draining(&self) {
+        self.cancel.cancel();
         let _ = self.state.compare_exchange(
             LifecycleState::Accepting as u8,
             LifecycleState::Draining as u8,
@@ -397,7 +400,7 @@ fn handle_conn(stream: UnixStream, engine: Engine, lifecycle: Arc<Lifecycle>) {
         let resp = if let (Some(fd), Request::Read(params)) = (fd.as_ref(), &req) {
             stream_read(&engine, params, fd)
         } else {
-            dispatch(&engine, req)
+            dispatch_cancellable(&engine, req, &lifecycle.cancel)
         };
         if write_msg(&mut writer, &resp).is_err() || is_shutdown {
             break;
