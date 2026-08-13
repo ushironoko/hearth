@@ -21,6 +21,23 @@ env:
   RUST_CACHE_SAVE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 jobs:
+  security:
+    name: RustSec advisory audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Audit locked dependencies
+        run: cargo audit --locked --deny warnings
+
   workflows:
     name: workflow lint
     runs-on: ubuntu-latest
