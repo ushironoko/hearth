@@ -410,7 +410,9 @@ fn run_once(
     let mut out = Delimited::new(nonce.as_bytes());
     let mut err = Delimited::new(nonce.as_bytes());
     let mut ctrl = Control::default();
-    let deadline = Instant::now() + timeout;
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return Dispatch::NotDispatched;
+    };
     let mut settled_at: Option<Instant> = None;
     let mut killed: Option<Dispatch> = None;
     let mut broken = false;

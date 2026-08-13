@@ -104,7 +104,7 @@ pub fn read_cancellable(
             )));
         }
         let end_line = match params.limit {
-            Some(n) if n > 0 => (start_line + n - 1).min(total_lines),
+            Some(n) if n > 0 => start_line.saturating_add(n - 1).min(total_lines),
             _ => total_lines,
         };
 

@@ -78,6 +78,41 @@ fn a_file_without_a_trailing_newline_counts_the_same_in_both_modes() {
 }
 
 #[test]
+fn extreme_line_windows_clip_without_overflowing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seed(dir.path(), "extreme.txt", "one\ntwo\nthree\n");
+    let eng = engine(dir.path());
+
+    let all = read(
+        &eng,
+        &ReadParams {
+            path: path.clone(),
+            offset: Some(1),
+            limit: Some(u64::MAX),
+            line_numbers: false,
+            line_mode: LineWindowMode::Slice,
+        },
+    )
+    .unwrap();
+    assert_eq!(all.content, "one\ntwo\nthree\n");
+    assert_eq!(all.returned_lines, 3);
+
+    let tail = read(
+        &eng,
+        &ReadParams {
+            path,
+            offset: Some(2),
+            limit: Some(u64::MAX),
+            line_numbers: false,
+            line_mode: LineWindowMode::Slice,
+        },
+    )
+    .unwrap();
+    assert_eq!(tail.content, "two\nthree\n");
+    assert_eq!(tail.returned_lines, 2);
+}
+
+#[test]
 fn an_offset_past_the_end_is_an_error_and_a_limit_past_it_is_not() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());

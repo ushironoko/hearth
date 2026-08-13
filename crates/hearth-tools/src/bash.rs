@@ -39,6 +39,11 @@ const CANCEL_POLL: Duration = Duration::from_millis(10);
 /// How long to wait for a killed process group to be reaped before giving up.
 const REAP_GRACE: Duration = Duration::from_secs(5);
 
+/// Maximum caller-selectable command timeout. Long builds remain supported,
+/// while hostile `u64::MAX` input can never overflow `Instant` arithmetic or
+/// pin a daemon operation indefinitely.
+pub const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Run a command, discarding the stream.
 pub fn bash(engine: &Engine, params: &BashParams) -> ToolResult<BashResult> {
     bash_stream(engine, params, &CancelToken::none(), &mut |_| {})
@@ -76,7 +81,8 @@ pub fn bash_stream(
                 .timeout_ms
                 .unwrap_or(engine.config().bash_timeout_ms)
                 .max(1),
-        );
+        )
+        .min(MAX_BASH_TIMEOUT);
         let spec = params
             .shell
             .clone()
@@ -86,7 +92,10 @@ pub fn bash_stream(
         let mut emitter = Emitter::new(params.collect_output, on_chunk);
 
         // Opt-in warm-shell fast path.
-        if engine.config().warm_shell {
+        // A pooled shell inherited the daemon environment before this call, so
+        // it cannot truthfully implement env_clear. Route such calls through
+        // the fresh-spawn path, where Command::env_clear is authoritative.
+        if engine.config().warm_shell && !params.env_clear {
             let pool = engine.extension::<WarmShellPool>();
             let dispatch = pool.run(
                 &spec.program,
@@ -321,7 +330,9 @@ fn spawn_bash(
         let _ = tx.send(Ev::Exited(status));
     });
 
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| ToolError::invalid("bash timeout exceeds platform range"))?;
     let mut out_eof = false;
     let mut err_eof = false;
     let mut exited: Option<Option<ExitStatus>> = None;

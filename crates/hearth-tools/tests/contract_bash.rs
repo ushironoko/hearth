@@ -379,6 +379,41 @@ fn cwd_and_environment_are_honoured() {
 }
 
 #[test]
+fn warm_shell_mode_honours_env_clear_via_fresh_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = warm_engine(dir.path());
+
+    let cleared = bash(
+        &eng,
+        &BashParams {
+            env: vec![("ONLY".into(), "this".into())],
+            env_clear: true,
+            ..BashParams::new("printf '%s|%s' \"$ONLY\" \"$HOME\"")
+        },
+    )
+    .unwrap();
+
+    assert_eq!(cleared.stdout, "this|");
+}
+
+#[test]
+fn extreme_timeout_is_clamped_before_deadline_arithmetic() {
+    let dir = tempfile::tempdir().unwrap();
+    for eng in [engine(dir.path()), warm_engine(dir.path())] {
+        let result = bash(
+            &eng,
+            &BashParams {
+                timeout_ms: Some(u64::MAX),
+                ..BashParams::new("printf bounded")
+            },
+        )
+        .unwrap();
+        assert_eq!(result.stdout, "bounded");
+        assert_eq!(result.exit_code, 0);
+    }
+}
+
+#[test]
 fn collect_output_can_be_turned_off_for_a_streaming_caller() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
