@@ -16,7 +16,11 @@
 | `7f7858c` | HD-02/03/04/05/09/11/12/15/17: private endpoint、peer UID、lifetime lock/dev+ino cleanup、stateful framing、FD CLOEXEC/validation、short I/O、connection cap、at-most-once CLI、root拒否、bounded drain | transport 16 tests; daemon 13 tests; CLI/workspace tests; Clippy |
 | `205c35d`, `8eacce8` | LLM threat model、same-UID authority、adapter責務、pinned RustSec CI | documentation review; workflow lint対象 |
 
-未完了 finding は引き続き open である。特に protocol handshake/aggregate in-flight budget、Graph byte budget、watcher root limit、daemon cancellation propagation、escaped descendant containmentは後続対応または明示したportable limitationが必要。
+### Remediation status
+
+監査で特定した実装上のP0/P1欠陥は `security/hearth-hardening` で修正した。protocol handshake、aggregate frame/decode budget、Graph build/resident/traversal budget、watch/walk budget、request cancellation、secure endpoint/FD/temp/file I/O、at-most-once CLI、full cache resetを回帰試験で固定している。安全な上限はoptimizer無効時も強制される。
+
+残る設計上の制約は、同一UIDクライアントへOSユーザー相当の権限を与えること、UIDごとに単一socketでworkspace境界を提供しないこと、POSIX process groupから意図的に離脱したdescendantのportable containmentがbest effortであること。bounded walkはregularなroot-local `.ignore`/`.rgignore`だけを扱い、ancestor/global Git ignoreと`.git/info/exclude`を展開しない。JS resolver configはregular file・1 MiB以下で、tsconfig project-reference fan-outは自動展開しない。
 
 ## 1. 結論
 
@@ -27,7 +31,7 @@
 1. daemon を非特権ユーザーで実行する。
 2. socket の親ディレクトリが当該ユーザーだけにアクセス可能である。
 3. 同一 UID の全プロセスを信頼する。
-4. 入力規模とクライアント数が善意で、可用性攻撃を想定しない。
+4. daemonのhard limitに加え、LLM adapter側でもroot/operation/environment/approvalを制限する。
 5. daemon が保持する環境変数、OS 権限、TCC/entitlement 等がクライアントより強くない。
 
 `hearthd` を別 UID、root、権限の強い launch agent/service、複数信頼ドメインで共有する構成は、現状では安全でない。また、同一 UID の侵害プロセスを防御対象にする場合、socket `0600` や peer UID 検査だけでは境界にならない。別サービス UID、OS sandbox、継承済み FD 等による能力分離が必要である。

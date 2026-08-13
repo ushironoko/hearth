@@ -82,6 +82,8 @@ What that buys, **measured** (Apple Silicon, `--release`; see
 
 ### Limits
 
+Safety ceilings are enforced even with the optimizer disabled: 256 MiB wire frames with bounded MessagePack structure, 30 s frame receipt, 64 MiB read/edit files, 16 MiB per searched file, 4 MiB aggregate grep results, bounded walk/build/result state, and a 24 h maximum Bash timeout. Directory walks honor only bounded root-local `.ignore`/`.rgignore`; ancestor/global Git ignore files and project-reference tsconfig fan-out are intentionally not expanded.
+
 Hearth wins where the amortized work it saves exceeds the cost of reaching it.
 Where it doesn't:
 
@@ -104,7 +106,7 @@ Where it doesn't:
 ```
                  ┌──────────────────────── one resident Engine ─────────────────────────┐
    native Rust ──┤  FileCache   — file contents cached, validated by mtime/size           │
-   napi (Node) ──┤  WalkCache   — directory walk (+ .gitignore) cached per root            │
+   napi (Node) ──┤  WalkCache   — bounded directory walk (+ root-local ignore) per root    │
    daemon/CLI  ──┤  WarmShells  — opt-in pooled shells for bash                            │
                  │  fs-watch    — best-effort proactive invalidation                       │
                  │  (caches are bounded by an LRU byte budget, so the daemon stays small)  │

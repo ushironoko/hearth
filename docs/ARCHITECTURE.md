@@ -504,14 +504,18 @@ atomic stdout.
 | Resource | Default/hard maximum |
 |---|---:|
 | Daemon connections | 64 default; 1,024 maximum (`--max-connections`) |
-| Request/response frame | 256 MiB |
+| Request/response frame | 256 MiB; 30 s receive deadline; 1,000,000 MessagePack values / depth 64 |
 | Aggregate admitted frame reservation | 512 MiB default; 4 GiB maximum |
 | Shutdown drain | 5 s default, 60 s maximum |
 | Bash timeout | 120 s default, 24 h maximum |
 | Bash collected/streamed output | 16 MiB total; excess drained and discarded |
 | File cache | 65,536 entries, 1 GiB hard max including reserved line-index heap |
-| Walk cache | 64 snapshots |
+| Tool read/edit file and rewritten result | 64 MiB |
+| Walk cache | 64 snapshots; 1,000,000 visited/files and 256 MiB path bytes; 16 MiB root-local ignore files |
 | Grep matcher/glob cache | 256 entries per cache |
-| Grep content bytes | 4 MiB per file |
+| Grep content/result bytes | 16 MiB per file; 4 MiB aggregate result |
 | Grep pattern/globs/context/matches | 1 MiB / 256×16 KiB / 10,000 / 1,000,000 |
 | Graph files/path/query/depth/results | 100,000 / 64 KiB / 1 MiB / 64 / 100,000 |
+| Graph build/resident roots | 2 concurrent builds; 256 MiB build estimate; 16 roots / 512 MiB resident estimate |
+
+Walks intentionally honor only regular root-local `.ignore` and `.rgignore` files. Ancestor/global Git ignore discovery and `.git/info/exclude` are disabled because they escape the bounded root. JavaScript resolver config reads are same-FD, regular-file-only, and capped at 1 MiB; automatic tsconfig project-reference fan-out is disabled.
