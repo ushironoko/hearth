@@ -142,8 +142,11 @@ call.
 
 ### At the boundaries
 
-- **Daemon/CLI**: length-prefixed msgpack over a Unix socket, one thread per
-  connection, engine shared by `Arc` clone.
+- **Daemon/CLI**: capped length-prefixed msgpack over a Unix socket, one thread
+  per connection behind a default ceiling of 64, engine shared by `Arc` clone.
+  The endpoint lives in an owner-only runtime directory; client and server both
+  verify peer UID. FD-passing validates kind/count/CLOEXEC and preserves frame
+  boundaries.
 - **napi**: concrete generated TypeScript types at the boundary — no `any` on any
   tool method. Sync methods plus `*Async` twins that offload to a libuv worker via
   `AsyncTask` (no embedded tokio) and take an optional `AbortSignal`, and a
@@ -199,9 +202,11 @@ bun  bench/harness/bun/compare.js          # fair vs Bun fs
 **CLI + daemon** (repeated calls are warm):
 
 ```bash
-./target/release/hearthd --socket /tmp/hearth.sock --cwd "$PWD" --trust-cache &
-./target/release/hearth  --socket /tmp/hearth.sock grep -l "TODO" .
-./target/release/hearth  --socket /tmp/hearth.sock stop
+runtime_dir="$(mktemp -d)"
+chmod 700 "$runtime_dir"
+./target/release/hearthd --socket "$runtime_dir/hearth.sock" --cwd "$PWD" --trust-cache &
+./target/release/hearth  --socket "$runtime_dir/hearth.sock" grep -l "TODO" .
+./target/release/hearth  --socket "$runtime_dir/hearth.sock" stop
 ```
 
 The CLI falls back to an in-process (cold) engine only when it cannot connect

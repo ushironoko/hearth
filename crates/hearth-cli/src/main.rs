@@ -1,8 +1,10 @@
 //! `hearth` — the thin CLI client.
 //!
 //! By default it connects to a running `hearthd` (the warm, resident engine).
-//! If no daemon is reachable it falls back to an in-process engine (a cold run),
-//! so the CLI always works. The `--no-daemon` flag forces the inline path.
+//! If no authenticated daemon is reachable *before delivery begins*, it falls
+//! back to an in-process engine (a cold run). Once sending may have begun it
+//! reports an indeterminate result and never replays the operation. The
+//! `--no-daemon` flag forces the inline path.
 
 use clap::{Args, Parser, Subcommand};
 use hearth_core::{Engine, EngineConfig};

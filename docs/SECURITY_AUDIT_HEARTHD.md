@@ -9,9 +9,14 @@
 
 | Commit | 対象 | 検証 |
 |---|---|---|
-| `39a4960` | HD-08/HD-10 の secure temp 部分: CSPRNG 名、exclusive/no-follow/CLOEXEC、初期 0600、identity-safe cleanup/publish、permission failure fatal、write/symlink matrix | `cargo test -p hearth-tools --no-fail-fast`; `cargo clippy -p hearth-tools --all-targets -- -D warnings` |
+| `39a4960` | HD-08/HD-10: CSPRNG secure temp、exclusive/no-follow/CLOEXEC、identity-safe cleanup/publish、permission fatal、write/symlink matrix | tools tests; Clippy |
+| `27c667b`, `7ca234e` | HD-06/HD-07: SingleFlight panic recovery、Read overflow、Bash timeout clamp/checked deadline、warm-shell `env_clear` | core/tools tests; Clippy |
+| `38da989`, `7600b19`, `447d979` | HD-13/HD-14: Bash 後 global reset、full ClearCaches、optimizer 非依存 file byte/entry cap、LineIndex reserve、walk cap | concurrency/accounting・contract tests; Clippy |
+| `6de83b7`, `4a226c2`, `020f0a0` | Bash output、Grep matcher/input/content、Graph scalar/vector/depth/result limit | hostile boundary tests; N-API Rust test; Clippy |
+| `7f7858c` | HD-02/03/04/05/09/11/12/15/17: private endpoint、peer UID、lifetime lock/dev+ino cleanup、stateful framing、FD CLOEXEC/validation、short I/O、connection cap、at-most-once CLI、root拒否、bounded drain | transport 16 tests; daemon 13 tests; CLI/workspace tests; Clippy |
+| `205c35d`, `8eacce8` | LLM threat model、same-UID authority、adapter責務、pinned RustSec CI | documentation review; workflow lint対象 |
 
-未完了 finding は引き続き open である。特に transport、endpoint、resource caps、Bash/cache、shutdown は後続 commit と adversarial test の証拠が必要。
+未完了 finding は引き続き open である。特に protocol handshake/aggregate in-flight budget、Graph byte budget、watcher root limit、daemon cancellation propagation、escaped descendant containmentは後続対応または明示したportable limitationが必要。
 
 ## 1. 結論
 

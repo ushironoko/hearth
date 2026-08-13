@@ -396,13 +396,15 @@ something invalidates it. That is the whole bargain of `trustCache`, and the
 reason the invalidation API is explicit:
 
 * `invalidatePath(path)` — one file, plus any walk that could have listed it.
-* `invalidateRoot(root)` — everything beneath a directory. **This is the sound
-  choice after a `bash` call**: an arbitrary command can create, delete, rename
-  or rewrite anything under its working directory, and no cheaper invalidation
-  covers that. Hearth does not do it automatically, because the adapter knows
-  which root the command could have touched and Hearth does not.
+* `invalidateRoot(root)` — everything beneath a directory when the caller has
+  an independently enforced write set.
 * `invalidate(path, recursive, scope)` — the scoped form.
-* `clearCaches()` — everything.
+* `clearCaches()` — every file/walk entry plus resident tool extensions,
+  watcher state, graph roots, compiled matchers, and warm shells.
+
+A dispatched unrestricted `bash` call automatically clears all
+filesystem-derived state, including graph roots. Cwd-only invalidation is not
+sound because a command can leave cwd, use absolute paths, and follow symlinks.
 
 Cost is proportional to the number of *cached* entries, not to the size of the
 tree on disk, so it stays bounded by the cache's own entry cap.
@@ -448,8 +450,11 @@ atomic stdout.
 ## Surfaces
 
 * **Daemon/CLI**: length-prefixed msgpack (`transport.rs`) over a Unix socket.
-  Synchronous request→response, one thread per connection, engine shared by
-  `Arc` clone. The daemon reads each request with `recvmsg` so a client can
+  Synchronous request→response, one thread per connection (hard default ceiling
+  64), engine shared by `Arc` clone. A frame is at most 256 MiB. The default
+  endpoint lives in an euid-owned mode-0700 runtime directory; both sides verify
+  the peer UID. A lifetime lock and socket dev+ino protect stale cleanup. The
+  daemon reads each request with `recvmsg` so a client can
   attach its stdout fd via `SCM_RIGHTS`; for a `read` the daemon then writes the
   cached content **straight to that fd**, skipping payload serialization
   entirely. (This makes CLI `read` as fast as the client's own startup floor —
@@ -493,3 +498,19 @@ atomic stdout.
   on the path where Hearth is fastest.
 * **Externally-tagged transport enums** — internally-tagged enums don't
   round-trip through `rmp-serde`.
+
+## Default safety limits
+
+| Resource | Default/hard maximum |
+|---|---:|
+| Daemon connections | 64 (configurable `--max-connections`) |
+| Request/response frame | 256 MiB |
+| Shutdown drain | 5 s default, 60 s maximum |
+| Bash timeout | 120 s default, 24 h maximum |
+| Bash collected/streamed output | 16 MiB total; excess drained and discarded |
+| File cache | 65,536 entries, 1 GiB hard max including reserved line-index heap |
+| Walk cache | 64 snapshots |
+| Grep matcher/glob cache | 256 entries per cache |
+| Grep content bytes | 4 MiB per file |
+| Grep pattern/globs/context/matches | 1 MiB / 256×16 KiB / 10,000 / 1,000,000 |
+| Graph files/path/query/depth/results | 100,000 / 64 KiB / 1 MiB / 64 / 100,000 |

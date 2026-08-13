@@ -160,6 +160,8 @@ export interface BashResult {
   durationUs: number
   /** How many chunks were delivered to the stream callback. */
   chunks: number
+  /** True when output beyond the engine hard cap was drained and discarded. */
+  outputTruncated: boolean
 }
 
 /** Which caches an invalidation should drop. */
