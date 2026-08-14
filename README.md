@@ -53,9 +53,8 @@ allowlists, request/output/deadline budgets, and approval for Bash or mutations
 where appropriate. Without those controls, the LLM deliberately has the OS
 user's read/write/execute authority and can reach daemon-inherited secrets.
 
-See [`SECURITY.md`](SECURITY.md) for deployment requirements and
-[`docs/SECURITY_AUDIT_HEARTHD.md`](docs/SECURITY_AUDIT_HEARTHD.md) for the
-source-level threat model and remediation status.
+See [`SECURITY.md`](SECURITY.md) for deployment requirements and the supported
+security model.
 
 ---
 
