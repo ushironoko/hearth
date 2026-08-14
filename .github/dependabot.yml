@@ -40,7 +40,8 @@ updates:
     open-pull-requests-limit: 5
 
   - package-ecosystem: npm
-    directory: /crates/hearth-napi
+    # pnpm-workspace.yaml and the shared lockfile both live at the root.
+    directory: /
     schedule:
       interval: weekly
     cooldown:
