@@ -728,6 +728,12 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    enum LegacyRequest {
+        Ping,
+    }
+
     fn test_global() -> Global {
         Global {
             socket: None,
@@ -749,10 +755,11 @@ mod tests {
     fn handshake_eof_falls_back_before_operation_delivery() {
         let (client, mut legacy_daemon) = UnixStream::pair().unwrap();
         let worker = std::thread::spawn(move || {
-            let hello: Request = read_msg(&mut legacy_daemon).unwrap();
-            assert!(matches!(hello, Request::Hello(_)));
-            // A pre-v2 daemon rejects the unknown Hello request and closes the
-            // connection without ever receiving the actual operation.
+            let _supported_legacy_operation = LegacyRequest::Ping;
+            let error = read_msg::<_, LegacyRequest>(&mut legacy_daemon).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            // The pre-v2 decoder rejects the unknown Hello variant and closes
+            // without ever receiving the actual operation.
         });
 
         let response = dispatch_connected(&test_global(), client, Request::Ping);
@@ -782,6 +789,32 @@ mod tests {
         let response = dispatch_connected(&test_global(), client, Request::Ping);
         assert!(matches!(response, Response::Pong));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn response_loss_after_operation_delivery_remains_indeterminate() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let hello: Request = read_msg(&mut daemon).unwrap();
+            assert!(matches!(hello, Request::Hello(_)));
+            hearth_tools::transport::write_msg(
+                &mut daemon,
+                &Response::Hello(ProtocolAck {
+                    version: PROTOCOL_VERSION,
+                }),
+            )
+            .unwrap();
+            let operation: Request = read_msg(&mut daemon).unwrap();
+            assert!(matches!(operation, Request::Ping));
+            // Drop without a response after observing exactly one operation.
+        });
+
+        let response = dispatch_connected(&test_global(), client, Request::Ping);
+        worker.join().unwrap();
+        let Response::Error(error) = response else {
+            panic!("response loss after delivery must not fall back inline");
+        };
+        assert_eq!(error.kind, ErrorKind::Indeterminate);
     }
 
     fn graph_node(path: &str, node_id: &str) -> GraphNode {

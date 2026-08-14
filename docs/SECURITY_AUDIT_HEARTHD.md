@@ -434,7 +434,7 @@ Daemon dispatch は non-cancellable API を使用する（`crates/hearth-tools/s
 - root起動を拒否し、「同一UIDの全clientを信頼する」「別権限service/multi-tenantで使わない」をREADMEへ明記する。
 - unsafe existing socketを削除せずfail closedするsafe stale-path処理を入れる。
 - secure temp生成（`0600`、random、exclusive、nofollow）とpermission error処理を入れる。
-- `SCM_RIGHTS`をCLOEXECで受信し、request種別とFD数を厳密検証する。
+- `SCM_RIGHTS`は対応OSで`MSG_CMSG_CLOEXEC`によりatomicに受信し、macOSでは受信直後に`fcntl(F_SETFD)`を適用する。request種別とFD数を厳密検証する。
 - 完了条件: P0 endpoint/authorization、request replay/output integrity、filesystem試験をすべて通す。
 
 ### Phase 1: endpoint と bounded server
