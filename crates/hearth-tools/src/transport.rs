@@ -830,9 +830,12 @@ fn receive_chunk(fd: RawFd, data: &mut [u8]) -> io::Result<(usize, AncillaryBatc
 
 /// Connection-owned sequential request receiver.
 ///
-/// Bytes read beyond the current frame and ancillary data anchored to those
-/// bytes remain owned here for the next call. Dropping the receiver closes all
-/// descriptors that have not crossed a successful `recv_request` boundary.
+/// Every frame's first byte is isolated in its own `recvmsg` call. This is
+/// required on Linux, where control data can be returned with ordinary stream
+/// bytes queued before the byte that carried it. Exact per-frame reads keep
+/// that ambiguity from assigning `SCM_RIGHTS` to an earlier frame and let us
+/// reject rights sent after a frame's first byte. Dropping the receiver closes
+/// every descriptor that has not crossed a successful `recv_request` boundary.
 pub struct RequestReceiver<'a> {
     stream: &'a UnixStream,
     max_frame: u32,
@@ -840,23 +843,22 @@ pub struct RequestReceiver<'a> {
     start: usize,
     base_offset: u64,
     ancillary: VecDeque<AnchoredAncillary>,
-    read_ahead: bool,
     poisoned: bool,
     request_deadline: Option<Instant>,
 }
 
 impl<'a> RequestReceiver<'a> {
     pub fn new(stream: &'a UnixStream) -> Self {
-        Self::with_options(stream, true, MAX_FRAME)
+        Self::with_options(stream, MAX_FRAME)
     }
 
     /// A receiver with a stricter per-frame limit, used by small fixed-shape
     /// control lanes that must not inherit the 256 MiB data-plane allowance.
     pub fn with_max_frame(stream: &'a UnixStream, max_frame: u32) -> Self {
-        Self::with_options(stream, true, max_frame.min(MAX_FRAME))
+        Self::with_options(stream, max_frame.min(MAX_FRAME))
     }
 
-    fn with_options(stream: &'a UnixStream, read_ahead: bool, max_frame: u32) -> Self {
+    fn with_options(stream: &'a UnixStream, max_frame: u32) -> Self {
         Self {
             stream,
             max_frame,
@@ -864,7 +866,6 @@ impl<'a> RequestReceiver<'a> {
             start: 0,
             base_offset: 0,
             ancillary: VecDeque::new(),
-            read_ahead,
             poisoned: false,
             request_deadline: None,
         }
@@ -892,6 +893,10 @@ impl<'a> RequestReceiver<'a> {
     }
 
     fn recv_request_inner(&mut self) -> io::Result<(Request, Option<OwnedFd>)> {
+        // Do not combine the first byte with any later stream data. Linux may
+        // report SCM_RIGHTS together with bytes queued before the sendmsg that
+        // carried it, so a larger first read cannot identify its true offset.
+        self.ensure_available(1)?;
         self.ensure_available(4)?;
         let prefix = &self.bytes[self.start..self.start + 4];
         let len = validate_frame_len_with_limit(
@@ -989,11 +994,10 @@ impl<'a> RequestReceiver<'a> {
                 ));
             }
             let missing = needed - (self.bytes.len() - self.start);
-            let read_len = if self.read_ahead {
-                READ_CHUNK.max(missing).min(READ_CHUNK)
-            } else {
-                missing.min(READ_CHUNK)
-            };
+            // Never cross the currently known boundary. Besides avoiding
+            // unbounded read-ahead, this preserves the first-byte ancillary
+            // association established by `recv_request_inner`.
+            let read_len = missing.min(READ_CHUNK);
             let mut chunk = [0u8; READ_CHUNK];
             let anchor = self
                 .base_offset
@@ -1056,11 +1060,11 @@ impl<'a> RequestReceiver<'a> {
 
 /// Compatibility adapter for callers that receive only one request.
 ///
-/// It deliberately disables read-ahead so constructing a new receiver cannot
-/// consume bytes belonging to a later frame. Multi-request connections should
+/// Exact per-frame reads ensure that constructing a new receiver cannot consume
+/// bytes belonging to a later frame. Multi-request connections should still
 /// keep one [`RequestReceiver`] for their entire lifetime.
 pub fn recv_request(stream: &UnixStream) -> io::Result<(Request, Option<OwnedFd>)> {
-    RequestReceiver::with_options(stream, false, MAX_FRAME).recv_request()
+    RequestReceiver::with_options(stream, MAX_FRAME).recv_request()
 }
 
 #[cfg(test)]
@@ -1118,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn sequential_receiver_preserves_surplus_frames() {
+    fn sequential_receiver_preserves_consecutive_frames() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
         let first = encode_frame(&Request::Ping).unwrap();
         let second = encode_frame(&Request::Stats).unwrap();
@@ -1149,21 +1153,15 @@ mod tests {
     }
 
     #[test]
-    fn dropping_receiver_closes_rights_queued_for_a_surplus_frame() {
-        let (mut sender, receiver) = UnixStream::pair().unwrap();
-        let first = encode_frame(&Request::Ping).unwrap();
-        let second = encode_frame(&read_request()).unwrap();
+    fn dropping_receiver_closes_rights_received_with_a_partial_frame() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let frame = encode_frame(&read_request()).unwrap();
         let (read, write) = pipe();
-
-        sender.write_all(&first).unwrap();
-        send_raw(&sender, &second, &[write.as_raw_fd()]);
+        send_raw(&sender, &frame, &[write.as_raw_fd()]);
         drop(write);
 
         let mut requests = RequestReceiver::new(&receiver);
-        requests
-            .ensure_available(first.len() + second.len())
-            .unwrap();
-        assert!(matches!(requests.recv_request().unwrap().0, Request::Ping));
+        requests.ensure_available(1).unwrap();
         drop(requests);
         assert_pipe_eof(&read);
     }
