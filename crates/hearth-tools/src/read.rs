@@ -24,7 +24,10 @@ pub fn read_bytes_cancellable(
         cancel.check()?;
         let path = resolve_path(engine, &params.path);
         let trust = engine.stat_free(&path);
-        let (entry, _hit) = engine.files().get_trusting(&path, trust)?;
+        let (entry, _hit) = engine
+            .files()
+            .get_bounded_trusting(&path, engine.config().max_tool_file_bytes, trust)?
+            .ok_or_else(|| ToolError::invalid("file exceeds read byte limit"))?;
         cancel.check()?;
         Ok(entry.bytes().to_vec())
     })
@@ -45,7 +48,10 @@ pub fn read_cancellable(
         cancel.check()?;
         let path = resolve_path(engine, &params.path);
         let trust = engine.stat_free(&path);
-        let (entry, cache_hit) = engine.files().get_trusting(&path, trust)?;
+        let (entry, cache_hit) = engine
+            .files()
+            .get_bounded_trusting(&path, engine.config().max_tool_file_bytes, trust)?
+            .ok_or_else(|| ToolError::invalid("file exceeds read byte limit"))?;
         cancel.check()?;
 
         let idx = entry.line_index();
@@ -104,7 +110,7 @@ pub fn read_cancellable(
             )));
         }
         let end_line = match params.limit {
-            Some(n) if n > 0 => (start_line + n - 1).min(total_lines),
+            Some(n) if n > 0 => start_line.saturating_add(n - 1).min(total_lines),
             _ => total_lines,
         };
 
@@ -138,7 +144,17 @@ pub fn read_cancellable(
 
         let returned_lines = end_line - start_line + 1;
         let content = if params.line_numbers {
-            let mut out = String::with_capacity(window.len() + (returned_lines as usize) * 8);
+            let numbered_capacity = usize::try_from(returned_lines)
+                .ok()
+                .and_then(|lines| lines.checked_mul(8))
+                .and_then(|prefixes| window.len().checked_add(prefixes))
+                .ok_or_else(|| ToolError::invalid("numbered read output size overflow"))?;
+            if numbered_capacity > engine.config().max_tool_file_bytes as usize {
+                return Err(ToolError::invalid(
+                    "numbered read output exceeds byte limit",
+                ));
+            }
+            let mut out = String::with_capacity(numbered_capacity);
             for (i, line) in window.split_inclusive('\n').enumerate() {
                 let n = start_line + i as u64;
                 let has_nl = line.ends_with('\n');

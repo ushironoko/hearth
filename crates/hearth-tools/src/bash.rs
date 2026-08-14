@@ -38,6 +38,12 @@ const CANCEL_POLL: Duration = Duration::from_millis(10);
 
 /// How long to wait for a killed process group to be reaped before giving up.
 const REAP_GRACE: Duration = Duration::from_secs(5);
+const MAX_WARM_SHELL_CONTEXT_BYTES: usize = 1024 * 1024;
+
+/// Maximum caller-selectable command timeout. Long builds remain supported,
+/// while hostile `u64::MAX` input can never overflow `Instant` arithmetic or
+/// pin a daemon operation indefinitely.
+pub const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Run a command, discarding the stream.
 pub fn bash(engine: &Engine, params: &BashParams) -> ToolResult<BashResult> {
@@ -67,6 +73,11 @@ pub fn bash_stream(
 ) -> ToolResult<BashResult> {
     profile!("tool.bash", {
         cancel.check()?;
+        // An unrestricted command can mutate any path reachable by this UID,
+        // not merely cwd. Once this call is admitted, conservatively discard
+        // every filesystem-derived cache even on timeout, cancellation,
+        // indeterminate completion, spawn failure, or unwind.
+        let _invalidate = BashInvalidation(engine);
         let cwd = params
             .cwd
             .clone()
@@ -76,17 +87,37 @@ pub fn bash_stream(
                 .timeout_ms
                 .unwrap_or(engine.config().bash_timeout_ms)
                 .max(1),
-        );
+        )
+        .min(MAX_BASH_TIMEOUT);
         let spec = params
             .shell
             .clone()
             .or_else(|| engine.config().shell.clone())
             .unwrap_or_default();
         let start = Instant::now();
-        let mut emitter = Emitter::new(params.collect_output, on_chunk);
+        let mut emitter = Emitter::new(
+            params.collect_output,
+            engine.config().max_bash_output_bytes,
+            on_chunk,
+        );
 
         // Opt-in warm-shell fast path.
-        if engine.config().warm_shell {
+        // A pooled shell inherited the daemon environment before this call, so
+        // it cannot truthfully implement env_clear. Route such calls through
+        // the fresh-spawn path, where Command::env_clear is authoritative.
+        let warm_context_bytes = cwd.len().saturating_add(
+            params
+                .env
+                .iter()
+                .map(|(key, value)| key.len().saturating_add(value.len()))
+                .sum::<usize>(),
+        );
+        let warm_compatible = spec.program == "/bin/sh"
+            && spec.transport == ShellTransport::Arg
+            && spec.args == ["-c"]
+            && params.command.len() <= 4096
+            && warm_context_bytes <= MAX_WARM_SHELL_CONTEXT_BYTES;
+        if engine.config().warm_shell && !params.env_clear && warm_compatible {
             let pool = engine.extension::<WarmShellPool>();
             let dispatch = pool.run(
                 &spec.program,
@@ -115,11 +146,24 @@ pub fn bash_stream(
     })
 }
 
+/// Clears filesystem-derived resident state when an admitted Bash call exits.
+struct BashInvalidation<'a>(&'a Engine);
+
+impl Drop for BashInvalidation<'_> {
+    fn drop(&mut self) {
+        self.0.clear_filesystem_caches();
+        crate::graph::graph_clear(self.0);
+    }
+}
+
 /// Accumulates output and hands it to the caller as ordered chunks.
 struct Emitter<'a> {
     on_chunk: &'a mut dyn FnMut(BashChunk),
     seq: u64,
     collect: bool,
+    max_bytes: usize,
+    emitted_bytes: usize,
+    output_truncated: bool,
     stdout: String,
     stderr: String,
     out_decoder: Utf8Stream,
@@ -127,11 +171,14 @@ struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
-    fn new(collect: bool, on_chunk: &'a mut dyn FnMut(BashChunk)) -> Self {
+    fn new(collect: bool, max_bytes: usize, on_chunk: &'a mut dyn FnMut(BashChunk)) -> Self {
         Self {
             on_chunk,
             seq: 0,
             collect,
+            max_bytes,
+            emitted_bytes: 0,
+            output_truncated: false,
             stdout: String::new(),
             stderr: String::new(),
             out_decoder: Utf8Stream::default(),
@@ -147,10 +194,26 @@ impl<'a> Emitter<'a> {
         self.emit(channel, text);
     }
 
-    fn emit(&mut self, channel: BashChannel, text: String) {
+    fn emit(&mut self, channel: BashChannel, mut text: String) {
         if text.is_empty() {
             return;
         }
+        let remaining = self.max_bytes.saturating_sub(self.emitted_bytes);
+        if text.len() > remaining {
+            let mut end = remaining.min(text.len());
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            self.output_truncated = true;
+        }
+        if remaining == 0 {
+            self.output_truncated = true;
+        }
+        if text.is_empty() {
+            return;
+        }
+        self.emitted_bytes += text.len();
         if self.collect {
             match channel {
                 BashChannel::Stdout => self.stdout.push_str(&text),
@@ -188,6 +251,7 @@ impl<'a> Emitter<'a> {
             aborted,
             duration_us: start.elapsed().as_micros() as u64,
             chunks: self.seq,
+            output_truncated: self.output_truncated,
         }
     }
 }
@@ -307,7 +371,7 @@ fn spawn_bash(
         });
     }
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(8);
     if let Some(mut pipe) = child.stdout.take() {
         let tx = tx.clone();
         std::thread::spawn(move || pump(&mut pipe, BashChannel::Stdout, tx));
@@ -321,7 +385,9 @@ fn spawn_bash(
         let _ = tx.send(Ev::Exited(status));
     });
 
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| ToolError::invalid("bash timeout exceeds platform range"))?;
     let mut out_eof = false;
     let mut err_eof = false;
     let mut exited: Option<Option<ExitStatus>> = None;
@@ -386,7 +452,7 @@ fn spawn_bash(
     })
 }
 
-fn pump<R: Read>(pipe: &mut R, channel: BashChannel, tx: mpsc::Sender<Ev>) {
+fn pump<R: Read>(pipe: &mut R, channel: BashChannel, tx: mpsc::SyncSender<Ev>) {
     let mut chunk = vec![0_u8; 65_536];
     loop {
         match pipe.read(&mut chunk) {

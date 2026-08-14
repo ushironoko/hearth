@@ -78,6 +78,41 @@ fn a_file_without_a_trailing_newline_counts_the_same_in_both_modes() {
 }
 
 #[test]
+fn extreme_line_windows_clip_without_overflowing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seed(dir.path(), "extreme.txt", "one\ntwo\nthree\n");
+    let eng = engine(dir.path());
+
+    let all = read(
+        &eng,
+        &ReadParams {
+            path: path.clone(),
+            offset: Some(1),
+            limit: Some(u64::MAX),
+            line_numbers: false,
+            line_mode: LineWindowMode::Slice,
+        },
+    )
+    .unwrap();
+    assert_eq!(all.content, "one\ntwo\nthree\n");
+    assert_eq!(all.returned_lines, 3);
+
+    let tail = read(
+        &eng,
+        &ReadParams {
+            path,
+            offset: Some(2),
+            limit: Some(u64::MAX),
+            line_numbers: false,
+            line_mode: LineWindowMode::Slice,
+        },
+    )
+    .unwrap();
+    assert_eq!(tail.content, "two\nthree\n");
+    assert_eq!(tail.returned_lines, 2);
+}
+
+#[test]
 fn an_offset_past_the_end_is_an_error_and_a_limit_past_it_is_not() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
@@ -277,6 +312,79 @@ fn writing_through_a_symlink_does_not_replace_the_link() {
             .is_symlink()
     );
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+}
+
+#[test]
+fn write_mode_and_symlink_policy_form_the_documented_matrix() {
+    for mode in [WriteMode::Atomic, WriteMode::InPlace] {
+        for follow_symlinks in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let eng = engine(dir.path());
+            let target = seed(dir.path(), "target.txt", "old\n");
+            let link = dir.path().join("link.txt");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+
+            let result = write(
+                &eng,
+                &WriteParams {
+                    mode,
+                    follow_symlinks,
+                    ..WriteParams::new(link.display().to_string(), "new\n")
+                },
+            )
+            .unwrap();
+
+            assert_eq!(result.followed_symlink, follow_symlinks);
+            assert_eq!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                follow_symlinks,
+                "Follow preserves the link; NoFollow replaces it ({mode:?})"
+            );
+            if follow_symlinks {
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+            } else {
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+                assert_eq!(std::fs::read_to_string(&link).unwrap(), "new\n");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_new_atomic_target_uses_the_process_umask_instead_of_temp_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let path = dir.path().join("new.txt");
+
+    write(
+        &eng,
+        &WriteParams::new(path.display().to_string(), "content"),
+    )
+    .unwrap();
+
+    let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_ne!(mode, 0o600, "the unpublished 0600 temp mode must not leak");
+    assert_eq!(mode & !0o666, 0, "umask may only remove requested rw bits");
+}
+
+#[test]
+fn atomic_writes_leave_no_temporary_siblings() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let path = dir.path().join("clean.txt");
+
+    for value in ["one", "two", "three"] {
+        write(&eng, &WriteParams::new(path.display().to_string(), value)).unwrap();
+    }
+
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [std::ffi::OsString::from("clean.txt")]);
 }
 
 #[test]

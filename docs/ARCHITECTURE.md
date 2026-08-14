@@ -396,13 +396,15 @@ something invalidates it. That is the whole bargain of `trustCache`, and the
 reason the invalidation API is explicit:
 
 * `invalidatePath(path)` — one file, plus any walk that could have listed it.
-* `invalidateRoot(root)` — everything beneath a directory. **This is the sound
-  choice after a `bash` call**: an arbitrary command can create, delete, rename
-  or rewrite anything under its working directory, and no cheaper invalidation
-  covers that. Hearth does not do it automatically, because the adapter knows
-  which root the command could have touched and Hearth does not.
+* `invalidateRoot(root)` — everything beneath a directory when the caller has
+  an independently enforced write set.
 * `invalidate(path, recursive, scope)` — the scoped form.
-* `clearCaches()` — everything.
+* `clearCaches()` — every file/walk entry plus resident tool extensions,
+  watcher state, graph roots, compiled matchers, and warm shells.
+
+A dispatched unrestricted `bash` call automatically clears all
+filesystem-derived state, including graph roots. Cwd-only invalidation is not
+sound because a command can leave cwd, use absolute paths, and follow symlinks.
 
 Cost is proportional to the number of *cached* entries, not to the size of the
 tree on disk, so it stays bounded by the cache's own entry cap.
@@ -421,11 +423,38 @@ stat records. A wipe makes it discard every stat record and revalidate the
 whole selected universe, so missing history cannot leave a stale graph entry
 trusted.
 
+## Security and authority model
+
+The daemon is a same-UID performance component, not a privilege, tenant, or
+workspace boundary. Its single predictable endpoint per UID is deliberate: one
+warm engine can serve that user's repositories. Consequently any accepted
+client can request operations against every path and command available to that
+UID. The daemon must not run as root, a more privileged service identity, or a
+multi-tenant/shared service. Endpoint DAC and peer credentials exclude other
+UIDs; they do not defend against a compromised same-UID process.
+
+An LLM or LLM-controlled adapter is an untrusted protocol-input source even
+when the model is benign: extreme sizes, invented paths, long Bash commands,
+parallel bursts, and non-idempotent retry are expected failure modes. The
+adapter, not this warm-cache engine, owns least-authority policy: allowed
+lexical roots and resolved symlink targets, operation grants, environment
+allowlists, budgets, and human approval. Direct unrestricted daemon access is
+equivalent to the OS user's read/write/execute authority.
+
+The CLI's delivery contract is at-most-once. It may fall back inline only before
+any request byte could have reached the daemon. A later transport failure is
+indeterminate and is never replayed. FD-streamed Read can have emitted a valid
+partial prefix before such a failure; the contract is non-duplication, not
+atomic stdout.
+
 ## Surfaces
 
 * **Daemon/CLI**: length-prefixed msgpack (`transport.rs`) over a Unix socket.
-  Synchronous request→response, one thread per connection, engine shared by
-  `Arc` clone. The daemon reads each request with `recvmsg` so a client can
+  Synchronous request→response, one thread per connection (hard default ceiling
+  64), engine shared by `Arc` clone. A frame is at most 256 MiB. The default
+  endpoint lives in an euid-owned mode-0700 runtime directory; both sides verify
+  the peer UID. A lifetime lock and socket dev+ino protect stale cleanup. The
+  daemon reads each request with `recvmsg` so a client can
   attach its stdout fd via `SCM_RIGHTS`; for a `read` the daemon then writes the
   cached content **straight to that fd**, skipping payload serialization
   entirely. (This makes CLI `read` as fast as the client's own startup floor —
@@ -456,11 +485,41 @@ trusted.
   opt-in for callers that own their workspace.
 * **Cooperative, not preemptive, cancellation** — a mutation always finishes or
   never starts, rather than being interrupted somewhere in between.
-* **No automatic invalidation after `bash`** — the adapter knows the blast
-  radius; guessing it in the engine would either be unsound or drop the whole
-  cache on every command.
+* **Global filesystem-derived invalidation after unrestricted `bash`** — a
+  command can leave cwd, use absolute paths, or follow symlinks, so cwd-only
+  invalidation is unsound. A narrower write set requires a future enforced
+  sandbox/declared-write protocol.
+* **Tracked process groups, not a portable descendant sandbox** — timeout and
+  shutdown terminate/reap groups Hearth owns. A descendant that deliberately
+  double-forks and creates a new session can escape POSIX process-group
+  tracking; preventing that requires an external sandbox/service manager.
+* **Atomic received-FD CLOEXEC where the OS supports it** — Linux and supported
+  BSDs use `MSG_CMSG_CLOEXEC`. macOS requires a post-`recvmsg`
+  `fcntl(F_SETFD)`, leaving a short race with concurrent fork/exec. This is a
+  residual same-UID limitation, not a strict descriptor-inheritance boundary.
 * **One engine per process, not shared across processes** — the caches are
   in-process memory; sharing them would mean re-introducing the daemon's IPC cost
   on the path where Hearth is fastest.
 * **Externally-tagged transport enums** — internally-tagged enums don't
   round-trip through `rmp-serde`.
+
+## Default safety limits
+
+| Resource | Default/hard maximum |
+|---|---:|
+| Daemon connections | 64 default; 1,024 maximum (`--max-connections`) |
+| Request/response frame | 256 MiB; 30 s receive deadline; 1,000,000 MessagePack values / depth 64 |
+| Aggregate admitted frame reservation | 512 MiB default; 4 GiB maximum |
+| Shutdown drain | 5 s default, 60 s maximum |
+| Bash timeout | 120 s default, 24 h maximum |
+| Bash collected/streamed output | 16 MiB total; excess drained and discarded |
+| File cache | 65,536 entries, 1 GiB hard max including reserved line-index heap |
+| Tool read/edit file and rewritten result | 64 MiB |
+| Walk cache | 64 snapshots; 1,000,000 visited/files and 256 MiB path bytes; 16 MiB root-local ignore files |
+| Grep matcher/glob cache | 256 entries per cache |
+| Grep content/result bytes | 16 MiB per file; 4 MiB aggregate result |
+| Grep pattern/globs/context/matches | 1 MiB / 256×16 KiB / 10,000 / 1,000,000 |
+| Graph files/path/query/depth/results | 100,000 / 64 KiB / 1 MiB / 64 / 100,000 |
+| Graph build/resident roots | 2 concurrent builds; 256 MiB build estimate; 16 roots / 512 MiB resident estimate |
+
+Walks intentionally honor only regular root-local `.ignore` and `.rgignore` files. Ancestor/global Git ignore discovery and `.git/info/exclude` are disabled because they escape the bounded root. JavaScript resolver config reads are same-FD, regular-file-only, and capped at 1 MiB; automatic tsconfig project-reference fan-out is disabled.

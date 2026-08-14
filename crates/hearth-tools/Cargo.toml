@@ -34,6 +34,7 @@ similar = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 crossbeam-channel = { workspace = true }
+getrandom = { workspace = true }
 libc = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

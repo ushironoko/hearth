@@ -3,21 +3,42 @@
 //! Adapted from `vize_carton`'s `LineIndex`, but tuned for CLI tools: it works
 //! on raw bytes (so it is `\n`-scan-friendly via SIMD `memchr`), reports
 //! **1-based** line/column with **byte** columns, and can slice a line's text
-//! back out. Building is a single O(n) pass; a line lookup is O(log lines).
+//! back out. Building is O(n); a line lookup is O(log lines).
 
 /// Precomputed byte offsets of the start of each line.
 #[derive(Debug, Clone)]
 pub struct LineIndex {
     /// `line_starts[i]` is the byte offset where line `i` (0-based) begins.
     /// `line_starts[0]` is always 0. Length == number of lines.
-    line_starts: Vec<u32>,
+    line_starts: Box<[u32]>,
     len: u32,
 }
 
 impl LineIndex {
-    /// Build the index for `source` in one SIMD-accelerated pass.
+    /// Hard upper bound for the heap allocation made by [`LineIndex::new`].
+    ///
+    /// There can be at most one line start per source byte plus the initial
+    /// zero. The file cache reserves this full amount before retaining an
+    /// entry, so building the lazy index never grows accounted cache memory.
+    pub(crate) fn max_heap_bytes(source_len: usize) -> Option<u64> {
+        u64::try_from(source_len)
+            .ok()?
+            .checked_add(1)?
+            .checked_mul(size_of::<u32>() as u64)
+    }
+
+    /// Exact logical heap bytes held by this index.
+    #[cfg(test)]
+    pub(crate) fn heap_bytes(&self) -> u64 {
+        self.line_starts.len() as u64 * size_of::<u32>() as u64
+    }
+
+    /// Build the index for `source` in two SIMD-accelerated passes.
     pub fn new(source: &[u8]) -> Self {
-        let mut line_starts = Vec::with_capacity(source.len() / 32 + 1);
+        // Count first so the boxed table has no spare Vec capacity. This makes
+        // its retained allocation exact and bounded by `max_heap_bytes`.
+        let newline_count = memchr::memchr_iter(b'\n', source).count();
+        let mut line_starts = Vec::with_capacity(newline_count + 1);
         line_starts.push(0u32);
         for pos in memchr::memchr_iter(b'\n', source) {
             // Guard against absurdly large files (u32 offsets keep the table small).
@@ -28,7 +49,7 @@ impl LineIndex {
         // empty last line only if the file does not end in '\n'. We keep it and
         // let `line_count` account for the trailing newline.
         Self {
-            line_starts,
+            line_starts: line_starts.into_boxed_slice(),
             len: source.len().min(u32::MAX as usize) as u32,
         }
     }
@@ -109,5 +130,14 @@ mod tests {
         assert_eq!(idx.line_count(), 2);
         assert_eq!(idx.line_range(1), Some((0, 1)));
         assert_eq!(idx.line_range(2), Some((2, 3)));
+    }
+
+    #[test]
+    fn heap_allocation_is_exact_and_bounded_by_source_length() {
+        let source = b"\n\nnot-a-newline\n";
+        let idx = LineIndex::new(source);
+
+        assert_eq!(idx.heap_bytes(), 4 * 4);
+        assert!(idx.heap_bytes() <= LineIndex::max_heap_bytes(source.len()).unwrap());
     }
 }

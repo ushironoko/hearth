@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, io,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -23,8 +25,10 @@ use super::{
 use crate::imports::{ImportKind, RawImport};
 
 const MAX_TSCONFIG_BYTES: usize = 1024 * 1024;
+const MAX_RESOLVER_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TSCONFIG_EXTENDS_ENTRIES: usize = 32;
 const MAX_TSCONFIG_EXTENDS_VISITS: usize = 256;
+const MAX_RESOLUTION_MEMO_ENTRIES: usize = 65_536;
 
 /// Configuration for JavaScript and TypeScript module resolution.
 #[derive(Debug, Clone)]
@@ -152,7 +156,11 @@ impl Resolve for JsResolver {
         let mut dependency_paths: Vec<PathBuf> = self.configured_tsconfig.iter().cloned().collect();
         let mut notes = Vec::new();
         let mut tsconfig_tracking_truncated = false;
-        let tsconfig = match resolver.find_tsconfig(from_path) {
+        let discovered = match &self.configured_tsconfig {
+            Some(configured) => resolver.find_tsconfig(configured),
+            None => resolver.find_tsconfig(from_path),
+        };
+        let tsconfig = match discovered {
             Ok(tsconfig) => tsconfig,
             Err(error) => {
                 if let Some(configured_tsconfig) = &self.configured_tsconfig {
@@ -250,6 +258,9 @@ impl JsResolver {
             outcome.dependencies.extend(dependencies.iter().cloned());
         }
         normalize_dependencies(&mut outcome.dependencies);
+        if memo.len() >= MAX_RESOLUTION_MEMO_ENTRIES && !memo.contains_key(&key) {
+            memo.clear();
+        }
         memo.insert(key, outcome.dependencies.clone());
         outcome
     }
@@ -441,7 +452,7 @@ fn resolver_options(
     let tsconfig = configured_tsconfig.clone().map(|config_file| {
         TsconfigDiscovery::Manual(TsconfigOptions {
             config_file,
-            references: TsconfigReferences::Auto,
+            references: TsconfigReferences::Disabled,
         })
     });
     let common_conditions: Vec<String> = condition_names
@@ -716,11 +727,33 @@ impl FileSystem for SharedFileSystem {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        self.0.read(path)
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > MAX_RESOLVER_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resolver config must be a regular file no larger than 1 MiB",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.by_ref()
+            .take(MAX_RESOLVER_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_RESOLVER_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resolver config exceeds 1 MiB",
+            ));
+        }
+        Ok(bytes)
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
-        self.0.read_to_string(path)
+        let bytes = self.read(path)?;
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     fn metadata(&self, path: &Path) -> io::Result<oxc_resolver::FileMetadata> {

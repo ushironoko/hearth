@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{engine, warm_engine};
+use common::{engine, trusting_engine, warm_engine};
 use hearth_core::CancelToken;
 use hearth_proto::*;
 use hearth_tools::{bash, bash_cancellable, bash_stream};
@@ -49,6 +49,58 @@ fn wait_for_exit(pid: i32, limit: Duration) -> bool {
 }
 
 #[test]
+fn dispatched_bash_globally_invalidates_trusted_file_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = trusting_engine(dir.path());
+    let inside = dir.path().join("inside.txt");
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("outside.txt");
+    std::fs::write(&inside, "old-inside").unwrap();
+    std::fs::write(&outside, "old-outside").unwrap();
+
+    for path in [&inside, &outside] {
+        hearth_tools::read(&eng, &ReadParams::new(path.display().to_string())).unwrap();
+    }
+    assert_eq!(eng.files().len(), 2);
+
+    let command = format!(
+        "printf new-inside > '{}'; printf new-outside > '{}'",
+        inside.display(),
+        outside.display()
+    );
+    bash(&eng, &BashParams::new(command)).unwrap();
+
+    assert_eq!(
+        eng.files().len(),
+        0,
+        "Bash must clear cwd-external state too"
+    );
+    let inside_read =
+        hearth_tools::read(&eng, &ReadParams::new(inside.display().to_string())).unwrap();
+    let outside_read =
+        hearth_tools::read(&eng, &ReadParams::new(outside.display().to_string())).unwrap();
+    assert_eq!(inside_read.content, "new-inside");
+    assert_eq!(outside_read.content, "new-outside");
+}
+
+#[test]
+fn a_pre_cancelled_bash_preserves_caches_because_nothing_was_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = trusting_engine(dir.path());
+    let path = dir.path().join("cached.txt");
+    std::fs::write(&path, "cached").unwrap();
+    hearth_tools::read(&eng, &ReadParams::new(path.display().to_string())).unwrap();
+    assert_eq!(eng.files().len(), 1);
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let err = bash_cancellable(&eng, &BashParams::new("exit 0"), &cancel).unwrap_err();
+
+    assert_eq!(err.kind, ErrorKind::Cancelled);
+    assert_eq!(eng.files().len(), 1);
+}
+
+#[test]
 fn chunks_reconstruct_the_final_output_with_one_monotonic_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
@@ -81,6 +133,29 @@ fn output_without_a_trailing_newline_is_preserved_exactly() {
         assert_eq!(r.stdout, "no newline");
         assert!(r.stderr.is_empty());
     }
+}
+
+#[test]
+fn output_cap_truncates_without_deadlocking_pipe_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = hearth_core::Engine::new(hearth_core::EngineConfig {
+        default_cwd: dir.path().to_path_buf(),
+        enable_optimizer: false,
+        enable_watch: false,
+        max_bash_output_bytes: 1024,
+        ..hearth_core::EngineConfig::default()
+    });
+    let (result, chunks) = collect(
+        &eng,
+        &BashParams::new("head -c 200000 /dev/zero | tr '\\0' x; printf done 1>&2"),
+        &CancelToken::none(),
+    );
+
+    assert_eq!(result.exit_code, 0);
+    assert!(result.output_truncated);
+    assert_eq!(result.stdout.len() + result.stderr.len(), 1024);
+    let streamed: usize = chunks.iter().map(|chunk| chunk.text.len()).sum();
+    assert_eq!(streamed, 1024);
 }
 
 #[test]
@@ -376,6 +451,41 @@ fn cwd_and_environment_are_honoured() {
     )
     .unwrap();
     assert_eq!(cleared.stdout, "this|");
+}
+
+#[test]
+fn warm_shell_mode_honours_env_clear_via_fresh_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = warm_engine(dir.path());
+
+    let cleared = bash(
+        &eng,
+        &BashParams {
+            env: vec![("ONLY".into(), "this".into())],
+            env_clear: true,
+            ..BashParams::new("printf '%s|%s' \"$ONLY\" \"$HOME\"")
+        },
+    )
+    .unwrap();
+
+    assert_eq!(cleared.stdout, "this|");
+}
+
+#[test]
+fn extreme_timeout_is_clamped_before_deadline_arithmetic() {
+    let dir = tempfile::tempdir().unwrap();
+    for eng in [engine(dir.path()), warm_engine(dir.path())] {
+        let result = bash(
+            &eng,
+            &BashParams {
+                timeout_ms: Some(u64::MAX),
+                ..BashParams::new("printf bounded")
+            },
+        )
+        .unwrap();
+        assert_eq!(result.stdout, "bounded");
+        assert_eq!(result.exit_code, 0);
+    }
 }
 
 #[test]

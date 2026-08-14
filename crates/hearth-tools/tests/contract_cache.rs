@@ -160,10 +160,10 @@ fn invalidating_a_root_covers_a_shell_command_that_rewrote_the_tree() {
     .unwrap();
     assert_eq!(r.exit_code, 0);
 
-    // Which is why the adapter invalidates the command's cwd conservatively.
-    let dropped = eng.invalidate_root(dir.path());
-    assert!(dropped.files_invalidated >= 1);
-    assert!(dropped.walks_invalidated >= 1);
+    // Bash itself globally invalidates filesystem-derived state: cwd-only
+    // invalidation would miss absolute and symlinked writes elsewhere.
+    assert!(eng.files().is_empty());
+    assert!(eng.walks().is_empty());
 
     assert_eq!(files_found(&eng, dir.path()), vec!["fresh.txt", "kept.txt"]);
     assert_eq!(
@@ -201,7 +201,7 @@ fn scoped_and_recursive_invalidation_do_only_what_they_say() {
 }
 
 #[test]
-fn clearing_the_caches_empties_both() {
+fn clearing_the_caches_empties_all_resident_state() {
     let dir = tempfile::tempdir().unwrap();
     let eng = trusting_engine(dir.path());
     seed(dir.path(), "a.txt", "marker\n");
@@ -211,11 +211,19 @@ fn clearing_the_caches_empties_both() {
     )
     .unwrap();
     assert!(!eng.files().is_empty());
+    #[derive(Default)]
+    struct ResidentMarker;
+    let extension_before = eng.extension::<ResidentMarker>();
 
     let dropped = eng.clear_caches();
     assert!(dropped.files_invalidated >= 1);
     assert_eq!(dropped.walks_invalidated, 1);
     assert!(eng.files().is_empty());
+    let extension_after = eng.extension::<ResidentMarker>();
+    assert!(
+        !std::sync::Arc::ptr_eq(&extension_before, &extension_after),
+        "tool extension state must be detached by a full clear"
+    );
 
     let r = grep(
         &eng,

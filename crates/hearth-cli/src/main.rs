@@ -1,14 +1,17 @@
 //! `hearth` — the thin CLI client.
 //!
 //! By default it connects to a running `hearthd` (the warm, resident engine).
-//! If no daemon is reachable it falls back to an in-process engine (a cold run),
-//! so the CLI always works. The `--no-daemon` flag forces the inline path.
+//! If no authenticated daemon is reachable before operation delivery begins,
+//! it falls back to an in-process engine (a cold run). A protocol handshake
+//! carries no operation and can also fall back safely. Once operation sending
+//! may have begun, the CLI reports an indeterminate result and never replays it.
+//! The `--no-daemon` flag forces the inline path.
 
 use clap::{Args, Parser, Subcommand};
 use hearth_core::{Engine, EngineConfig};
 use hearth_proto::*;
 use hearth_tools::dispatch;
-use hearth_tools::transport::{read_msg, send_request_with_fd};
+use hearth_tools::transport::{connect_verified, read_msg, send_request_with_fd};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -376,25 +379,58 @@ fn socket_path(global: &Global) -> PathBuf {
 }
 
 fn run(global: &Global, req: Request) -> Response {
+    if global.no_daemon {
+        return dispatch_inline(req);
+    }
+
+    // Connecting and authenticating the server happen before operation
+    // delivery, so failure here is safe to fall back from.
+    let stream = match connect_verified(&socket_path(global)) {
+        Ok(stream) => stream,
+        Err(_) => return dispatch_inline(req),
+    };
+    dispatch_connected(global, stream, req)
+}
+
+fn dispatch_connected(global: &Global, stream: UnixStream, req: Request) -> Response {
+    // Negotiate before any operation or FD transfer. Hello contains no
+    // operation, so every handshake failure is determinate: `req` did not run
+    // and can safely take the cold inline path. This also makes a new CLI work
+    // against a pre-handshake daemon without requiring an immediate restart.
+    let hello = Request::Hello(ProtocolHello {
+        version: PROTOCOL_VERSION,
+    });
+    if send_request_with_fd(&stream, &hello, None).is_err() {
+        return dispatch_inline(req);
+    }
+    let mut reader = &stream;
+    match read_msg::<_, Response>(&mut reader) {
+        Ok(Response::Hello(ProtocolAck { version })) if version == PROTOCOL_VERSION => {}
+        Ok(_) | Err(_) => return dispatch_inline(req),
+    }
+
     // A read destined for stdout can be streamed: pass our stdout fd so the
     // daemon writes the content straight to it, skipping payload serialization.
-    let stream_to_stdout = matches!(req, Request::Read(_)) && !global.json;
-    if !global.no_daemon
-        && let Ok(stream) = UnixStream::connect(socket_path(global))
-    {
-        let fd = if stream_to_stdout {
-            Some(std::io::stdout().as_raw_fd())
-        } else {
-            None
-        };
-        if send_request_with_fd(&stream, &req, fd).is_ok() {
-            let mut rd = &stream;
-            if let Ok(resp) = read_msg::<_, Response>(&mut rd) {
-                return resp;
-            }
-        }
+    let fd = if matches!(req, Request::Read(_)) && !global.json {
+        Some(std::io::stdout().as_raw_fd())
+    } else {
+        None
+    };
+    if let Err(error) = send_request_with_fd(&stream, &req, fd) {
+        return Response::Error(ToolError::indeterminate(format!(
+            "daemon request delivery may have begun; request was not replayed: {error}"
+        )));
     }
-    // Inline fallback: a fresh, one-shot engine (cold).
+
+    match read_msg::<_, Response>(&mut reader) {
+        Ok(response) => response,
+        Err(error) => Response::Error(ToolError::indeterminate(format!(
+            "daemon response was lost or invalid; request was not replayed: {error}"
+        ))),
+    }
+}
+
+fn dispatch_inline(req: Request) -> Response {
     let engine = Engine::new(EngineConfig {
         enable_optimizer: false,
         enable_watch: false,
@@ -415,6 +451,10 @@ fn render(global: &Global, cmd: &Cmd, resp: &Response) -> i32 {
     }
     let count_mode = matches!(cmd, Cmd::Grep { count: true, .. });
     match resp {
+        Response::Hello(_) => {
+            eprintln!("error: unexpected protocol handshake response");
+            1
+        }
         Response::Read(r) => {
             print!("{}", r.content);
             0
@@ -454,7 +494,17 @@ fn render(global: &Global, cmd: &Cmd, resp: &Response) -> i32 {
                 }
             }
             print!("{out}");
-            if g.total_matches == 0 { 1 } else { 0 }
+            if g.incomplete {
+                eprintln!("error: grep could not search every selected file completely");
+                2
+            } else if g.limit_reached {
+                eprintln!("warning: grep result limit reached");
+                0
+            } else if g.total_matches == 0 {
+                1
+            } else {
+                0
+            }
         }
         Response::EditBatch(r) => {
             eprintln!("{} replacement(s)", r.replacements);
@@ -677,6 +727,95 @@ fn render_graph_status(out: &mut String, status: &GraphStatusResult) {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    enum LegacyRequest {
+        Ping,
+    }
+
+    fn test_global() -> Global {
+        Global {
+            socket: None,
+            no_daemon: false,
+            json: true,
+        }
+    }
+
+    #[test]
+    fn handshake_send_failure_falls_back_before_operation_delivery() {
+        let (client, _daemon) = UnixStream::pair().unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let response = dispatch_connected(&test_global(), client, Request::Ping);
+        assert!(matches!(response, Response::Pong));
+    }
+
+    #[test]
+    fn handshake_eof_falls_back_before_operation_delivery() {
+        let (client, mut legacy_daemon) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let _supported_legacy_operation = LegacyRequest::Ping;
+            let error = read_msg::<_, LegacyRequest>(&mut legacy_daemon).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            // The pre-v2 decoder rejects the unknown Hello variant and closes
+            // without ever receiving the actual operation.
+        });
+
+        let response = dispatch_connected(&test_global(), client, Request::Ping);
+        worker.join().unwrap();
+        assert!(matches!(response, Response::Pong));
+    }
+
+    #[test]
+    fn version_mismatch_falls_back_without_sending_the_operation() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let hello: Request = read_msg(&mut daemon).unwrap();
+            assert!(matches!(hello, Request::Hello(_)));
+            hearth_tools::transport::write_msg(
+                &mut daemon,
+                &Response::Error(ToolError::invalid(format!(
+                    "unsupported protocol version {}; expected {}",
+                    PROTOCOL_VERSION + 1,
+                    PROTOCOL_VERSION
+                ))),
+            )
+            .unwrap();
+            let error = read_msg::<_, Request>(&mut daemon).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        });
+
+        let response = dispatch_connected(&test_global(), client, Request::Ping);
+        assert!(matches!(response, Response::Pong));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn response_loss_after_operation_delivery_remains_indeterminate() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let hello: Request = read_msg(&mut daemon).unwrap();
+            assert!(matches!(hello, Request::Hello(_)));
+            hearth_tools::transport::write_msg(
+                &mut daemon,
+                &Response::Hello(ProtocolAck {
+                    version: PROTOCOL_VERSION,
+                }),
+            )
+            .unwrap();
+            let operation: Request = read_msg(&mut daemon).unwrap();
+            assert!(matches!(operation, Request::Ping));
+            // Drop without a response after observing exactly one operation.
+        });
+
+        let response = dispatch_connected(&test_global(), client, Request::Ping);
+        worker.join().unwrap();
+        let Response::Error(error) = response else {
+            panic!("response loss after delivery must not fall back inline");
+        };
+        assert_eq!(error.kind, ErrorKind::Indeterminate);
+    }
 
     fn graph_node(path: &str, node_id: &str) -> GraphNode {
         GraphNode {

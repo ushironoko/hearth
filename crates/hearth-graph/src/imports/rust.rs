@@ -3,24 +3,28 @@ use tree_sitter::Node;
 
 use super::{ImportKind, RawImport};
 
+const MAX_RUST_IMPORTS: usize = 100_000;
+const MAX_RUST_IMPORT_SPECIFIER_BYTES: usize = 64 * 1024 * 1024;
+
 pub(crate) fn extract(source: &str, tree: &tree_sitter::Tree) -> Vec<RawImport> {
     let bytes = source.as_bytes();
     let mut imports = Vec::new();
     // Keeping inline-module specifiers as written loses some resolution
     // precision, which is acceptable while Rust outcomes are constitutively
     // Partial and their graph edges are Approximate.
-    visit(tree.root_node(), bytes, &mut imports);
+    let mut specifier_bytes = 0usize;
+    visit(tree.root_node(), bytes, &mut imports, &mut specifier_bytes);
     imports.sort_by_key(|import| import.span.0);
     imports
 }
 
-fn visit(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) {
+fn visit(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>, specifier_bytes: &mut usize) {
     let mut pending = vec![node];
     while let Some(node) = pending.pop() {
         match node.kind() {
             "use_declaration" => {
                 if let Some(argument) = node.child_by_field_name("argument") {
-                    expand_use_tree(argument, source, imports);
+                    expand_use_tree(argument, source, imports, specifier_bytes);
                 }
             }
             "mod_item" => {
@@ -28,7 +32,13 @@ fn visit(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) {
                     && let Some(name) = node.child_by_field_name("name")
                 {
                     let specifier = node_text(name, source);
-                    push_import(name, specifier, ImportKind::RustMod, imports);
+                    push_import(
+                        name,
+                        specifier,
+                        ImportKind::RustMod,
+                        imports,
+                        specifier_bytes,
+                    );
                 }
             }
             _ => {}
@@ -49,7 +59,12 @@ struct UsePrefixPart {
     rendered_len: usize,
 }
 
-fn expand_use_tree(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) {
+fn expand_use_tree(
+    node: Node<'_>,
+    source: &[u8],
+    imports: &mut Vec<RawImport>,
+    specifier_bytes: &mut usize,
+) {
     let mut prefixes = Vec::new();
     let mut pending = vec![(node, UsePrefix::default())];
     while let Some((node, prefix)) = pending.pop() {
@@ -72,7 +87,7 @@ fn expand_use_tree(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) 
                 if let Some(path) = node.child_by_field_name("path")
                     && let Some(segment) = normalized_path(path, source)
                 {
-                    push_use_leaf(path, prefix, &prefixes, &segment, imports);
+                    push_use_leaf(path, prefix, &prefixes, &segment, imports, specifier_bytes);
                 }
             }
             "use_wildcard" => {
@@ -80,11 +95,11 @@ fn expand_use_tree(node: Node<'_>, source: &[u8], imports: &mut Vec<RawImport>) 
                     .named_child(0)
                     .and_then(|path| normalized_path(path, source))
                     .map_or_else(|| "*".to_owned(), |path| format!("{path}::*"));
-                push_use_leaf(node, prefix, &prefixes, &segment, imports);
+                push_use_leaf(node, prefix, &prefixes, &segment, imports, specifier_bytes);
             }
             "identifier" | "scoped_identifier" | "crate" | "self" | "super" | "metavariable" => {
                 if let Some(segment) = normalized_path(node, source) {
-                    push_use_leaf(node, prefix, &prefixes, &segment, imports);
+                    push_use_leaf(node, prefix, &prefixes, &segment, imports, specifier_bytes);
                 }
             }
             _ => {}
@@ -117,9 +132,27 @@ fn push_use_leaf(
     prefixes: &[UsePrefixPart],
     segment: &str,
     imports: &mut Vec<RawImport>,
+    specifier_bytes: &mut usize,
 ) {
+    if imports.len() >= MAX_RUST_IMPORTS {
+        return;
+    }
+    let prefix_len = prefix.0.map_or(0, |index| prefixes[index].rendered_len);
+    let append_segment = segment != "self" || prefix.0.is_none();
+    let projected_len = prefix_len
+        .saturating_add(usize::from(prefix.0.is_some() && append_segment) * 2)
+        .saturating_add(append_segment as usize * segment.len());
+    if projected_len > MAX_RUST_IMPORT_SPECIFIER_BYTES.saturating_sub(*specifier_bytes) {
+        return;
+    }
     let specifier = render_use_path(prefix, prefixes, segment);
-    push_import(node, Some(specifier), ImportKind::RustUse, imports);
+    push_import(
+        node,
+        Some(specifier),
+        ImportKind::RustUse,
+        imports,
+        specifier_bytes,
+    );
 }
 
 fn render_use_path(prefix: UsePrefix, prefixes: &[UsePrefixPart], segment: &str) -> String {
@@ -157,6 +190,7 @@ fn push_import(
     specifier: Option<String>,
     kind: ImportKind,
     imports: &mut Vec<RawImport>,
+    specifier_bytes: &mut usize,
 ) {
     let Some(specifier) = specifier else {
         return;
@@ -170,6 +204,12 @@ fn push_import(
     let Ok(line) = u32::try_from(node.start_position().row + 1) else {
         return;
     };
+    if imports.len() >= MAX_RUST_IMPORTS
+        || specifier.len() > MAX_RUST_IMPORT_SPECIFIER_BYTES.saturating_sub(*specifier_bytes)
+    {
+        return;
+    }
+    *specifier_bytes += specifier.len();
     imports.push(RawImport {
         specifier: CompactString::from(specifier),
         kind,
@@ -179,43 +219,34 @@ fn push_import(
 }
 
 fn normalized_path(node: Node<'_>, source: &[u8]) -> Option<String> {
-    enum Frame<'tree> {
-        Visit(Node<'tree>),
-        JoinScoped { has_path: bool },
-    }
+    const MAX_NORMALIZED_PATH_BYTES: usize = 64 * 1024;
 
-    let mut pending = vec![Frame::Visit(node)];
-    let mut values = Vec::new();
-    while let Some(frame) = pending.pop() {
-        match frame {
-            Frame::Visit(node) if node.kind() == "scoped_identifier" => {
-                let Some(name) = node.child_by_field_name("name") else {
-                    values.push(None);
-                    continue;
-                };
-                let path = node.child_by_field_name("path");
-                pending.push(Frame::JoinScoped {
-                    has_path: path.is_some(),
-                });
-                if let Some(path) = path {
-                    pending.push(Frame::Visit(path));
-                }
-                pending.push(Frame::Visit(name));
+    // Collect source-ordered leaf segments and join once. Rebuilding a growing
+    // prefix at every nested scoped identifier is quadratic.
+    let mut pending = vec![node];
+    let mut segments = Vec::new();
+    let mut rendered_len = 0usize;
+    while let Some(node) = pending.pop() {
+        if node.kind() == "scoped_identifier" {
+            let name = node.child_by_field_name("name")?;
+            if let Some(path) = node.child_by_field_name("path") {
+                pending.push(name);
+                pending.push(path);
+            } else {
+                pending.push(name);
             }
-            Frame::Visit(node) => values.push(node_text(node, source)),
-            Frame::JoinScoped { has_path } => {
-                let path = has_path.then(|| values.pop().flatten()).flatten();
-                let Some(name) = values.pop().flatten() else {
-                    values.push(None);
-                    continue;
-                };
-                values.push(Some(
-                    path.map_or(name.clone(), |path| join_path(&path, &name)),
-                ));
-            }
+            continue;
         }
+        let segment = node_text(node, source)?;
+        rendered_len = rendered_len
+            .checked_add(usize::from(!segments.is_empty()) * 2)?
+            .checked_add(segment.len())?;
+        if rendered_len > MAX_NORMALIZED_PATH_BYTES {
+            return None;
+        }
+        segments.push(segment);
     }
-    values.pop().flatten()
+    Some(segments.join("::"))
 }
 
 fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -224,14 +255,4 @@ fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
-}
-
-fn join_path(prefix: &str, segment: &str) -> String {
-    if prefix.is_empty() {
-        segment.to_owned()
-    } else if segment.is_empty() {
-        prefix.to_owned()
-    } else {
-        format!("{prefix}::{segment}")
-    }
 }

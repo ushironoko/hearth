@@ -160,6 +160,8 @@ export interface BashResult {
   durationUs: number
   /** How many chunks were delivered to the stream callback. */
   chunks: number
+  /** True when output beyond the engine hard cap was drained and discarded. */
+  outputTruncated: boolean
 }
 
 /** Which caches an invalidation should drop. */
@@ -617,6 +619,8 @@ export interface GrepResult {
   walkCacheHit: boolean
   /** True when `maxTotalCount` capped the result; more matches exist. */
   limitReached: boolean
+  /** True when at least one selected file could not be searched completely. */
+  incomplete: boolean
   /** The resolved search root. */
   root: string
   rootIsDir: boolean

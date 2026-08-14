@@ -27,6 +27,14 @@ pub struct EngineConfig {
     /// Default shell for `bash`. `None` means `/bin/sh -c`. A per-call
     /// `BashParams::shell` overrides this.
     pub shell: Option<ShellSpec>,
+    /// Hard cap on collected Bash stdout + stderr bytes. Pipes continue to be
+    /// drained after the cap so a noisy child cannot deadlock.
+    pub max_bash_output_bytes: usize,
+    /// Hard per-operation bounds for full-file reads and rewritten results.
+    pub max_tool_file_bytes: u64,
+    pub max_edit_result_bytes: usize,
+    /// Hard cap on Grep Content-mode line/context text retained per file.
+    pub max_grep_output_bytes: usize,
     /// Use the pooled warm-shell fast path for `bash` (opt-in). Default false:
     /// each command spawns a fresh `/bin/sh -c` (always correct). The warm pool
     /// avoids the per-command spawn but falls back to a fresh spawn on any
@@ -34,8 +42,17 @@ pub struct EngineConfig {
     pub warm_shell: bool,
     /// Threads used by the parallel directory walker.
     pub walk_threads: usize,
+    /// Hard cap on retained directory-walk snapshots.
+    pub max_cached_walks: usize,
+    /// Hard per-walk cap on discovered files and retained path bytes.
+    pub max_walk_files: usize,
+    pub max_walk_path_bytes: usize,
     /// Start an fs-watcher on searched roots to proactively invalidate caches.
     pub enable_watch: bool,
+    /// Hard cap on distinct roots admitted to the resident watcher. When the
+    /// cap is reached, new roots remain correct via stat validation but are not
+    /// proactively watched.
+    pub max_watch_roots: usize,
     /// Skip the per-hit freshness `stat` on warm reads/greps. This is a
     /// single-writer / bounded-staleness fast path: it assumes files are only
     /// modified *through* Hearth (whose `write`/`edit` refresh the cache) — an
@@ -62,9 +79,17 @@ impl Default for EngineConfig {
             default_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             bash_timeout_ms: 120_000,
             shell: None,
+            max_bash_output_bytes: 16 * 1024 * 1024,
+            max_tool_file_bytes: 64 * 1024 * 1024,
+            max_edit_result_bytes: 64 * 1024 * 1024,
+            max_grep_output_bytes: 4 * 1024 * 1024,
             warm_shell: false,
             walk_threads: threads,
+            max_cached_walks: 64,
+            max_walk_files: 1_000_000,
+            max_walk_path_bytes: 256 * 1024 * 1024,
             enable_watch: false,
+            max_watch_roots: 64,
             trust_cache: false,
             enable_optimizer: true,
             max_cached_files: 65_536,
@@ -100,10 +125,12 @@ struct EngineInner {
     invalidations: Arc<InvalidationLog>,
     tuning: Arc<Tuning>,
     watch: Mutex<Option<WatchHandle>>,
+    watched_roots: Mutex<std::collections::HashSet<PathBuf>>,
     /// Type-erased per-engine extensions, so tools can stash long-lived state
     /// (e.g. a compiled-matcher cache) without `hearth-core` depending on their
     /// types.
     extensions: DashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+    path_locks: Arc<PathLocks>,
     opt_stop: Arc<AtomicBool>,
     // Kept alive for the engine's lifetime; the thread exits when `opt_stop` is set.
     #[allow(dead_code)]
@@ -126,13 +153,22 @@ pub struct Engine {
 impl Engine {
     /// Build an engine with the given configuration, starting the optimizer.
     pub fn new(config: EngineConfig) -> Self {
-        let files = Arc::new(FileCache::new());
-        let walks = Arc::new(WalkCache::new(config.walk_threads));
+        let files = Arc::new(FileCache::with_limits(
+            config.max_cache_bytes,
+            config.max_cached_files,
+        ));
+        let walks = Arc::new(WalkCache::with_limits(
+            config.walk_threads,
+            config.max_cached_walks,
+            config.max_walk_files,
+            config.max_walk_path_bytes,
+        ));
         let invalidations = Arc::new(InvalidationLog::new());
         let tuning = Arc::new(Tuning::default());
-        // Normalize bounds so a misconfigured min>max can never panic `clamp`.
-        let min_bytes = config.min_cache_bytes;
-        let max_bytes = config.max_cache_bytes.max(min_bytes);
+        // The configured maximum is a safety ceiling, never raised to satisfy a
+        // misconfigured adaptive floor.
+        let max_bytes = config.max_cache_bytes;
+        let min_bytes = config.min_cache_bytes.min(max_bytes);
         // Start the adaptive budget at the floor; the optimizer grows it toward
         // the ceiling for warm, high-reuse workloads.
         tuning.cache_byte_budget.store(min_bytes, Ordering::Relaxed);
@@ -165,7 +201,9 @@ impl Engine {
                 invalidations,
                 tuning,
                 watch: Mutex::new(None),
+                watched_roots: Mutex::new(std::collections::HashSet::new()),
                 extensions: DashMap::new(),
+                path_locks: Arc::new(PathLocks::default()),
                 opt_stop,
                 opt_thread: Mutex::new(opt_thread),
             }),
@@ -226,11 +264,25 @@ impl Engine {
         if !self.inner.config.enable_watch {
             return;
         }
+        // Preserve the caller's spelling: WatchHandle uses it to map events
+        // back through symlinked roots. The hard cap may conservatively count
+        // two spellings of one directory, which is safe.
+        let root = root.to_path_buf();
+        {
+            let mut roots = self.inner.watched_roots.lock();
+            if roots.contains(&root) {
+                return;
+            }
+            if roots.len() >= self.inner.config.max_watch_roots {
+                return;
+            }
+            roots.insert(root.clone());
+        }
         let mut guard = self.inner.watch.lock();
         let started = match guard.as_mut() {
-            Some(handle) => handle.add_root(root).is_ok(),
+            Some(handle) => handle.add_root(&root).is_ok(),
             None => match WatchHandle::start(
-                root,
+                &root,
                 Arc::clone(&self.inner.files),
                 Arc::clone(&self.inner.walks),
                 Arc::clone(&self.inner.invalidations),
@@ -243,7 +295,9 @@ impl Engine {
             },
         };
         drop(guard);
-        let _ = started;
+        if !started {
+            self.inner.watched_roots.lock().remove(&root);
+        }
     }
 
     /// Whether a warm hit may skip the freshness `stat` — true only in
@@ -251,6 +305,11 @@ impl Engine {
     /// default stats every hit.
     pub fn stat_free(&self, _path: &Path) -> bool {
         self.inner.config.trust_cache
+    }
+
+    #[cfg(test)]
+    fn watched_root_count(&self) -> usize {
+        self.inner.watched_roots.lock().len()
     }
 
     // -- mutation serialization ------------------------------------------
@@ -262,7 +321,7 @@ impl Engine {
     /// the same file (or of a symlink alias of it) cannot interleave and lose
     /// an update. The guard releases on drop, including on unwind.
     pub fn lock_path(&self, path: &Path) -> PathGuard {
-        self.extension::<PathLocks>().lock(mutation_key(path))
+        self.inner.path_locks.lock(mutation_key(path))
     }
 
     // -- explicit cache invalidation --------------------------------------
@@ -319,13 +378,34 @@ impl Engine {
         result
     }
 
-    /// Drop every cached file and walk.
-    pub fn clear_caches(&self) -> InvalidateResult {
+    /// Drop filesystem-derived file and walk state across every root.
+    ///
+    /// Bash uses this conservative reset because an unrestricted command can
+    /// mutate outside cwd. It deliberately preserves non-filesystem extensions
+    /// such as the warm-shell pool; tool-owned graph state is detached by the
+    /// tool layer alongside this call.
+    pub fn clear_filesystem_caches(&self) -> InvalidateResult {
         let result = InvalidateResult {
             files_invalidated: self.inner.files.clear() as u64,
             walks_invalidated: self.inner.walks.clear() as u64,
         };
         self.inner.invalidations.record_wipe();
+        result
+    }
+
+    /// Drop all resident cache state owned by this engine.
+    ///
+    /// Besides filesystem entries this detaches tool extensions (compiled
+    /// matchers, graph roots, and warm shells) and stops
+    /// the current watcher. Active callers may keep an already-cloned Arc until
+    /// they settle, but future calls start from empty state. Watching restarts
+    /// lazily on the next `watch_root` call. The mutation lock registry is a
+    /// permanent synchronization primitive and is intentionally preserved.
+    pub fn clear_caches(&self) -> InvalidateResult {
+        let result = self.clear_filesystem_caches();
+        self.inner.extensions.clear();
+        self.inner.watch.lock().take();
+        self.inner.watched_roots.lock().clear();
         result
     }
 
@@ -463,5 +543,45 @@ fn optimizer_loop(
             crate::profiler::count("optimizer.evictions", (evicted + pruned) as u64);
             crate::profiler::count("optimizer.bytes_freed", freed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watcher_root_budget_is_synchronous() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let engine = Engine::new(EngineConfig {
+            enable_watch: true,
+            max_watch_roots: 1,
+            ..EngineConfig::default()
+        });
+
+        engine.watch_root(&first);
+        assert_eq!(engine.watched_root_count(), 1);
+        engine.watch_root(&second);
+        assert_eq!(engine.watched_root_count(), 1);
+        engine.watch_root(&first);
+        assert_eq!(engine.watched_root_count(), 1);
+    }
+
+    #[test]
+    fn zero_watcher_root_budget_never_starts_a_watcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(EngineConfig {
+            enable_watch: true,
+            max_watch_roots: 0,
+            ..EngineConfig::default()
+        });
+
+        engine.watch_root(temp.path());
+        assert_eq!(engine.watched_root_count(), 0);
+        assert!(engine.inner.watch.lock().is_none());
     }
 }

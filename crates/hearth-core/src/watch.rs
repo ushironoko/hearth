@@ -516,19 +516,17 @@ impl WatchHandle {
         // already being watched.
         let original = root.to_path_buf();
         let (key, conservative) = resolve_root(root);
-        // Even a covered subtree needs its alias recorded: callers may cache that
-        // spelling although no additional backend watch is necessary.
-        register_watched_tree(
-            self.watched_trees.as_ref(),
-            original,
-            key.clone(),
-            conservative,
-        );
         if self.watched.iter().any(|watched| key.starts_with(watched)) {
+            // A covered subtree needs no backend admission; register its alias
+            // only after coverage is known.
+            register_watched_tree(self.watched_trees.as_ref(), original, key, conservative);
             return Ok(());
         }
+        // Do not publish resident alias state until the backend accepted the
+        // root. A failed watch must leave no uncapped per-event work behind.
         self.watcher.watch(&key, RecursiveMode::Recursive)?;
-        self.watched.insert(key);
+        self.watched.insert(key.clone());
+        register_watched_tree(self.watched_trees.as_ref(), original, key, conservative);
         Ok(())
     }
 

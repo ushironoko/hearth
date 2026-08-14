@@ -38,6 +38,25 @@ Three surfaces, one core:
 Full design in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); full benchmark
 methodology in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
+### Security model for agents and LLM clients
+
+`hearthd` is a same-user performance service, **not** a privilege, tenant, or
+workspace boundary. A client that can reach it can request every operation the
+daemon's OS user can perform, including arbitrary paths and shell commands. Do
+not run it as root, under a more privileged UID, or as a shared service.
+
+An LLM is an untrusted input producer even when it is not malicious: it can
+invent paths, emit extreme numeric/vector values, retry ambiguous mutations,
+launch long-running commands, and create parallel load. An adapter that exposes
+Hearth to an LLM must enforce allowed roots and operations, environment
+allowlists, request/output/deadline budgets, and approval for Bash or mutations
+where appropriate. Without those controls, the LLM deliberately has the OS
+user's read/write/execute authority and can reach daemon-inherited secrets.
+
+See [`SECURITY.md`](SECURITY.md) for deployment requirements and
+[`docs/SECURITY_AUDIT_HEARTHD.md`](docs/SECURITY_AUDIT_HEARTHD.md) for the
+source-level threat model and remediation status.
+
 ---
 
 ## Why Hearth
@@ -63,6 +82,8 @@ What that buys, **measured** (Apple Silicon, `--release`; see
 
 ### Limits
 
+Safety ceilings are enforced even with the optimizer disabled: 256 MiB wire frames with bounded MessagePack structure, 30 s frame receipt, 64 MiB read/edit files, 16 MiB per searched file, 4 MiB aggregate grep results, bounded walk/build/result state, and a 24 h maximum Bash timeout. Directory walks honor only bounded root-local `.ignore`/`.rgignore`; ancestor/global Git ignore files and project-reference tsconfig fan-out are intentionally not expanded.
+
 Hearth wins where the amortized work it saves exceeds the cost of reaching it.
 Where it doesn't:
 
@@ -85,7 +106,7 @@ Where it doesn't:
 ```
                  ┌──────────────────────── one resident Engine ─────────────────────────┐
    native Rust ──┤  FileCache   — file contents cached, validated by mtime/size           │
-   napi (Node) ──┤  WalkCache   — directory walk (+ .gitignore) cached per root            │
+   napi (Node) ──┤  WalkCache   — bounded directory walk (+ root-local ignore) per root    │
    daemon/CLI  ──┤  WarmShells  — opt-in pooled shells for bash                            │
                  │  fs-watch    — best-effort proactive invalidation                       │
                  │  (caches are bounded by an LRU byte budget, so the daemon stays small)  │
@@ -123,8 +144,11 @@ call.
 
 ### At the boundaries
 
-- **Daemon/CLI**: length-prefixed msgpack over a Unix socket, one thread per
-  connection, engine shared by `Arc` clone.
+- **Daemon/CLI**: capped length-prefixed msgpack over a Unix socket, one thread
+  per connection behind a default ceiling of 64, engine shared by `Arc` clone.
+  The endpoint lives in an owner-only runtime directory; client and server both
+  verify peer UID. FD-passing validates kind/count/CLOEXEC and preserves frame
+  boundaries.
 - **napi**: concrete generated TypeScript types at the boundary — no `any` on any
   tool method. Sync methods plus `*Async` twins that offload to a libuv worker via
   `AsyncTask` (no embedded tokio) and take an optional `AbortSignal`, and a
@@ -180,12 +204,17 @@ bun  bench/harness/bun/compare.js          # fair vs Bun fs
 **CLI + daemon** (repeated calls are warm):
 
 ```bash
-./target/release/hearthd --socket /tmp/hearth.sock --cwd "$PWD" --trust-cache &
-./target/release/hearth  --socket /tmp/hearth.sock grep -l "TODO" .
-./target/release/hearth  --socket /tmp/hearth.sock stop
+runtime_dir="$(mktemp -d)"
+chmod 700 "$runtime_dir"
+./target/release/hearthd --socket "$runtime_dir/hearth.sock" --cwd "$PWD" --trust-cache &
+./target/release/hearth  --socket "$runtime_dir/hearth.sock" grep -l "TODO" .
+./target/release/hearth  --socket "$runtime_dir/hearth.sock" stop
 ```
 
-The CLI falls back to an in-process (cold) engine when no daemon is reachable.
+The CLI falls back to an in-process (cold) engine only when it cannot connect
+or can prove no request byte was sent. Once delivery may have begun it returns
+an indeterminate error instead of replaying the operation. A streamed read may
+already have emitted a partial, non-duplicated prefix in that case.
 
 **Node.js** (where read/grep/edit win in-process):
 

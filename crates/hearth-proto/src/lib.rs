@@ -496,6 +496,10 @@ pub struct BashResult {
     /// Number of chunks emitted to the stream callback. A streaming caller can
     /// assert it observed exactly this many.
     pub chunks: u64,
+    /// True when stdout/stderr exceeded the engine's hard collection/streaming
+    /// cap. Pipes were still drained, but bytes beyond the cap were discarded.
+    #[serde(default)]
+    pub output_truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +554,8 @@ pub struct GrepParams {
     /// Stop after this many matches **per file**. `None` is unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_count: Option<u64>,
-    /// Stop after this many matches **across all files**. `None` is unlimited.
+    /// Stop after this many matches **across all files**. `None` uses the
+    /// hard safety default of 100,000 matches.
     ///
     /// The kept matches are the first `maxTotalCount` in path order, which does
     /// not depend on how the parallel search happened to interleave.
@@ -638,6 +643,9 @@ pub struct GrepResult {
     pub walk_cache_hit: bool,
     /// True when `maxTotalCount` capped the result. More matches exist.
     pub limit_reached: bool,
+    /// True when at least one selected file could not be searched completely.
+    #[serde(default)]
+    pub incomplete: bool,
     /// The resolved search root, so a caller can relativize `files[].path`
     /// exactly the way it intends without re-resolving the request path.
     pub root: String,
@@ -1187,6 +1195,22 @@ pub struct InvalidateResult {
 // Envelope for the daemon transport
 // ---------------------------------------------------------------------------
 
+/// Current daemon transport contract. A client negotiates this before sending
+/// an operation, so incompatible peers fail before mutation or FD transfer.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolHello {
+    pub version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolAck {
+    pub version: u32,
+}
+
 /// A request sent to the resident daemon.
 ///
 /// Externally tagged (the default) so it round-trips cleanly through msgpack —
@@ -1194,6 +1218,8 @@ pub struct InvalidateResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Request {
+    /// Must be the first request on every daemon connection.
+    Hello(ProtocolHello),
     Read(ReadParams),
     Write(WriteParams),
     Edit(EditParams),
@@ -1217,6 +1243,7 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Response {
+    Hello(ProtocolAck),
     Read(ReadResult),
     Write(WriteResult),
     Edit(EditResult),

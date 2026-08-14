@@ -38,9 +38,17 @@ use xxhash_rust::xxh3::Xxh3;
 
 const MAX_GRAPH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_GRAPH_ROOTS: usize = 16;
+const MAX_GRAPH_RESIDENT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_GRAPH_ACTIVE_BUILDS: usize = 2;
 const MAX_RDEPS_REPAIR: usize = 256;
 const MAX_RDEPS_GREP_CANDIDATES: u64 = 1024;
 const MAX_SWEEP_PUBLISH_REBUILDS: usize = 3;
+const MAX_GRAPH_FILES: usize = 100_000;
+const MAX_GRAPH_PATH_BYTES: usize = 64 * 1024;
+const MAX_GRAPH_QUERY_BYTES: usize = 1024 * 1024;
+const MAX_GRAPH_DEPTH: u32 = 64;
+const MAX_GRAPH_RESULTS: u64 = 100_000;
+const MAX_GRAPH_BUILD_BYTES: usize = 256 * 1024 * 1024;
 
 /// Run a graph query without a live cancellation token.
 pub fn graph(engine: &Engine, params: &GraphParams) -> ToolResult<GraphResult> {
@@ -55,6 +63,7 @@ pub fn graph_cancellable(
 ) -> ToolResult<GraphResult> {
     profile!("tool.graph", {
         cancel.check()?;
+        validate_graph_params(params)?;
         let root_path = resolve_path(engine, &params.root);
         let metadata = std::fs::metadata(&root_path)
             .map_err(|_| ToolError::not_found(root_path.display().to_string()))?;
@@ -100,6 +109,43 @@ pub fn graph_cancellable(
     })
 }
 
+fn validate_graph_params(params: &GraphParams) -> ToolResult<()> {
+    if params.root.len() > MAX_GRAPH_PATH_BYTES {
+        return Err(ToolError::invalid("graph root path exceeds 64 KiB"));
+    }
+    if params.files.len() > MAX_GRAPH_FILES {
+        return Err(ToolError::invalid(
+            "graph files view exceeds 100000 entries",
+        ));
+    }
+    if params
+        .files
+        .iter()
+        .any(|path| path.len() > MAX_GRAPH_PATH_BYTES)
+    {
+        return Err(ToolError::invalid("graph file path exceeds 64 KiB"));
+    }
+    let (text_len, depth, limit) = match &params.op {
+        GraphOp::Symbols { path } | GraphOp::Outline { path } => (path.len(), 0, 0),
+        GraphOp::Search { query, limit } => (query.len(), 0, *limit),
+        GraphOp::Definitions { name, limit } => (name.len(), 0, *limit),
+        GraphOp::Deps { path, depth }
+        | GraphOp::Rdeps { path, depth, .. }
+        | GraphOp::Neighborhood { path, depth } => (path.len(), *depth, 0),
+        GraphOp::Status => (0, 0, 0),
+    };
+    if text_len > MAX_GRAPH_QUERY_BYTES {
+        return Err(ToolError::invalid("graph query text exceeds 1 MiB"));
+    }
+    if depth > MAX_GRAPH_DEPTH {
+        return Err(ToolError::invalid("graph depth exceeds 64"));
+    }
+    if limit > MAX_GRAPH_RESULTS {
+        return Err(ToolError::invalid("graph result limit exceeds 100000"));
+    }
+    Ok(())
+}
+
 /// Drop every graph root associated with `engine`.
 ///
 /// Engine extensions outlive the ordinary file and walk caches, so cache
@@ -115,6 +161,7 @@ struct GraphState {
     registry: Arc<LanguageRegistry>,
     roots: DashMap<PathBuf, Arc<RootGraph>>,
     access_clock: AtomicU64,
+    active_builds: Mutex<usize>,
 }
 
 impl Default for GraphState {
@@ -125,12 +172,13 @@ impl Default for GraphState {
             registry: Arc::new(LanguageRegistry::bundled()),
             roots: DashMap::new(),
             access_clock: AtomicU64::new(1),
+            active_builds: Mutex::new(0),
         }
     }
 }
 
 impl GraphState {
-    fn root(&self, path: &Path) -> RootQueryPin {
+    fn root(self: &Arc<Self>, path: &Path) -> RootQueryPin {
         let root = {
             let entry = self
                 .roots
@@ -142,8 +190,11 @@ impl GraphState {
         };
         self.touch(&root);
         run_graph_test_hook(path, GraphTestPoint::RootPinned);
-        self.evict_roots(path, &root);
-        RootQueryPin { root }
+        self.evict_roots();
+        RootQueryPin {
+            graph_state: Arc::clone(self),
+            root,
+        }
     }
 
     fn touch(&self, root: &RootGraph) {
@@ -153,18 +204,16 @@ impl GraphState {
         }
     }
 
-    fn evict_roots(&self, current_path: &Path, current_root: &Arc<RootGraph>) {
-        while self.roots.len() > MAX_GRAPH_ROOTS {
+    fn evict_roots(&self) {
+        while self.roots.len() > MAX_GRAPH_ROOTS
+            || self.estimated_bytes() > MAX_GRAPH_RESIDENT_BYTES
+        {
             // Inspect every candidate: a busy sweep may temporarily push the
             // map over the cap, but any later query retries the eviction.
             let victim = self
                 .roots
                 .iter()
-                .filter(|entry| {
-                    entry.key().as_path() != current_path
-                        && !Arc::ptr_eq(entry.value(), current_root)
-                        && entry.value().active_queries.load(Ordering::SeqCst) == 0
-                })
+                .filter(|entry| entry.value().active_queries.load(Ordering::SeqCst) == 0)
                 .filter_map(|entry| {
                     let last_access = entry.value().sweep.try_lock()?.last_access;
                     Some((entry.key().clone(), Arc::clone(entry.value()), last_access))
@@ -182,15 +231,48 @@ impl GraphState {
             }
         }
     }
+
+    fn reserve_build(self: &Arc<Self>) -> ToolResult<GraphBuildPermit> {
+        let mut active = self.active_builds.lock();
+        if *active >= MAX_GRAPH_ACTIVE_BUILDS {
+            return Err(ToolError::invalid("graph build capacity is exhausted"));
+        }
+        *active += 1;
+        Ok(GraphBuildPermit {
+            graph_state: Arc::clone(self),
+        })
+    }
+
+    fn estimated_bytes(&self) -> u64 {
+        self.roots
+            .iter()
+            .map(|entry| entry.value().estimated_bytes())
+            .sum()
+    }
+}
+
+struct GraphBuildPermit {
+    graph_state: Arc<GraphState>,
+}
+
+impl Drop for GraphBuildPermit {
+    fn drop(&mut self) {
+        let mut active = self.graph_state.active_builds.lock();
+        *active = active.saturating_sub(1);
+    }
 }
 
 struct RootQueryPin {
+    graph_state: Arc<GraphState>,
     root: Arc<RootGraph>,
 }
 
 impl Drop for RootQueryPin {
     fn drop(&mut self) {
         self.root.active_queries.fetch_sub(1, Ordering::SeqCst);
+        // A cold build may push resident bytes over budget after root()'s
+        // admission-time eviction. Retry once the query unpins the built root.
+        self.graph_state.evict_roots();
     }
 }
 
@@ -211,6 +293,11 @@ impl RootGraph {
             rdeps_flights: Mutex::new(FxHashMap::default()),
             active_queries: AtomicU64::new(0),
         }
+    }
+
+    fn estimated_bytes(&self) -> u64 {
+        let state = self.state.read();
+        state.estimated_bytes()
     }
 }
 
@@ -260,6 +347,29 @@ impl RootState {
             last_sweep_at: None,
             build_duration_us: None,
         }
+    }
+
+    fn estimated_bytes(&self) -> u64 {
+        let paths = self
+            .records
+            .keys()
+            .chain(self.config_records.keys())
+            .chain(self.supported_universe.iter())
+            .map(|path| path.len() as u64)
+            .sum::<u64>();
+        let nodes = self.graph.paths().count() as u64;
+        let edges = self.graph.edge_count() as u64;
+        let symbols = self.index.symbol_count() as u64;
+        let files = self.index.file_count() as u64;
+        // Conservative structural accounting. String capacities and allocator
+        // metadata vary by platform, so multiply logical payloads rather than
+        // claiming exact RSS. The hard root-count cap remains a second bound.
+        paths
+            .saturating_mul(3)
+            .saturating_add(nodes.saturating_mul(512))
+            .saturating_add(edges.saturating_mul(256))
+            .saturating_add(symbols.saturating_mul(512))
+            .saturating_add(files.saturating_mul(256))
     }
 }
 
@@ -406,7 +516,7 @@ struct ReadyAnswer {
 
 fn query_ready_root(
     engine: &Engine,
-    graph_state: &GraphState,
+    graph_state: &Arc<GraphState>,
     root_path: &Path,
     root: &Arc<RootGraph>,
     params: &GraphParams,
@@ -533,7 +643,7 @@ fn query_ready_root(
 #[allow(clippy::too_many_arguments)]
 fn sweep_and_answer(
     engine: &Engine,
-    graph_state: &GraphState,
+    graph_state: &Arc<GraphState>,
     root_path: &Path,
     root: &Arc<RootGraph>,
     params: &GraphParams,
@@ -542,6 +652,7 @@ fn sweep_and_answer(
     cold: bool,
 ) -> ToolResult<ReadyAnswer> {
     let started = Instant::now();
+    let _build_permit = graph_state.reserve_build()?;
     let mut cold_guard = cold.then(|| ColdBuildGuard::new(root));
     if cold {
         run_graph_test_hook(root_path, GraphTestPoint::ColdBuildStarted);
@@ -818,6 +929,32 @@ fn sweep_snapshot(root: &Path, state: &RootState) -> SweepSnapshot {
     }
 }
 
+fn analysis_bytes(analysis: &FileAnalysis) -> usize {
+    analysis
+        .path
+        .len()
+        .saturating_add(
+            analysis
+                .language
+                .as_ref()
+                .map_or(0, |language| language.len()),
+        )
+        .saturating_add(
+            analysis
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.len().saturating_add(size_of::<Symbol>()))
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            analysis
+                .imports
+                .iter()
+                .map(|import| import.specifier.len().saturating_add(size_of_val(import)))
+                .sum::<usize>(),
+        )
+}
+
 struct SweepUpsert {
     relative: CompactString,
     analysis: FileAnalysis,
@@ -897,8 +1034,27 @@ fn build_sweep_delta(
         };
         engine.watch_root(root);
         let (entry, hit) = engine.walks().get(root, key);
+        if !entry.complete {
+            return Err(ToolError::invalid("graph walk exceeded its work budget"));
+        }
+        if entry.files.len() > MAX_GRAPH_FILES {
+            return Err(ToolError::invalid(
+                "graph implicit universe exceeds 100000 files",
+            ));
+        }
         (entry.files.as_ref().clone(), hit)
     };
+
+    if universe
+        .iter()
+        .map(|path| path.as_os_str().len())
+        .sum::<usize>()
+        > MAX_GRAPH_QUERY_BYTES.saturating_mul(64)
+    {
+        return Err(ToolError::invalid(
+            "graph universe path bytes exceed 64 MiB",
+        ));
+    }
 
     let mut relative_universe = FxHashSet::default();
     let mut upserts = Vec::new();
@@ -906,6 +1062,7 @@ fn build_sweep_delta(
     let mut excluded = FxHashSet::default();
     let mut supported_universe = FxHashSet::default();
     let mut parser_pool = ParserPool::new(registry);
+    let mut build_bytes = 0usize;
     let mut counters = RootCounters {
         universe_files: universe.len() as u64,
         walk_cache_hit,
@@ -1004,6 +1161,11 @@ fn build_sweep_delta(
                 .expect("classified graph universe paths are UTF-8"),
         );
         let analysis = analyze_source(source, absolute.as_str(), hash, &mut parser_pool);
+        let analysis_bytes = analysis_bytes(&analysis);
+        if analysis_bytes > MAX_GRAPH_BUILD_BYTES.saturating_sub(build_bytes) {
+            return Err(ToolError::invalid("graph build exceeds byte limit"));
+        }
+        build_bytes += analysis_bytes;
         if CancelSignal::is_cancelled(&cancel_signal) {
             return Err(ToolError::cancelled());
         }
@@ -1078,6 +1240,12 @@ fn answer_query(
                 &filter,
                 caller_view.as_ref(),
             )?;
+            if result.edges.len().saturating_add(result.unresolved.len())
+                > MAX_GRAPH_RESULTS as usize
+                || result.coverage.basis.len() > MAX_GRAPH_RESULTS as usize
+            {
+                return Err(ToolError::invalid("graph dependency result exceeds limit"));
+            }
             (GraphOutput::Deps(result), Some(guarantee))
         }
         GraphOp::Rdeps {
@@ -1094,6 +1262,13 @@ fn answer_query(
                 &filter,
                 caller_view.as_ref(),
             )?;
+            if result.importers.len() > MAX_GRAPH_RESULTS as usize
+                || result.coverage.basis.len() > MAX_GRAPH_RESULTS as usize
+            {
+                return Err(ToolError::invalid(
+                    "graph reverse dependency result exceeds limit",
+                ));
+            }
             let freshness_guarantee = graph_meta(root, state, freshness).guarantee;
             result.verified =
                 guarantee == Guarantee::Exact && freshness_guarantee == GraphGuarantee::Exact;
@@ -1109,6 +1284,13 @@ fn answer_query(
                 &filter,
                 caller_view.as_ref(),
             )?;
+            if result.nodes.len().saturating_add(result.edges.len()) > MAX_GRAPH_RESULTS as usize
+                || result.coverage.basis.len() > MAX_GRAPH_RESULTS as usize
+            {
+                return Err(ToolError::invalid(
+                    "graph neighborhood result exceeds limit",
+                ));
+            }
             (GraphOutput::Neighborhood(result), Some(guarantee))
         }
         GraphOp::Status => {
@@ -1295,6 +1477,9 @@ fn traverse_deps(
         let deps = graph.deps(current.as_str())?;
         guarantee = weakest_guarantee(guarantee, deps.guarantee);
         for edge in deps.edges {
+            if edges.len() >= MAX_GRAPH_RESULTS as usize {
+                return None;
+            }
             if let EdgeTargetOwned::Path(target) = &edge.to {
                 if graph_path_escapes_view(root, target.as_str(), caller_view) {
                     escaped_view = true;
@@ -1331,7 +1516,7 @@ fn traverse_rdeps(
     if depth == 0 {
         // Reverse-dependency exactness is a root-wide property; an empty
         // answer still must not claim more than the store can prove.
-        let guarantee = graph.rdeps(path)?.guarantee;
+        let guarantee = graph.rdeps_guarantee_for(path)?;
         return Some(TraversedEdges {
             edges: Vec::new(),
             guarantee,
@@ -1352,9 +1537,16 @@ fn traverse_rdeps(
             escaped_view = true;
             continue;
         }
-        let rdeps = graph.rdeps(current.as_str())?;
+        let remaining = MAX_GRAPH_RESULTS as usize - edges.len();
+        let rdeps = graph.rdeps_bounded(current.as_str(), remaining.saturating_add(1))?;
+        if rdeps.edges.len() > remaining {
+            return None;
+        }
         guarantee = weakest_guarantee(guarantee, rdeps.guarantee);
         for edge in rdeps.edges {
+            if edges.len() >= MAX_GRAPH_RESULTS as usize {
+                return None;
+            }
             if graph_path_escapes_view(root, edge.from.as_str(), caller_view) {
                 escaped_view = true;
                 continue;
@@ -1407,16 +1599,26 @@ fn traverse_neighborhood(
                 escaped_view = true;
                 continue;
             }
+            if reached.len() >= MAX_GRAPH_RESULTS as usize {
+                return None;
+            }
             if reached.insert(target.clone()) {
                 queue.push_back((target, distance + 1));
             }
         }
 
-        let rdeps = graph.rdeps(current.as_str())?;
+        let remaining = MAX_GRAPH_RESULTS as usize - reached.len();
+        let rdeps = graph.rdeps_bounded(current.as_str(), remaining.saturating_add(1))?;
+        if rdeps.edges.len() > remaining {
+            return None;
+        }
         for edge in rdeps.edges {
             if graph_path_escapes_view(root, edge.from.as_str(), caller_view) {
                 escaped_view = true;
                 continue;
+            }
+            if reached.len() >= MAX_GRAPH_RESULTS as usize {
+                return None;
             }
             if reached.insert(edge.from.clone()) {
                 queue.push_back((edge.from, distance + 1));
@@ -1434,17 +1636,26 @@ fn traverse_neighborhood(
         if depth == 0 {
             continue;
         }
-        edges.extend(deps.edges.into_iter().filter_map(|edge| {
-            let EdgeTargetOwned::Path(target) = &edge.to else {
-                return None;
-            };
-            reached
-                .contains(target.as_str())
-                .then_some((edge, deps.guarantee))
-        }));
+        if edges.len() >= MAX_GRAPH_RESULTS as usize {
+            return None;
+        }
+        let remaining = MAX_GRAPH_RESULTS as usize - edges.len();
+        edges.extend(
+            deps.edges
+                .into_iter()
+                .filter_map(|edge| {
+                    let EdgeTargetOwned::Path(target) = &edge.to else {
+                        return None;
+                    };
+                    reached
+                        .contains(target.as_str())
+                        .then_some((edge, deps.guarantee))
+                })
+                .take(remaining),
+        );
     }
     if depth != 0 {
-        guarantee = weakest_guarantee(guarantee, graph.rdeps(path)?.guarantee);
+        guarantee = weakest_guarantee(guarantee, graph.rdeps_guarantee_for(path)?);
     }
     if escaped_view {
         guarantee = Guarantee::Approximate;
@@ -1729,7 +1940,7 @@ fn sort_rdep_entries(entries: &mut [GraphRdepEntry]) {
 #[allow(clippy::too_many_arguments)]
 fn verify_rdeps_query(
     engine: &Engine,
-    graph_state: &GraphState,
+    graph_state: &Arc<GraphState>,
     root_path: &Path,
     root: &Arc<RootGraph>,
     params: &GraphParams,
@@ -1860,7 +2071,7 @@ fn verify_rdeps_query(
 #[allow(clippy::too_many_arguments)]
 fn run_rdeps_repair(
     engine: &Engine,
-    graph_state: &GraphState,
+    graph_state: &Arc<GraphState>,
     root_path: &Path,
     root: &Arc<RootGraph>,
     params: &GraphParams,
@@ -1869,6 +2080,7 @@ fn run_rdeps_repair(
     cancel: &CancelToken,
 ) -> ToolResult<RdepsRepairOutcome> {
     run_graph_test_hook(root_path, GraphTestPoint::RdepsRepairStarted);
+    let _repair_permit = graph_state.reserve_build()?;
     let RdepsGrepCandidates {
         candidates,
         limit_reached,
@@ -1877,6 +2089,7 @@ fn run_rdeps_repair(
     let mut approximate_entries = Vec::new();
     let mut prepared = Vec::new();
     let mut repaired = 0_usize;
+    let mut repair_bytes = 0usize;
     let mut repair_truncated = limit_reached;
     let mut generation_changed = false;
     let mut view_excluded = false;
@@ -1955,6 +2168,12 @@ fn run_rdeps_repair(
             entry.content_hash(),
             &mut parser_pool,
         );
+        let bytes = analysis_bytes(&analysis);
+        if bytes > MAX_GRAPH_BUILD_BYTES.saturating_sub(repair_bytes) {
+            repair_truncated = true;
+            break;
+        }
+        repair_bytes += bytes;
         if analysis.language.is_none() {
             approximate_entries.push(approximate_rdep_entry(root_path, root, &candidate));
             continue;
@@ -2040,20 +2259,15 @@ fn rdeps_grep_candidates(
         candidates: grep
             .files
             .into_iter()
-            .map(|hit| {
-                let line = hit
-                    .lines
-                    .iter()
-                    .find(|line| line.is_match)
-                    .expect("content-mode grep hits contain a matching line")
-                    .line_number;
-                RdepsGrepCandidate {
+            .filter_map(|hit| {
+                let line = hit.lines.iter().find(|line| line.is_match)?.line_number;
+                Some(RdepsGrepCandidate {
                     path: PathBuf::from(hit.path),
                     line,
-                }
+                })
             })
             .collect(),
-        limit_reached: grep.limit_reached,
+        limit_reached: grep.limit_reached || grep.incomplete,
     })
 }
 
@@ -2312,6 +2526,7 @@ fn definitions_result(
                 .as_ref()
                 .is_none_or(|allowed| allowed.contains(found.path))
         })
+        .take(limit.saturating_add(1))
         .filter_map(|found| {
             let hash = state.index.file_hash(found.path)?;
             Some(graph_symbol(root, found.path, hash, found.symbol))
@@ -2925,7 +3140,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
 
     fn engine() -> Engine {
@@ -3493,51 +3708,25 @@ mod tests {
     }
 
     #[test]
-    fn busy_root_overshoot_converges_on_the_next_query() {
-        let parent = tempfile::tempdir().unwrap();
-        let engine = engine();
-        let release = Arc::new(Barrier::new(MAX_GRAPH_ROOTS + 2));
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let mut handles = Vec::new();
-        let mut roots = Vec::new();
+    fn graph_build_reservations_are_bounded_and_released() {
+        let state = Arc::new(GraphState::default());
+        let first = state.reserve_build().unwrap();
+        let second = state.reserve_build().unwrap();
+        let error = match state.reserve_build() {
+            Ok(_) => panic!("third graph build reservation must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("capacity"));
 
-        for index in 0..=MAX_GRAPH_ROOTS {
-            let root = parent.path().join(format!("root-{index}"));
-            seed(&root, "src/lib.rs");
-            roots.push(root.clone());
-            let hook: GraphTestHook = {
-                let entered_tx = entered_tx.clone();
-                let release = Arc::clone(&release);
-                Arc::new(move |point| {
-                    if point == GraphTestPoint::ColdBuildStarted {
-                        entered_tx.send(()).unwrap();
-                        release.wait();
-                    }
-                })
-            };
-            graph_test_set_hook(&root, Some(hook));
-            let query = query(&root);
-            let thread_engine = engine.clone();
-            handles.push(std::thread::spawn(move || graph(&thread_engine, &query)));
-            entered_rx.recv().unwrap();
-        }
-
-        assert_eq!(graph_test_root_count(&engine), MAX_GRAPH_ROOTS + 1);
-        release.wait();
-        for handle in handles {
-            assert!(handle.join().unwrap().is_ok());
-        }
-        for root in &roots {
-            graph_test_set_hook(root, None);
-        }
-
-        graph(&engine, &query(roots.last().unwrap())).unwrap();
-        assert_eq!(graph_test_root_count(&engine), MAX_GRAPH_ROOTS);
-        assert_eq!(graph_clear(&engine), MAX_GRAPH_ROOTS as u64);
+        drop(first);
+        let replacement = state.reserve_build().unwrap();
+        drop(second);
+        drop(replacement);
+        assert_eq!(*state.active_builds.lock(), 0);
     }
 
     #[test]
-    fn concurrent_insertions_do_not_evict_each_other() {
+    fn concurrent_insertions_preserve_the_hard_root_cap() {
         let parent = tempfile::tempdir().unwrap();
         let parent = parent.path().canonicalize().unwrap();
         let engine = engine();
@@ -3585,7 +3774,7 @@ mod tests {
 
         assert!(thread_a.join().unwrap().is_ok());
         assert!(thread_b.join().unwrap().is_ok());
-        assert_eq!(graph_test_root_count(&engine), MAX_GRAPH_ROOTS + 1);
+        assert!(graph_test_root_count(&engine) <= MAX_GRAPH_ROOTS);
 
         graph_test_set_hook(&root_a, None);
         graph_test_set_hook(&root_b, None);

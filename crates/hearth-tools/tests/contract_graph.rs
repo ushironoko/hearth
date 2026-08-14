@@ -117,6 +117,40 @@ export function vueEntry() { return dep; }\n\
 }
 
 #[test]
+fn hostile_graph_scalars_and_vectors_are_rejected_before_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+
+    let mut params = GraphParams::new(
+        dir.path().display().to_string(),
+        GraphOp::Deps {
+            path: "src/main.rs".into(),
+            depth: u32::MAX,
+        },
+    );
+    assert_eq!(
+        graph(&eng, &params).unwrap_err().kind,
+        ErrorKind::InvalidInput
+    );
+
+    params.op = GraphOp::Search {
+        query: "x".into(),
+        limit: u64::MAX,
+    };
+    assert_eq!(
+        graph(&eng, &params).unwrap_err().kind,
+        ErrorKind::InvalidInput
+    );
+
+    params.op = GraphOp::Status;
+    params.files = vec!["x.rs".into(); 100_001];
+    assert_eq!(
+        graph(&eng, &params).unwrap_err().kind,
+        ErrorKind::InvalidInput
+    );
+}
+
+#[test]
 fn verification_01_lazy_build_transitions_status_from_unbuilt_to_built() {
     let dir = tempfile::tempdir().unwrap();
     let file = seed(dir.path(), "src/lib.rs", "pub fn lazy_symbol() {}\n");

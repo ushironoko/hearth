@@ -49,7 +49,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 /// How long to keep reading after the command settled but the pipes are still
@@ -171,7 +171,7 @@ fn spawn_shell(program: &str) -> std::io::Result<WarmShell> {
     // One reader thread per pipe, alive for the shell's whole life. They send
     // raw bytes; the per-command logic does the delimiter search. Threads exit
     // on EOF or once the receiver is dropped.
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(8);
     spawn_reader(stdout, Src::Out, tx.clone());
     spawn_reader(stderr, Src::Err, tx.clone());
     spawn_reader(ctrl, Src::Ctrl, tx);
@@ -188,16 +188,35 @@ fn spawn_shell(program: &str) -> std::io::Result<WarmShell> {
 /// and whose write end is not (so it survives into the child for `dup2`).
 fn control_pipe() -> std::io::Result<(RawFd, RawFd)> {
     let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `fds` is a valid two-element array, as pipe(2) requires.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    // SAFETY: `fds` is a valid two-element array. `pipe2` atomically marks both
+    // ends close-on-exec so concurrent process spawns cannot inherit a writer.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if result != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: fds[0] is the pipe read end this function owns.
-    unsafe { libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    for fd in fds {
+        // SAFETY: both descriptors were created above. macOS lacks pipe2, so
+        // this is the narrow best-effort portable fallback.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+    }
     Ok((fds[0], fds[1]))
 }
 
-fn spawn_reader<R: Read + AsRawFd + Send + 'static>(mut reader: R, src: Src, tx: Sender<Raw>) {
+fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
+    mut reader: R,
+    src: Src,
+    tx: mpsc::SyncSender<Raw>,
+) {
     let _ = std::thread::Builder::new()
         .name("hearth-shell-reader".into())
         .spawn(move || {
@@ -291,6 +310,12 @@ struct Control {
 
 impl Control {
     fn push(&mut self, bytes: &[u8]) {
+        const MAX_CONTROL_BUFFER: usize = 4096;
+        if bytes.len() > MAX_CONTROL_BUFFER.saturating_sub(self.buf.len()) {
+            self.buf.clear();
+            self.exit_code = None;
+            return;
+        }
         self.buf.extend_from_slice(bytes);
         while let Some(nl) = memchr::memchr(b'\n', &self.buf) {
             let line: Vec<u8> = self.buf.drain(..=nl).collect();
@@ -300,8 +325,12 @@ impl Control {
                 parts.next(),
                 parts.next().and_then(|v| v.parse::<i32>().ok()),
             ) {
-                (Some("P"), Some(pid)) => self.job_pgid = Some(pid),
-                (Some("X"), Some(code)) => self.exit_code = Some(code),
+                (Some("P"), Some(pid)) if self.job_pgid.is_none() && self.exit_code.is_none() => {
+                    self.job_pgid = Some(pid);
+                }
+                (Some("X"), Some(code)) if self.job_pgid.is_some() && self.exit_code.is_none() => {
+                    self.exit_code = Some(code);
+                }
                 _ => {}
             }
         }
@@ -410,9 +439,13 @@ fn run_once(
     let mut out = Delimited::new(nonce.as_bytes());
     let mut err = Delimited::new(nonce.as_bytes());
     let mut ctrl = Control::default();
-    let deadline = Instant::now() + timeout;
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return Dispatch::NotDispatched;
+    };
     let mut settled_at: Option<Instant> = None;
     let mut killed: Option<Dispatch> = None;
+    let mut kill_deadline: Option<Instant> = None;
+    let mut killed_job: Option<i32> = None;
     let mut broken = false;
 
     loop {
@@ -420,36 +453,55 @@ fn run_once(
         if complete || broken {
             break;
         }
-        // Once the command has settled, only wait out the idle grace for
-        // stragglers rather than the full timeout.
-        if let Some(at) = settled_at
-            && at.elapsed() >= IDLE_GRACE
-        {
+        // Once the command has settled naturally, wait out an idle grace.
+        if killed.is_none() && settled_at.is_some_and(|at| at.elapsed() >= IDLE_GRACE) {
+            break;
+        }
+        // After cancellation/timeout, output can no longer extend the hard
+        // reap grace. A delayed P record is killed as soon as it arrives.
+        if kill_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
         if killed.is_none() {
             if cancel.is_cancelled() {
                 kill_job(&ctrl, shell);
+                killed_job = ctrl.job_pgid;
                 killed = Some(Dispatch::Aborted);
-                settled_at = Some(Instant::now());
+                let now = Instant::now();
+                settled_at = Some(now);
+                kill_deadline = now.checked_add(IDLE_GRACE);
             } else if Instant::now() >= deadline {
                 kill_job(&ctrl, shell);
+                killed_job = ctrl.job_pgid;
                 killed = Some(Dispatch::TimedOut);
-                settled_at = Some(Instant::now());
+                let now = Instant::now();
+                settled_at = Some(now);
+                kill_deadline = now.checked_add(IDLE_GRACE);
             }
         }
 
-        let wait = next_wait(deadline, settled_at, cancel);
+        let wait = next_wait(deadline, settled_at, cancel).min(
+            kill_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::MAX),
+        );
         match shell.rx.recv_timeout(wait) {
             Ok(Raw::Data(src, bytes)) => {
-                if settled_at.is_some() {
-                    settled_at = Some(Instant::now()); // a straggler: re-arm
+                if settled_at.is_some() && killed.is_none() {
+                    settled_at = Some(Instant::now()); // natural straggler: re-arm
                 }
                 match src {
                     Src::Out => out.push(&bytes, &mut |b| on_bytes(BashChannel::Stdout, b)),
                     Src::Err => err.push(&bytes, &mut |b| on_bytes(BashChannel::Stderr, b)),
                     Src::Ctrl => {
                         ctrl.push(&bytes);
+                        if killed.is_some()
+                            && ctrl.job_pgid.is_some()
+                            && ctrl.job_pgid != killed_job
+                        {
+                            kill_job(&ctrl, shell);
+                            killed_job = ctrl.job_pgid;
+                        }
                         if ctrl.exit_code.is_some() && killed.is_none() {
                             // The command finished on its own; anything still
                             // arriving is a detached descendant's output.
@@ -541,7 +593,7 @@ fn build_script(command: &str, cwd: &str, env: &[(String, String)], nonce: &str)
     // Job control is switched back off *inside* the subshell so the command's
     // own background jobs stay in the subshell's process group rather than
     // splitting into groups Hearth has no handle on.
-    script.push_str("( set +m 2>/dev/null; cd ");
+    script.push_str("( set +m 2>/dev/null; exec 3>&-; cd ");
     script.push_str(&sh_quote(cwd));
     script.push_str(" && { ");
     for (k, v) in env {
@@ -612,5 +664,20 @@ mod tests {
         assert_eq!(c.exit_code, None);
         c.push(b"7\n");
         assert_eq!(c.exit_code, Some(7));
+    }
+
+    #[test]
+    fn control_rejects_forged_or_out_of_order_records() {
+        let mut c = Control::default();
+        c.push(b"X 0\nP 123\nP 999\nX 7\nX 0\n");
+        assert_eq!(c.job_pgid, Some(123));
+        assert_eq!(c.exit_code, Some(7));
+    }
+
+    #[test]
+    fn command_subshell_closes_the_private_control_fd() {
+        let script = build_script("printf forged >&3 2>/dev/null || :", "/", &[], "nonce");
+        assert!(script.contains("exec 3>&-"));
+        assert!(script.find("exec 3>&-").unwrap() < script.find("eval ").unwrap());
     }
 }

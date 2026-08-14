@@ -508,6 +508,43 @@ impl ModuleGraph {
         })
     }
 
+    /// Reverse-dependency guarantee without materializing importer edges.
+    #[must_use]
+    pub fn rdeps_guarantee_for(&self, path: &str) -> Option<Guarantee> {
+        self.by_path.get(path)?;
+        Some(self.rdeps_guarantee())
+    }
+
+    /// Returns at most `limit` stored edges that directly target `path`.
+    #[must_use]
+    pub fn rdeps_bounded(&self, path: &str, limit: usize) -> Option<DepsResult> {
+        let target = *self.by_path.get(path)?;
+        let node = self.occupied(target);
+        let mut visited = FxHashSet::default();
+        visited.insert(target);
+        let mut edges = Vec::new();
+        'sources: for &source in &node.rdeps {
+            let source_node = self.occupied(source);
+            visited.insert(source);
+            for edge in source_node
+                .out
+                .iter()
+                .filter(|edge| edge.target == EdgeTarget::Node(target))
+            {
+                if edges.len() >= limit {
+                    break 'sources;
+                }
+                edges.push(self.owned_edge(source, edge));
+            }
+        }
+        sort_edges(&mut edges);
+        Some(DepsResult {
+            edges,
+            guarantee: self.rdeps_guarantee(),
+            coverage: self.coverage(&visited),
+        })
+    }
+
     /// Returns all stored edges that directly target `path`.
     #[must_use]
     pub fn rdeps(&self, path: &str) -> Option<DepsResult> {

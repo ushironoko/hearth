@@ -41,33 +41,56 @@ pub use hearth_proto as proto;
 /// Dispatch a protocol [`Request`] against the engine, returning a [`Response`].
 /// This is the single entry point the daemon and napi layer share.
 pub fn dispatch(engine: &Engine, req: hearth_proto::Request) -> hearth_proto::Response {
+    dispatch_cancellable(engine, req, &CancelToken::none())
+}
+
+/// Dispatch a protocol request with cooperative cancellation for long-running
+/// read/search/graph/Bash work. Mutations poll only at their safe points.
+pub fn dispatch_cancellable(
+    engine: &Engine,
+    req: hearth_proto::Request,
+    cancel: &CancelToken,
+) -> hearth_proto::Response {
     use hearth_proto::{Request, Response};
     match req {
-        Request::Read(p) => match read(engine, &p) {
+        Request::Hello(hello) => {
+            if hello.version == hearth_proto::PROTOCOL_VERSION {
+                Response::Hello(hearth_proto::ProtocolAck {
+                    version: hearth_proto::PROTOCOL_VERSION,
+                })
+            } else {
+                Response::Error(hearth_proto::ToolError::invalid(format!(
+                    "unsupported protocol version {}; expected {}",
+                    hello.version,
+                    hearth_proto::PROTOCOL_VERSION
+                )))
+            }
+        }
+        Request::Read(p) => match read_cancellable(engine, &p, cancel) {
             Ok(r) => Response::Read(r),
             Err(e) => Response::Error(e),
         },
-        Request::Write(p) => match write(engine, &p) {
+        Request::Write(p) => match write_cancellable(engine, &p, cancel) {
             Ok(r) => Response::Write(r),
             Err(e) => Response::Error(e),
         },
-        Request::Edit(p) => match edit(engine, &p) {
+        Request::Edit(p) => match edit_cancellable(engine, &p, cancel) {
             Ok(r) => Response::Edit(r),
             Err(e) => Response::Error(e),
         },
-        Request::EditBatch(p) => match edit_batch(engine, &p) {
+        Request::EditBatch(p) => match edit_batch_cancellable(engine, &p, cancel) {
             Ok(r) => Response::EditBatch(r),
             Err(e) => Response::Error(e),
         },
-        Request::Bash(p) => match bash(engine, &p) {
+        Request::Bash(p) => match bash_cancellable(engine, &p, cancel) {
             Ok(r) => Response::Bash(r),
             Err(e) => Response::Error(e),
         },
-        Request::Grep(p) => match grep(engine, &p) {
+        Request::Grep(p) => match grep_cancellable(engine, &p, cancel) {
             Ok(r) => Response::Grep(r),
             Err(e) => Response::Error(e),
         },
-        Request::Graph(p) => match graph(engine, &p) {
+        Request::Graph(p) => match graph_cancellable(engine, &p, cancel) {
             Ok(r) => Response::Graph(r),
             Err(e) => Response::Error(e),
         },
@@ -76,11 +99,7 @@ pub fn dispatch(engine: &Engine, req: hearth_proto::Request) -> hearth_proto::Re
             p.recursive,
             p.scope,
         )),
-        Request::ClearCaches => {
-            let result = engine.clear_caches();
-            graph::graph_clear(engine);
-            Response::Invalidate(result)
-        }
+        Request::ClearCaches => Response::Invalidate(engine.clear_caches()),
         Request::Ping => Response::Pong,
         Request::Stats => Response::Stats(engine.profiler_report()),
         Request::Shutdown => Response::ShuttingDown,

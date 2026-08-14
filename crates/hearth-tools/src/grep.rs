@@ -23,7 +23,18 @@ use hearth_proto::{
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+const MAX_PATTERN_BYTES: usize = 1024 * 1024;
+const MAX_GLOBS: usize = 256;
+const MAX_GLOB_BYTES: usize = 16 * 1024;
+const MAX_CONTEXT_LINES: u32 = 10_000;
+const MAX_MATCHES: u64 = 1_000_000;
+const DEFAULT_MAX_MATCHES: u64 = 100_000;
+const MAX_GREP_FILES: usize = 1_000_000;
+const MAX_GREP_SEARCH_HEAP_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MATCHER_CACHE_ENTRIES: usize = 256;
+const MAX_MATCHER_CACHE_KEY_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn grep(engine: &Engine, params: &GrepParams) -> ToolResult<GrepResult> {
     grep_cancellable(engine, params, &CancelToken::none())
@@ -39,6 +50,7 @@ pub fn grep_cancellable(
 ) -> ToolResult<GrepResult> {
     profile!("tool.grep", {
         cancel.check()?;
+        validate_params(params)?;
         // Compiled regex + glob sets are cached on the engine, so a repeated
         // pattern is never recompiled.
         let cache = engine.extension::<MatcherCache>();
@@ -49,6 +61,11 @@ pub fn grep_cancellable(
         let meta = std::fs::metadata(&root)
             .map_err(|_| ToolError::not_found(root.display().to_string()))?;
         let root_is_dir = meta.is_dir();
+        if !root_is_dir && !meta.is_file() {
+            return Err(ToolError::invalid(
+                "grep target must be a regular file or directory",
+            ));
+        }
 
         // Resolve the target set as a shared slice + the indices passing the
         // glob filter — no per-file PathBuf clones (the walk's Arc is reused).
@@ -65,6 +82,12 @@ pub fn grep_cancellable(
             };
             engine.watch_root(&root);
             let (entry, hit) = engine.walks().get(&root, key);
+            if !entry.complete {
+                return Err(ToolError::invalid("grep walk exceeded its work budget"));
+            }
+            if entry.files.len() > MAX_GREP_FILES {
+                return Err(ToolError::invalid("grep file set exceeds 1000000 files"));
+            }
             let files = Arc::clone(&entry.files);
             let idx: Vec<usize> = (0..files.len())
                 .filter(|&i| glob_filter.is_match(&files[i]))
@@ -75,10 +98,12 @@ pub fn grep_cancellable(
         // If a healthy watcher covers this root and trust_watch is on, warm
         // hits skip the per-file freshness stat.
         let trust = engine.stat_free(&root);
-        let limiter = params
-            .max_total_count
-            .map(|limit| Limiter::new(indices.len(), limit));
+        let total_limit = params.max_total_count.unwrap_or(DEFAULT_MAX_MATCHES);
+        let limiter = Some(Limiter::new(indices.len(), total_limit));
         let searched = AtomicU64::new(0);
+        let result_bytes = AtomicUsize::new(0);
+        let result_exhausted = AtomicBool::new(false);
+        let incomplete = AtomicBool::new(false);
         let threads = engine.config().walk_threads.min(indices.len().max(1));
         let (tx, rx) = crossbeam_channel::unbounded::<(usize, usize)>();
         for (slot, &i) in indices.iter().enumerate() {
@@ -96,13 +121,16 @@ pub fn grep_cancellable(
                     let all_files = Arc::clone(&all_files);
                     let limiter = limiter.as_ref();
                     let searched = &searched;
+                    let result_bytes = &result_bytes;
+                    let result_exhausted = &result_exhausted;
+                    let incomplete = &incomplete;
                     let params = &params;
                     let engine_ref = engine;
                     scope.spawn(move || {
                         let mut searcher = build_searcher(params);
                         let mut local: Vec<FileMatches> = Vec::new();
                         while let Ok((slot, i)) = rx.recv() {
-                            if cancel.is_cancelled() {
+                            if cancel.is_cancelled() || result_exhausted.load(Ordering::Acquire) {
                                 break;
                             }
                             // Stop once every file that could sort *before* an
@@ -111,7 +139,7 @@ pub fn grep_cancellable(
                                 break;
                             }
                             searched.fetch_add(1, Ordering::Relaxed);
-                            let found = search_one(
+                            let (found, complete) = search_one(
                                 &mut searcher,
                                 &matcher,
                                 engine_ref,
@@ -120,9 +148,27 @@ pub fn grep_cancellable(
                                 trust,
                                 cancel,
                             );
+                            if !complete {
+                                incomplete.store(true, Ordering::Release);
+                            }
                             let count = found.as_ref().map(|f| f.match_count).unwrap_or(0);
                             if let Some(fm) = found {
-                                local.push(fm);
+                                let bytes = file_matches_bytes(&fm);
+                                let reserved = result_bytes.fetch_update(
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                    |current| {
+                                        current.checked_add(bytes).filter(|&next| {
+                                            next <= engine_ref.config().max_grep_output_bytes
+                                        })
+                                    },
+                                );
+                                if reserved.is_ok() {
+                                    local.push(fm);
+                                } else {
+                                    result_exhausted.store(true, Ordering::Release);
+                                    break;
+                                }
                             }
                             if let Some(l) = limiter {
                                 l.complete(slot, count);
@@ -146,10 +192,10 @@ pub fn grep_cancellable(
         cancel.check()?;
 
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        let limit_reached = match params.max_total_count {
-            Some(limit) => apply_total_limit(&mut files, limit, params.after_context as u64),
-            None => false,
-        };
+        let limit_reached = apply_total_limit(&mut files, total_limit, params.after_context as u64);
+        if result_exhausted.load(Ordering::Acquire) {
+            return Err(ToolError::invalid("grep result exceeds global byte limit"));
+        }
         let total_matches: u64 = files.iter().map(|f| f.match_count).sum();
         let files_searched = searched.load(Ordering::Relaxed);
 
@@ -162,10 +208,43 @@ pub fn grep_cancellable(
             files_searched,
             walk_cache_hit: walk_hit,
             limit_reached,
+            incomplete: incomplete.load(Ordering::Acquire),
             root: root.display().to_string(),
             root_is_dir,
         })
     })
+}
+
+fn file_matches_bytes(file: &FileMatches) -> usize {
+    file.path.len().saturating_add(
+        file.lines
+            .iter()
+            .map(|line| line.text.len().saturating_add(size_of::<GrepLine>()))
+            .sum::<usize>(),
+    )
+}
+
+fn validate_params(params: &GrepParams) -> ToolResult<()> {
+    if params.pattern.len() > MAX_PATTERN_BYTES {
+        return Err(ToolError::invalid("grep pattern exceeds 1 MiB"));
+    }
+    if params.globs.len() > MAX_GLOBS {
+        return Err(ToolError::invalid("grep accepts at most 256 globs"));
+    }
+    if params.globs.iter().any(|glob| glob.len() > MAX_GLOB_BYTES) {
+        return Err(ToolError::invalid("grep glob exceeds 16 KiB"));
+    }
+    if params.before_context > MAX_CONTEXT_LINES || params.after_context > MAX_CONTEXT_LINES {
+        return Err(ToolError::invalid("grep context exceeds 10000 lines"));
+    }
+    if params.max_count.is_some_and(|limit| limit > MAX_MATCHES)
+        || params
+            .max_total_count
+            .is_some_and(|limit| limit > MAX_MATCHES)
+    {
+        return Err(ToolError::invalid("grep match limit exceeds 1000000"));
+    }
+    Ok(())
 }
 
 /// Keep only the first `limit` matches in path order, reporting whether the cap
@@ -281,6 +360,7 @@ impl Limiter {
 pub struct MatcherCache {
     regex: DashMap<RegexKey, Arc<RegexMatcher>>,
     globs: DashMap<Vec<String>, Arc<GlobFilter>>,
+    mutation: Mutex<()>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -305,6 +385,16 @@ impl MatcherCache {
             return Ok(Arc::clone(m.value()));
         }
         let m = Arc::new(build_matcher(params)?);
+        let _mutation = self.mutation.lock();
+        if let Some(existing) = self.regex.get(&key) {
+            return Ok(Arc::clone(existing.value()));
+        }
+        if self.regex.len() >= MAX_MATCHER_CACHE_ENTRIES
+            || regex_key_bytes(&self.regex).saturating_add(key.pattern.len())
+                > MAX_MATCHER_CACHE_KEY_BYTES
+        {
+            self.regex.clear();
+        }
         self.regex.insert(key, Arc::clone(&m));
         Ok(m)
     }
@@ -314,9 +404,30 @@ impl MatcherCache {
             return Ok(Arc::clone(g.value()));
         }
         let g = Arc::new(GlobFilter::new(globs)?);
+        let _mutation = self.mutation.lock();
+        if let Some(existing) = self.globs.get(globs) {
+            return Ok(Arc::clone(existing.value()));
+        }
+        let key_bytes = globs.iter().map(String::len).sum::<usize>();
+        if self.globs.len() >= MAX_MATCHER_CACHE_ENTRIES
+            || glob_key_bytes(&self.globs).saturating_add(key_bytes) > MAX_MATCHER_CACHE_KEY_BYTES
+        {
+            self.globs.clear();
+        }
         self.globs.insert(globs.to_vec(), Arc::clone(&g));
         Ok(g)
     }
+}
+
+fn regex_key_bytes(cache: &DashMap<RegexKey, Arc<RegexMatcher>>) -> usize {
+    cache.iter().map(|entry| entry.key().pattern.len()).sum()
+}
+
+fn glob_key_bytes(cache: &DashMap<Vec<String>, Arc<GlobFilter>>) -> usize {
+    cache
+        .iter()
+        .map(|entry| entry.key().iter().map(String::len).sum::<usize>())
+        .sum()
 }
 
 fn build_matcher(params: &GrepParams) -> ToolResult<RegexMatcher> {
@@ -342,13 +453,14 @@ fn build_searcher(params: &GrepParams) -> Searcher {
         .before_context(params.before_context as usize)
         .after_context(params.after_context as usize)
         .binary_detection(BinaryDetection::quit(0))
+        .heap_limit(Some(MAX_GREP_SEARCH_HEAP_BYTES))
         .build()
 }
 
-/// Files at or below this size are searched from (and pulled into) the shared
-/// cache; larger files are streamed via `search_path` so one search over a huge
-/// tree never floods the warm cache.
-const MAX_GREP_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+/// Hard per-file search bound. Every accepted file is read through the cache's
+/// nonblocking, same-FD bounded path and searched from an in-memory slice; no
+/// pathname is reopened after validation.
+const MAX_GREP_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 fn search_one(
@@ -359,7 +471,7 @@ fn search_one(
     params: &GrepParams,
     trust: bool,
     cancel: &CancelToken,
-) -> Option<FileMatches> {
+) -> (Option<FileMatches>, bool) {
     let mut sink = CollectSink {
         mode: params.mode,
         max_count: params.max_count,
@@ -367,29 +479,40 @@ fn search_one(
         blob: Vec::new(),
         spans: Vec::new(),
         found: false,
+        max_output_bytes: engine.config().max_grep_output_bytes,
+        output_full: false,
         cancel,
     };
-    // Fast path: search the cached bytes directly (no open()/read() syscalls on
-    // a warm file, and no freshness stat when `trust` is set). Oversize or
-    // uncacheable files fall back to grep-searcher's own IO. Unreadable/binary
-    // files are silently skipped, matching rg.
+    // Search only bytes returned by the cache's bounded same-FD loader. This
+    // avoids a validation/reopen race against FIFOs or device nodes. Oversize,
+    // unreadable, and binary files are skipped.
     let searched_ok = match engine
         .files()
         .get_bounded_trusting(path, MAX_GREP_CACHE_BYTES, trust)
     {
-        Ok(Some((entry, _hit))) => searcher
-            .search_slice(matcher, entry.bytes(), &mut sink)
-            .is_ok(),
-        _ => searcher.search_path(matcher, path, &mut sink).is_ok(),
+        Ok(Some((entry, _hit))) => {
+            if entry.is_binary() {
+                false
+            } else {
+                searcher
+                    .search_slice(matcher, entry.bytes(), &mut sink)
+                    .is_ok()
+                    && !sink.output_full
+            }
+        }
+        Ok(None) | Err(_) => false,
     };
     if !searched_ok || !sink.found {
-        return None;
+        return (None, searched_ok);
     }
-    Some(FileMatches {
-        path: path.display().to_string(),
-        match_count: sink.match_count,
-        lines: sink.materialize(),
-    })
+    (
+        Some(FileMatches {
+            path: path.display().to_string(),
+            match_count: sink.match_count,
+            lines: sink.materialize(),
+        }),
+        true,
+    )
 }
 
 /// A span into [`CollectSink::blob`] describing one collected line.
@@ -412,19 +535,40 @@ struct CollectSink<'a> {
     blob: Vec<u8>,
     spans: Vec<LineSpan>,
     found: bool,
+    max_output_bytes: usize,
+    output_full: bool,
     cancel: &'a CancelToken,
 }
 
 impl CollectSink<'_> {
     #[inline]
     fn push_line(&mut self, line_number: u64, bytes: &[u8], is_match: bool) {
+        if self.output_full {
+            return;
+        }
         let text = trim_eol(bytes);
-        let start = self.blob.len() as u32;
+        let retained = self
+            .blob
+            .len()
+            .saturating_add(self.spans.len().saturating_mul(size_of::<LineSpan>()));
+        let remaining = self.max_output_bytes.saturating_sub(retained);
+        if text.len().saturating_add(size_of::<LineSpan>()) > remaining {
+            self.output_full = true;
+            return;
+        }
+        let Ok(start) = u32::try_from(self.blob.len()) else {
+            self.output_full = true;
+            return;
+        };
+        let Ok(len) = u32::try_from(text.len()) else {
+            self.output_full = true;
+            return;
+        };
         self.blob.extend_from_slice(text);
         self.spans.push(LineSpan {
             line_number,
             start,
-            len: text.len() as u32,
+            len,
             is_match,
         });
     }
@@ -459,11 +603,14 @@ impl Sink for CollectSink<'_> {
             self.match_count = 1;
             return Ok(false);
         }
-        self.match_count += 1;
         if self.mode == GrepMode::Content {
             let line_number = mat.line_number().unwrap_or(0);
             self.push_line(line_number, mat.bytes(), true);
+            if self.output_full {
+                return Ok(false);
+            }
         }
+        self.match_count += 1;
         if let Some(mc) = self.max_count
             && self.match_count >= mc
         {
@@ -476,6 +623,9 @@ impl Sink for CollectSink<'_> {
         if self.mode == GrepMode::Content {
             let line_number = ctx.line_number().unwrap_or(0);
             self.push_line(line_number, ctx.bytes(), false);
+            if self.output_full {
+                return Ok(false);
+            }
         }
         Ok(true)
     }

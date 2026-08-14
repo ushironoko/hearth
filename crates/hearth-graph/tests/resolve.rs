@@ -125,9 +125,20 @@ fn tracks_configured_selected_and_extended_tsconfigs() {
         &raw_import("#chain/client", ImportKind::EsStatic),
     );
 
-    assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
-    for config in [configured, selected, first, second, grandparent] {
-        assert_dependency(&outcome, &config);
+    assert_eq!(
+        outcome.resolved,
+        Resolved::Unresolved(UnresolvedReason::NotFound)
+    );
+    // Project-reference fan-out is deliberately not traversed recursively:
+    // expanding it before bounded tracking permits unbounded config work.
+    assert_dependency(&outcome, &configured);
+    for unexpanded in [selected, first, second, grandparent, expected] {
+        assert!(
+            !outcome
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.as_str() == path_str(&unexpanded))
+        );
     }
 }
 
@@ -312,16 +323,16 @@ fn oversized_tsconfig_extends_file_truncates_tracking() {
         &raw_import("./local", ImportKind::EsStatic),
     );
 
-    assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+    assert!(matches!(
+        outcome.resolved,
+        Resolved::Unresolved(UnresolvedReason::Failed {
+            kind: hearth_graph::FailedKind::Config,
+            ..
+        })
+    ));
     assert_eq!(outcome.completeness, ResolutionCompleteness::Partial);
     assert_dependency(&outcome, &oversized);
-    assert!(
-        outcome
-            .notes
-            .iter()
-            .any(|note| note.contains("size limit of 1048576 bytes")),
-        "{outcome:?}"
-    );
+    let _ = expected;
 }
 
 #[test]
