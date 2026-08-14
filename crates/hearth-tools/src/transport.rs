@@ -614,10 +614,17 @@ fn recvmsg_with_cloexec(
     }
 }
 
+fn ancillary_len_to_usize<T>(value: T) -> Option<usize>
+where
+    usize: TryFrom<T>,
+{
+    usize::try_from(value).ok()
+}
+
 fn parse_ancillary(control: &[u8], header: &libc::msghdr) -> AncillaryBatch {
     let mut batch = AncillaryBatch::default();
 
-    let Ok(reported_len) = usize::try_from(header.msg_controllen) else {
+    let Some(reported_len) = ancillary_len_to_usize(header.msg_controllen) else {
         batch.malformed = true;
         return batch;
     };
@@ -657,7 +664,7 @@ fn parse_ancillary(control: &[u8], header: &libc::msghdr) -> AncillaryBatch {
         let cmsg = unsafe {
             std::ptr::read_unaligned(control.as_ptr().add(offset).cast::<libc::cmsghdr>())
         };
-        let Ok(cmsg_len) = usize::try_from(cmsg.cmsg_len) else {
+        let Some(cmsg_len) = ancillary_len_to_usize(cmsg.cmsg_len) else {
             batch.malformed = true;
             break;
         };
