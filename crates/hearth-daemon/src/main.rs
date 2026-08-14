@@ -854,6 +854,40 @@ mod tests {
     }
 
     #[test]
+    fn protocol_version_mismatch_is_rejected_before_operations() {
+        let engine = Engine::new(EngineConfig {
+            enable_optimizer: false,
+            enable_watch: false,
+            ..EngineConfig::default()
+        });
+        let lifecycle = Arc::new(Lifecycle::new());
+        let worker_lifecycle = Arc::clone(&lifecycle);
+        let (server, client) = UnixStream::pair().unwrap();
+        let frames = FrameBudget::new(DEFAULT_MAX_IN_FLIGHT_FRAME_BYTES).unwrap();
+        let worker =
+            std::thread::spawn(move || handle_conn(server, engine, worker_lifecycle, frames));
+
+        hearth_tools::transport::send_request_with_fd(
+            &client,
+            &Request::Hello(hearth_proto::ProtocolHello {
+                version: hearth_proto::PROTOCOL_VERSION + 1,
+            }),
+            None,
+        )
+        .unwrap();
+        let mut reader = &client;
+        let response = hearth_tools::transport::read_msg::<_, Response>(&mut reader).unwrap();
+        worker.join().unwrap();
+
+        let Response::Error(error) = response else {
+            panic!("version mismatch must return a structured error");
+        };
+        assert_eq!(error.kind, hearth_proto::ErrorKind::InvalidInput);
+        assert!(error.message.contains("unsupported protocol version"));
+        assert_eq!(lifecycle.state(), LifecycleState::Accepting);
+    }
+
+    #[test]
     fn aggregate_frame_budget_is_bounded_and_released() {
         assert!(FrameBudget::new(MIN_FRAME_RESERVATION_BYTES - 1).is_err());
         let budget = FrameBudget::new(MIN_FRAME_RESERVATION_BYTES * 2).unwrap();

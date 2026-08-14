@@ -1,10 +1,11 @@
 //! `hearth` — the thin CLI client.
 //!
 //! By default it connects to a running `hearthd` (the warm, resident engine).
-//! If no authenticated daemon is reachable *before delivery begins*, it falls
-//! back to an in-process engine (a cold run). Once sending may have begun it
-//! reports an indeterminate result and never replays the operation. The
-//! `--no-daemon` flag forces the inline path.
+//! If no authenticated daemon is reachable before operation delivery begins,
+//! it falls back to an in-process engine (a cold run). A protocol handshake
+//! carries no operation and can also fall back safely. Once operation sending
+//! may have begun, the CLI reports an indeterminate result and never replays it.
+//! The `--no-daemon` flag forces the inline path.
 
 use clap::{Args, Parser, Subcommand};
 use hearth_core::{Engine, EngineConfig};
@@ -14,6 +15,7 @@ use hearth_tools::transport::{connect_verified, read_msg, send_request_with_fd};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 const DEFAULT_GRAPH_LIMIT: u64 = 200;
@@ -381,37 +383,30 @@ fn run(global: &Global, req: Request) -> Response {
         return dispatch_inline(req);
     }
 
-    // Connecting and authenticating the server happen before delivery. Only a
-    // failure here is safe to fall back from: no request byte reached a daemon.
+    // Connecting and authenticating the server happen before operation
+    // delivery, so failure here is safe to fall back from.
     let stream = match connect_verified(&socket_path(global)) {
         Ok(stream) => stream,
         Err(_) => return dispatch_inline(req),
     };
+    dispatch_connected(global, stream, req)
+}
 
-    // Negotiate before any operation or FD transfer. A mismatch is therefore
-    // a safe pre-dispatch failure, never an ambiguous mutation outcome.
+fn dispatch_connected(global: &Global, stream: UnixStream, req: Request) -> Response {
+    // Negotiate before any operation or FD transfer. Hello contains no
+    // operation, so every handshake failure is determinate: `req` did not run
+    // and can safely take the cold inline path. This also makes a new CLI work
+    // against a pre-handshake daemon without requiring an immediate restart.
     let hello = Request::Hello(ProtocolHello {
         version: PROTOCOL_VERSION,
     });
-    if let Err(error) = send_request_with_fd(&stream, &hello, None) {
-        return Response::Error(ToolError::indeterminate(format!(
-            "protocol handshake delivery may have begun: {error}"
-        )));
+    if send_request_with_fd(&stream, &hello, None).is_err() {
+        return dispatch_inline(req);
     }
     let mut reader = &stream;
     match read_msg::<_, Response>(&mut reader) {
         Ok(Response::Hello(ProtocolAck { version })) if version == PROTOCOL_VERSION => {}
-        Ok(Response::Error(error)) => return Response::Error(error),
-        Ok(_) => {
-            return Response::Error(ToolError::invalid(
-                "daemon returned an incompatible protocol handshake",
-            ));
-        }
-        Err(error) => {
-            return Response::Error(ToolError::indeterminate(format!(
-                "protocol handshake response was lost or invalid: {error}"
-            )));
-        }
+        Ok(_) | Err(_) => return dispatch_inline(req),
     }
 
     // A read destined for stdout can be streamed: pass our stdout fd so the
@@ -732,6 +727,51 @@ fn render_graph_status(out: &mut String, status: &GraphStatusResult) {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    fn test_global() -> Global {
+        Global {
+            socket: None,
+            no_daemon: false,
+            json: true,
+        }
+    }
+
+    #[test]
+    fn handshake_eof_falls_back_before_operation_delivery() {
+        let (client, mut legacy_daemon) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let hello: Request = read_msg(&mut legacy_daemon).unwrap();
+            assert!(matches!(hello, Request::Hello(_)));
+            // A pre-v2 daemon rejects the unknown Hello request and closes the
+            // connection without ever receiving the actual operation.
+        });
+
+        let response = dispatch_connected(&test_global(), client, Request::Ping);
+        worker.join().unwrap();
+        assert!(matches!(response, Response::Pong));
+    }
+
+    #[test]
+    fn version_mismatch_falls_back_without_sending_the_operation() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let hello: Request = read_msg(&mut daemon).unwrap();
+            assert!(matches!(hello, Request::Hello(_)));
+            hearth_tools::transport::write_msg(
+                &mut daemon,
+                &Response::Hello(ProtocolAck {
+                    version: PROTOCOL_VERSION + 1,
+                }),
+            )
+            .unwrap();
+            let error = read_msg::<_, Request>(&mut daemon).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        });
+
+        let response = dispatch_connected(&test_global(), client, Request::Ping);
+        assert!(matches!(response, Response::Pong));
+        worker.join().unwrap();
+    }
 
     fn graph_node(path: &str, node_id: &str) -> GraphNode {
         GraphNode {
