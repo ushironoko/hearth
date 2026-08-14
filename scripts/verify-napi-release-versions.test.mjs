@@ -213,3 +213,16 @@ test("rejects non-exact root versions", async (t) => {
     /root package version is not an exact SemVer/,
   );
 });
+
+test("runs installed-package suites only after GITHUB_ENV becomes visible", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/release.yml", import.meta.url),
+    "utf8",
+  );
+  const install = workflow.indexOf("run: bash scripts/verify-tarball.sh");
+  const suiteStep = workflow.indexOf("- name: Verify the installed tarball on Node and Bun");
+  const installedSmoke = workflow.indexOf("node crates/hearth-napi/smoke.mjs", suiteStep);
+  assert.ok(install >= 0, "release workflow must install the packed package");
+  assert.ok(suiteStep > install, "installed suites must run in a later GitHub Actions step");
+  assert.ok(installedSmoke > suiteStep, "the later step must exercise the installed entry point");
+});

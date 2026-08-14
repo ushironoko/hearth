@@ -241,12 +241,18 @@ jobs:
 
       # Exercise the topology consumers receive: a root package with no addon
       # of its own loading the separately packed Linux x64 optional package.
-      - name: Verify the packed tarball on Node and Bun
+      - name: Pack and install the optional-package layout
         env:
           HEARTH_PLATFORM_PACKAGE_DIR: crates/hearth-napi/npm/linux-x64-gnu
           NAPI_RS_ENFORCE_VERSION_CHECK: 1
+        run: bash scripts/verify-tarball.sh
+
+      # verify-tarball exports HEARTH_ENTRY through GITHUB_ENV, which becomes
+      # visible only to steps after the installer exits.
+      - name: Verify the installed tarball on Node and Bun
+        env:
+          NAPI_RS_ENFORCE_VERSION_CHECK: 1
         run: |
-          bash scripts/verify-tarball.sh
           node crates/hearth-napi/smoke.mjs
           node crates/hearth-napi/__test__/contract.mjs
           bun crates/hearth-napi/smoke.mjs
