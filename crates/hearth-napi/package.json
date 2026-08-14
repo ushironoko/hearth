@@ -21,7 +21,7 @@
   },
   "main": "index.js",
   "types": "index.d.ts",
-  "type": "commonjs",
+  "type": "module",
   "files": [
     "index.js",
     "index.d.ts",
@@ -45,8 +45,8 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform",
+    "build": "napi build --platform --release --esm",
+    "build:debug": "napi build --platform --esm",
     "artifacts": "napi artifacts",
     "create-npm-dirs": "napi create-npm-dirs",
     "test": "node __test__/contract.mjs",

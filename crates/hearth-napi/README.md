@@ -5,7 +5,8 @@ resident engine serving `read`, `write`, `edit`, `bash`, and `grep` from shared
 warm caches and a warm shell pool.
 
 Prebuilt binaries ship for macOS (arm64, x64) and Linux (x64, arm64 glibc); no
-Rust toolchain is needed to install.
+Rust toolchain is needed to install. The package is ESM-only and exposes named
+exports for Node.js 18+ and Bun; CommonJS `require()` is not supported.
 
 ```bash
 npm install @hearthdev/napi

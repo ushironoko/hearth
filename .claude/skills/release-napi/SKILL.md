@@ -91,10 +91,10 @@ Then prove the published bytes actually install and load, outside the workspace:
 
 ```bash
 d=$(mktemp -d) && cd "$d"
-printf '{"name":"c","private":true,"version":"0.0.0","type":"commonjs"}\n' > package.json
+printf '{"name":"c","private":true,"version":"0.0.0","type":"module"}\n' > package.json
 npm install --no-audit --no-fund @hearthdev/napi
 npm audit signatures                        # expect "verified attestations"
-node -e 'const {HearthEngine}=require("@hearthdev/napi"); new HearthEngine({cwd:process.cwd()}); console.log("loads")'
+node --input-type=module -e 'import { HearthEngine } from "@hearthdev/napi"; new HearthEngine({cwd:process.cwd()}); console.log("loads")'
 ```
 
 `npm audit signatures` reporting verified attestations is the proof that

@@ -144,7 +144,7 @@ jobs:
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
-        run: pnpm exec napi build --platform --release --target "$TARGET"
+        run: pnpm exec napi build --platform --release --esm --target "$TARGET"
         working-directory: crates/hearth-napi
 
       - name: Smoke the fresh binary
