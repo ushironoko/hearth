@@ -474,8 +474,9 @@ where
 
 /// Client → daemon: send a request, optionally attaching a file descriptor
 /// (e.g. the client's stdout) via `SCM_RIGHTS` so the daemon can write results
-/// straight to it. Rights are attached until the first send makes byte
-/// progress, then omitted from all remaining short-send retries.
+/// straight to it. An FD-bearing send uses the frame's first byte as an isolated
+/// control slot. Rights are attached until that byte makes progress, then
+/// omitted from the rest of the frame and all remaining short-send retries.
 pub fn send_request_with_fd(
     stream: &UnixStream,
     req: &Request,
@@ -485,7 +486,12 @@ pub fn send_request_with_fd(
 
     match fd {
         Some(fd) => send_frame_with(&frame, true, |remaining, attach_rights| {
-            let iov = [IoSlice::new(remaining)];
+            let outgoing = if attach_rights {
+                &remaining[..1]
+            } else {
+                remaining
+            };
+            let iov = [IoSlice::new(outgoing)];
             if attach_rights {
                 let fds = [fd];
                 let cmsgs = [ControlMessage::ScmRights(&fds)];
@@ -896,8 +902,8 @@ impl<'a> RequestReceiver<'a> {
         // Do not combine the first byte with any later stream data. Linux may
         // report SCM_RIGHTS together with bytes queued before the sendmsg that
         // carried it, so a larger first read cannot identify its true offset.
-        self.ensure_available(1)?;
-        self.ensure_available(4)?;
+        self.ensure_available(1, true)?;
+        self.ensure_available(4, false)?;
         let prefix = &self.bytes[self.start..self.start + 4];
         let len = validate_frame_len_with_limit(
             u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize,
@@ -912,7 +918,7 @@ impl<'a> RequestReceiver<'a> {
                 .try_reserve_exact(frame_len - available)
                 .map_err(|err| io::Error::new(io::ErrorKind::OutOfMemory, err))?;
         }
-        self.ensure_available(frame_len)?;
+        self.ensure_available(frame_len, false)?;
 
         let frame_start = self
             .base_offset
@@ -982,7 +988,7 @@ impl<'a> RequestReceiver<'a> {
         Ok((request, received))
     }
 
-    fn ensure_available(&mut self, needed: usize) -> io::Result<()> {
+    fn ensure_available(&mut self, needed: usize, ancillary_allowed: bool) -> io::Result<()> {
         while self.bytes.len() - self.start < needed {
             if self
                 .request_deadline
@@ -1018,6 +1024,18 @@ impl<'a> RequestReceiver<'a> {
             }
             self.bytes.extend_from_slice(&chunk[..received]);
             if batch.present {
+                if !ancillary_allowed {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ancillary data arrived after the frame's first byte",
+                    ));
+                }
+                if batch.unexpected || batch.malformed || batch.rights.len() != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid ancillary data at the frame's first byte",
+                    ));
+                }
                 self.ancillary.push_back(AnchoredAncillary {
                     offset: anchor,
                     batch,
@@ -1161,7 +1179,7 @@ mod tests {
         drop(write);
 
         let mut requests = RequestReceiver::new(&receiver);
-        requests.ensure_available(1).unwrap();
+        requests.ensure_available(1, true).unwrap();
         drop(requests);
         assert_pipe_eof(&read);
     }
@@ -1188,6 +1206,39 @@ mod tests {
         let (read, write) = pipe();
         sender.write_all(&frame[..2]).unwrap();
         send_raw(&sender, &frame[2..], &[write.as_raw_fd()]);
+        drop(write);
+
+        let err = RequestReceiver::new(&receiver).recv_request().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_pipe_eof(&read);
+    }
+
+    #[test]
+    fn mid_frame_rights_are_rejected_before_waiting_for_the_body() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let prefix = 1024u32.to_le_bytes();
+        let (read, write) = pipe();
+        sender.write_all(&prefix[..1]).unwrap();
+        send_raw(&sender, &prefix[1..], &[write.as_raw_fd()]);
+        drop(write);
+
+        // No body is sent. A receiver that queues the illegal FD until frame
+        // completion would time out instead of rejecting it immediately.
+        let err = RequestReceiver::new(&receiver).recv_request().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_pipe_eof(&read);
+    }
+
+    #[test]
+    fn rights_at_the_start_of_a_body_are_rejected_and_closed() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let frame = encode_frame(&read_request()).unwrap();
+        let (read, write) = pipe();
+        sender.write_all(&frame[..4]).unwrap();
+        send_raw(&sender, &frame[4..], &[write.as_raw_fd()]);
         drop(write);
 
         let err = RequestReceiver::new(&receiver).recv_request().unwrap_err();
@@ -1291,6 +1342,17 @@ mod tests {
         let flags = unsafe { libc::fcntl(received.as_raw_fd(), libc::F_GETFD) };
         assert!(flags >= 0);
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn public_fd_sender_uses_the_frame_control_slot() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let (_read, write) = pipe();
+        send_request_with_fd(&sender, &read_request(), Some(write.as_raw_fd())).unwrap();
+
+        let (request, received) = RequestReceiver::new(&receiver).recv_request().unwrap();
+        assert!(matches!(request, Request::Read(_)));
+        assert!(received.is_some());
     }
 
     #[test]
