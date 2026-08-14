@@ -35,6 +35,15 @@ JSON
 
 npm install --no-audit --no-fund --install-strategy=nested "./$tarball"
 
+# Exercise package metadata resolution as an ESM consumer, not only the absolute
+# index.js path used by the full suites below.
+node --input-type=module --eval '
+  import { HearthEngine } from "@hearthdev/napi";
+  if (typeof HearthEngine !== "function") {
+    throw new TypeError("@hearthdev/napi has no named HearthEngine ESM export");
+  }
+'
+
 entry="$check_dir/node_modules/@hearthdev/napi/index.js"
 test -f "$entry" || { echo "error: installed package has no index.js" >&2; exit 1; }
 test -f "$check_dir/node_modules/@hearthdev/napi/index.d.ts" ||
