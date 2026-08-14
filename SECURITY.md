@@ -87,6 +87,13 @@ forks, starts a new session, and detaches. Preventing escaped descendants
 requires an external OS sandbox or service manager; do not infer that guarantee
 from Hearth's timeout alone.
 
+Linux and supported BSDs receive passed descriptors atomically with
+`MSG_CMSG_CLOEXEC`. macOS does not provide that flag, so Hearth applies
+`FD_CLOEXEC` with `fcntl` immediately after `recvmsg`. A concurrent fork/exec can
+race that short window and inherit the descriptor. This residual limitation is
+inside the same-UID trust model; use an external sandbox or service manager when
+that inheritance boundary must be strict.
+
 ## Reporting a vulnerability
 
 Please report suspected vulnerabilities privately to the repository owner

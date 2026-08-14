@@ -737,6 +737,15 @@ mod tests {
     }
 
     #[test]
+    fn handshake_send_failure_falls_back_before_operation_delivery() {
+        let (client, _daemon) = UnixStream::pair().unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let response = dispatch_connected(&test_global(), client, Request::Ping);
+        assert!(matches!(response, Response::Pong));
+    }
+
+    #[test]
     fn handshake_eof_falls_back_before_operation_delivery() {
         let (client, mut legacy_daemon) = UnixStream::pair().unwrap();
         let worker = std::thread::spawn(move || {
@@ -759,9 +768,11 @@ mod tests {
             assert!(matches!(hello, Request::Hello(_)));
             hearth_tools::transport::write_msg(
                 &mut daemon,
-                &Response::Hello(ProtocolAck {
-                    version: PROTOCOL_VERSION + 1,
-                }),
+                &Response::Error(ToolError::invalid(format!(
+                    "unsupported protocol version {}; expected {}",
+                    PROTOCOL_VERSION + 1,
+                    PROTOCOL_VERSION
+                ))),
             )
             .unwrap();
             let error = read_msg::<_, Request>(&mut daemon).unwrap_err();

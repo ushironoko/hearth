@@ -493,6 +493,10 @@ atomic stdout.
   shutdown terminate/reap groups Hearth owns. A descendant that deliberately
   double-forks and creates a new session can escape POSIX process-group
   tracking; preventing that requires an external sandbox/service manager.
+* **Atomic received-FD CLOEXEC where the OS supports it** — Linux and supported
+  BSDs use `MSG_CMSG_CLOEXEC`. macOS requires a post-`recvmsg`
+  `fcntl(F_SETFD)`, leaving a short race with concurrent fork/exec. This is a
+  residual same-UID limitation, not a strict descriptor-inheritance boundary.
 * **One engine per process, not shared across processes** — the caches are
   in-process memory; sharing them would mean re-introducing the daemon's IPC cost
   on the path where Hearth is fastest.

@@ -9,18 +9,23 @@
 
 | Commit | 対象 | 検証 |
 |---|---|---|
+| `205c35d`, `7f7858c` | HD-01/HD-09: same-UID authorityとper-UID非workspace境界を明示的な制約として固定し、root起動を拒否 | documentation review; daemon UID test |
+| `7f7858c`, `15bfb15` | HD-02/HD-06/HD-13: private endpoint、双方向peer UID、lifetime lock、dev+ino cleanup、safe stale-path処理 | endpoint/daemon tests; Clippy |
+| `7f7858c`, `fe8ec67`, `38ce7ea` | HD-03/HD-04: connection/control lane、aggregate frame reservation、request/response deadlineとsize cap | daemon accounting/lifecycle tests; transport tests |
+| `7ca234e`, `7600b19`, `447d979`, `6de83b7`, `4a226c2`, `020f0a0` | HD-05: timeout、file/walk/Bash/Grep/Graph input・output・resident hard caps | hostile boundary、accounting、contract tests; Clippy |
+| `26e2ec5`, `0259e51`, `e22450e` | HD-07: operation前handshake、protocol v2、operation送信開始後のnon-replay、handshake失敗時の安全なcold fallback | CLI/daemon protocol tests; workspace tests |
 | `39a4960` | HD-08/HD-10: CSPRNG secure temp、exclusive/no-follow/CLOEXEC、identity-safe cleanup/publish、permission fatal、write/symlink matrix | tools tests; Clippy |
-| `27c667b`, `7ca234e` | HD-06/HD-07: SingleFlight panic recovery、Read overflow、Bash timeout clamp/checked deadline、warm-shell `env_clear` | core/tools tests; Clippy |
-| `38da989`, `7600b19`, `447d979` | HD-13/HD-14: Bash 後 global reset、full ClearCaches、optimizer 非依存 file byte/entry cap、LineIndex reserve、walk cap | concurrency/accounting・contract tests; Clippy |
-| `6de83b7`, `4a226c2`, `020f0a0` | Bash output、Grep matcher/input/content、Graph scalar/vector/depth/result limit | hostile boundary tests; N-API Rust test; Clippy |
-| `7f7858c` | HD-02/03/04/05/09/11/12/15/17: private endpoint、peer UID、lifetime lock/dev+ino cleanup、stateful framing、FD CLOEXEC/validation、short I/O、connection cap、at-most-once CLI、root拒否、bounded drain | transport 16 tests; daemon 13 tests; CLI/workspace tests; Clippy |
-| `205c35d`, `8eacce8` | LLM threat model、same-UID authority、adapter責務、pinned RustSec CI | documentation review; workflow lint対象 |
+| `75d4688`, `9b3e930`, `0738db5` | HD-11/HD-12: shutdown/disconnect cancellation、absolute deadline、bounded drain、process-group kill/reap | daemon・lifecycle・Bash tests |
+| `7f7858c`, `0ee1ab8`, `3b6f17b`, `1d01ed9` | HD-14: stateful framing、short I/O、FD ownership/CLOEXEC/validation、portable first-byte control slot、misplaced rights即時拒否 | Linux/macOS transport tests; Clippy |
+| `38da989` | HD-15: dispatched Bash後のglobal filesystem-state resetとfull ClearCaches | cache/Bash contract tests |
+| `27c667b`, `7ca234e`, `fcdcfab` | HD-16: SingleFlight panic recovery、Read arithmetic、bounded MessagePack structure decode | panic/concurrency/boundary tests; Clippy |
+| `8eacce8` | HD-17: pinned RustSec advisory gateとlocal security check | CI workflow lint; cargo audit |
 
 ### Remediation status
 
 監査で特定した実装上のP0/P1欠陥は `security/hearth-hardening` で修正した。protocol handshake、aggregate frame/decode budget、Graph build/resident/traversal budget、watch/walk budget、request cancellation、secure endpoint/FD/temp/file I/O、at-most-once CLI、full cache resetを回帰試験で固定している。安全な上限はoptimizer無効時も強制される。
 
-残る設計上の制約は、同一UIDクライアントへOSユーザー相当の権限を与えること、UIDごとに単一socketでworkspace境界を提供しないこと、POSIX process groupから意図的に離脱したdescendantのportable containmentがbest effortであること。bounded walkはregularなroot-local `.ignore`/`.rgignore`だけを扱い、ancestor/global Git ignoreと`.git/info/exclude`を展開しない。JS resolver configはregular file・1 MiB以下で、tsconfig project-reference fan-outは自動展開しない。
+残る設計上の制約は、同一UIDクライアントへOSユーザー相当の権限を与えること、UIDごとに単一socketでworkspace境界を提供しないこと、POSIX process groupから意図的に離脱したdescendantのportable containmentがbest effortであること。macOSは`MSG_CMSG_CLOEXEC`を提供しないため、受信FDは`recvmsg`直後の`fcntl(F_SETFD)`でCLOEXEC化され、並行するfork/execとの短い非atomic windowが残る。bounded walkはregularなroot-local `.ignore`/`.rgignore`だけを扱い、ancestor/global Git ignoreと`.git/info/exclude`を展開しない。JS resolver configはregular file・1 MiB以下で、tsconfig project-reference fan-outは自動展開しない。
 
 ## 1. 結論
 
@@ -307,6 +312,8 @@ Daemon dispatch は non-cancellable API を使用する（`crates/hearth-tools/s
 - FD の型、blocking 性、出力上限を検査しない。
 
 **対策**: buffered frame decoder、short send/write loop、`MSG_CTRUNC`/unexpected cmsg 拒否、FD数とrequest kindの厳密対応、受信直後の`FD_CLOEXEC`、deadline/nonblocking strategy、actual bytesの検証。
+
+**修正後のportable制約**: Linux/BSDは`MSG_CMSG_CLOEXEC`で受信と同時にCLOEXEC化する。macOSはこのflagを提供しないため、`recvmsg`後に全受信FDへ`fcntl(F_SETFD)`を適用する。その短い間に別threadがfork/execするとFDがchildへ継承され得る。same-UID trust model内の残余riskであり、強い分離には外部sandboxまたはservice managerが必要である。
 
 ### HD-15 — `trust_cache` と `Bash` mutation がcache整合性を失わせる
 
