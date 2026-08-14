@@ -101,6 +101,3 @@ rather than filing a public exploit report. Include the affected commit,
 platform, deployment assumptions, minimal reproduction, and whether the client
 runs as the same UID. Do not include real credentials, private repository
 contents, or unrelated user data.
-
-The detailed source audit and finding ledger live in
-[`docs/SECURITY_AUDIT_HEARTHD.md`](docs/SECURITY_AUDIT_HEARTHD.md).
