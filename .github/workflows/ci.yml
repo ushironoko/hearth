@@ -22,7 +22,7 @@ env:
 
 jobs:
   security:
-    name: RustSec advisory audit
+    name: dependency advisory audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -32,10 +32,15 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+
+      - name: Audit locked JavaScript dependencies
+        run: pnpm audit --audit-level high
+
       - name: Install pinned cargo-audit
         run: cargo install cargo-audit --version 0.22.1 --locked
 
-      - name: Audit locked dependencies
+      - name: Audit locked Rust dependencies
         run: cargo audit --file Cargo.lock --deny warnings
 
   workflows:
