@@ -403,13 +403,18 @@ mod tests {
         }
         let stale = UnixListener::bind(endpoint.path()).unwrap();
         drop(stale);
-        let stale_identity =
-            PathIdentity::from_metadata(&fs::symlink_metadata(endpoint.path()).unwrap());
 
         let mut bound = BoundEndpoint::bind(&endpoint).unwrap();
-        let current_identity =
-            PathIdentity::from_metadata(&fs::symlink_metadata(endpoint.path()).unwrap());
-        assert_ne!(stale_identity, current_identity);
+        let current = fs::symlink_metadata(endpoint.path()).unwrap();
+        assert!(current.file_type().is_socket());
+        assert_eq!(current.mode() & 0o7777, 0o600);
+
+        // Successful bind already proves that the stale pathname was removed.
+        // Exercise the replacement listener instead of comparing inode numbers:
+        // Linux may immediately reuse the just-unlinked socket inode.
+        let client = UnixStream::connect(endpoint.path()).unwrap();
+        let (server, _) = bound.listener().accept().unwrap();
+        drop((client, server));
         assert!(bound.cleanup().unwrap());
     }
 
