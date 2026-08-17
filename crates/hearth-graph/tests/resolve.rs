@@ -584,6 +584,31 @@ fn package_json_dependency_survives_a_resolver_cache_hit() {
 }
 
 #[test]
+fn rejected_oversized_package_manifest_never_falls_back_to_index() {
+    let fixture = Fixture::new();
+    let importer = fixture.write("src/app.ts", "");
+    let package_json = fixture.write(
+        "node_modules/oversized-package/package.json",
+        &"x".repeat(1024 * 1024 + 1),
+    );
+    fixture.write(
+        "node_modules/oversized-package/index.js",
+        "module.exports = { unsafeFallback: true };",
+    );
+    let resolver = js_resolver(JsResolveOptions::default());
+    let import = raw_import("oversized-package", ImportKind::CommonJs);
+
+    for outcome in [
+        resolver.resolve(path_str(&importer), &import),
+        resolver.resolve(path_str(&importer), &import),
+    ] {
+        assert_dependency(&outcome, &package_json);
+        assert_eq!(failed_kind(&outcome), FailedKind::Config);
+        assert_eq!(outcome.completeness, ResolutionCompleteness::Partial);
+    }
+}
+
+#[test]
 fn package_import_referrer_dependency_survives_a_resolver_cache_hit() {
     let fixture = Fixture::new();
     let importer = fixture.write("src/app.ts", "");
