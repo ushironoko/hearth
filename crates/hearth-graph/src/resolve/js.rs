@@ -3,7 +3,10 @@
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
-use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::{
+    fs::{MetadataExt, OpenOptionsExt},
+    io::AsRawHandle,
+};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
@@ -21,6 +24,10 @@ use oxc_resolver::{
 };
 use parking_lot::Mutex;
 use serde_json::Value;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, GetFileType, SECURITY_IDENTIFICATION,
+};
 
 use super::{
     FailedKind, ResolutionCompleteness, ResolutionOutcome, Resolve, Resolved, UnresolvedReason,
@@ -34,13 +41,11 @@ const MAX_TSCONFIG_EXTENDS_VISITS: usize = 256;
 const MAX_RESOLUTION_MEMO_ENTRIES: usize = 65_536;
 
 #[cfg(any(windows, test))]
-const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+const WINDOWS_FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 #[cfg(any(windows, test))]
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-#[cfg(windows)]
-const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-#[cfg(windows)]
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+#[cfg(any(windows, test))]
+const WINDOWS_FILE_TYPE_DISK: u32 = 1;
 
 /// Configuration for JavaScript and TypeScript module resolution.
 #[derive(Debug, Clone)]
@@ -738,9 +743,12 @@ fn open_resolver_file(path: &Path) -> io::Result<std::fs::File> {
 fn open_resolver_file(path: &Path) -> io::Result<std::fs::File> {
     // Open the named object rather than traversing a reparse point. Backup
     // semantics lets the same handle-based validation reject directories too.
+    // Identification QoS prevents a named-pipe server from impersonating this
+    // process before the opened handle can be classified and rejected.
     std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .security_qos_flags(SECURITY_IDENTIFICATION)
         .open(path)
 }
 
@@ -752,32 +760,55 @@ fn open_resolver_file(_path: &Path) -> io::Result<std::fs::File> {
     ))
 }
 
+fn invalid_resolver_file() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "resolver config must be a regular file no larger than 1 MiB",
+    )
+}
+
 #[cfg(unix)]
-fn opened_resolver_file_is_regular(metadata: &std::fs::Metadata) -> bool {
-    metadata.is_file()
+fn opened_resolver_file_metadata(file: &std::fs::File) -> io::Result<std::fs::Metadata> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(invalid_resolver_file());
+    }
+    Ok(metadata)
 }
 
 #[cfg(windows)]
-fn opened_resolver_file_is_regular(metadata: &std::fs::Metadata) -> bool {
-    windows_file_attributes_are_regular(metadata.file_attributes())
+fn opened_resolver_file_metadata(file: &std::fs::File) -> io::Result<std::fs::Metadata> {
+    // SAFETY: the handle remains owned by `file` for the duration of this call.
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    if file_type != WINDOWS_FILE_TYPE_DISK {
+        return Err(invalid_resolver_file());
+    }
+
+    let metadata = file.metadata()?;
+    if !windows_handle_is_regular(file_type, metadata.file_attributes()) {
+        return Err(invalid_resolver_file());
+    }
+    Ok(metadata)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn opened_resolver_file_is_regular(_metadata: &std::fs::Metadata) -> bool {
-    false
+fn opened_resolver_file_metadata(_file: &std::fs::File) -> io::Result<std::fs::Metadata> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure resolver config reads are unsupported on this target",
+    ))
 }
 
 #[cfg(any(windows, test))]
-fn windows_file_attributes_are_regular(attributes: u32) -> bool {
-    attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
+fn windows_handle_is_regular(file_type: u32, attributes: u32) -> bool {
+    file_type == WINDOWS_FILE_TYPE_DISK
+        && attributes & (WINDOWS_FILE_ATTRIBUTE_DIRECTORY | WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT)
+            == 0
 }
 
-fn resolver_file_capacity(is_regular: bool, file_len: u64) -> io::Result<usize> {
-    if !is_regular || file_len > MAX_RESOLVER_FILE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "resolver config must be a regular file no larger than 1 MiB",
-        ));
+fn resolver_file_capacity(file_len: u64) -> io::Result<usize> {
+    if file_len > MAX_RESOLVER_FILE_BYTES {
+        return Err(invalid_resolver_file());
     }
     Ok(file_len as usize)
 }
@@ -798,9 +829,8 @@ fn read_resolver_contents(reader: &mut impl Read, initial_capacity: usize) -> io
 
 fn read_resolver_file(path: &Path) -> io::Result<Vec<u8>> {
     let mut file = open_resolver_file(path)?;
-    let metadata = file.metadata()?;
-    let capacity =
-        resolver_file_capacity(opened_resolver_file_is_regular(&metadata), metadata.len())?;
+    let metadata = opened_resolver_file_metadata(&file)?;
+    let capacity = resolver_file_capacity(metadata.len())?;
     read_resolver_contents(&mut file, capacity)
 }
 
@@ -934,20 +964,40 @@ mod tests {
     }
 
     #[test]
-    fn windows_attributes_reject_directories_and_all_reparse_points() {
+    fn windows_handle_classification_rejects_devices_directories_and_reparse_points() {
         const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
         const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        const FILE_TYPE_UNKNOWN: u32 = 0;
+        const FILE_TYPE_CHAR: u32 = 2;
+        const FILE_TYPE_PIPE: u32 = 3;
 
-        assert!(windows_file_attributes_are_regular(FILE_ATTRIBUTE_NORMAL));
-        assert!(windows_file_attributes_are_regular(FILE_ATTRIBUTE_ARCHIVE));
-        assert!(!windows_file_attributes_are_regular(
-            FILE_ATTRIBUTE_DIRECTORY
+        assert!(windows_handle_is_regular(
+            WINDOWS_FILE_TYPE_DISK,
+            FILE_ATTRIBUTE_NORMAL
         ));
-        assert!(!windows_file_attributes_are_regular(
-            FILE_ATTRIBUTE_REPARSE_POINT
+        assert!(windows_handle_is_regular(
+            WINDOWS_FILE_TYPE_DISK,
+            FILE_ATTRIBUTE_ARCHIVE
         ));
-        assert!(!windows_file_attributes_are_regular(
-            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT
+        assert!(!windows_handle_is_regular(
+            FILE_TYPE_UNKNOWN,
+            FILE_ATTRIBUTE_NORMAL
+        ));
+        assert!(!windows_handle_is_regular(
+            FILE_TYPE_CHAR,
+            FILE_ATTRIBUTE_NORMAL
+        ));
+        assert!(!windows_handle_is_regular(
+            FILE_TYPE_PIPE,
+            FILE_ATTRIBUTE_NORMAL
+        ));
+        assert!(!windows_handle_is_regular(
+            WINDOWS_FILE_TYPE_DISK,
+            WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+        ));
+        assert!(!windows_handle_is_regular(
+            WINDOWS_FILE_TYPE_DISK,
+            WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
         ));
     }
 

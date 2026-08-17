@@ -770,6 +770,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-zig",
+ "windows-sys 0.61.2",
  "xxhash-rust",
 ]
 

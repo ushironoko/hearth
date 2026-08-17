@@ -121,8 +121,8 @@ jobs:
         with:
           save-if: ${{ env.RUST_CACHE_SAVE }}
 
-      - name: Check hearth-graph default features
-        run: cargo check -p hearth-graph --all-targets
+      - name: Test hearth-graph default features
+        run: cargo test -p hearth-graph --all-targets
 
       - name: Lint focused resolve-js build
         run: cargo clippy -p hearth-graph --no-default-features --features resolve-js --lib -- -D warnings
