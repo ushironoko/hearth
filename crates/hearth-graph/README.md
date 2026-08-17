@@ -69,10 +69,14 @@ registry.register(
 requires Cargo target metadata and a module declaration tree that can model
 `cfg`, `#[path]`, macros, and inline modules.
 
+Resolver config reads use no-follow opens and opened-handle validation on Unix
+and Windows. Targets without a secure no-follow primitive fail closed instead
+of reading resolver configuration through a potentially redirected path.
+
 ## Versioning and MSRV
 
 The minimum supported Rust version is **1.95**. The crate is currently in the
-`0.1` series; public APIs may evolve between minor releases. Pin an exact
+`0.2` series; public APIs may evolve between minor releases. Pin an exact
 version when integrating a compatibility facade.
 
 The detailed cache adapter, freshness model, and graph guarantees used by the

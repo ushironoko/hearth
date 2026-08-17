@@ -186,7 +186,7 @@ fn tracks_missing_relative_tsconfig_extends_target() {
         "tsconfig.json",
         r#"{"extends":"./config/missing.json","include":["src/**/*"]}"#,
     );
-    let missing = fixture.root.join("config/missing.json");
+    let missing = relative_path(&fixture.root, "config/missing.json");
     let importer = fixture.write("src/app.ts", "");
     let resolver = js_resolver(JsResolveOptions {
         tsconfig: Some(tsconfig),
@@ -204,7 +204,7 @@ fn tracks_missing_relative_tsconfig_extends_target() {
 #[test]
 fn tracks_missing_absolute_tsconfig_extends_target() {
     let fixture = Fixture::new();
-    let missing = fixture.root.join("config/missing-absolute.json");
+    let missing = relative_path(&fixture.root, "config/missing-absolute.json");
     let config = serde_json::json!({
         "extends": path_str(&missing),
         "include": ["src/**/*"],
@@ -584,6 +584,31 @@ fn package_json_dependency_survives_a_resolver_cache_hit() {
 }
 
 #[test]
+fn rejected_oversized_package_manifest_never_falls_back_to_index() {
+    let fixture = Fixture::new();
+    let importer = fixture.write("src/app.ts", "");
+    let package_json = fixture.write(
+        "node_modules/oversized-package/package.json",
+        &"x".repeat(1024 * 1024 + 1),
+    );
+    fixture.write(
+        "node_modules/oversized-package/index.js",
+        "module.exports = { unsafeFallback: true };",
+    );
+    let resolver = js_resolver(JsResolveOptions::default());
+    let import = raw_import("oversized-package", ImportKind::CommonJs);
+
+    for outcome in [
+        resolver.resolve(path_str(&importer), &import),
+        resolver.resolve(path_str(&importer), &import),
+    ] {
+        assert_dependency(&outcome, &package_json);
+        assert_eq!(failed_kind(&outcome), FailedKind::Config);
+        assert_eq!(outcome.completeness, ResolutionCompleteness::Partial);
+    }
+}
+
+#[test]
 fn package_import_referrer_dependency_survives_a_resolver_cache_hit() {
     let fixture = Fixture::new();
     let importer = fixture.write("src/app.ts", "");
@@ -825,16 +850,6 @@ fn circular_tsconfig_extends_is_failed_and_tracks_the_cycle() {
     assert_eq!(failed_kind(&outcome), FailedKind::Config);
 }
 
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "from_file must be absolute")]
-fn relative_from_file_triggers_debug_assert() {
-    let resolver = js_resolver(JsResolveOptions::default());
-
-    let _ = resolver.resolve("src/app.ts", &raw_import("./module", ImportKind::EsStatic));
-}
-
-#[cfg(not(debug_assertions))]
 #[test]
 fn relative_from_file_returns_failed() {
     let resolver = js_resolver(JsResolveOptions::default());
@@ -864,9 +879,9 @@ fn empty_specifier_is_an_invalid_specifier_failure() {
 
 #[test]
 fn filesystem_errors_are_partial_io_failures() {
-    let root = Path::new("/virtual-hearth-io-error-root");
-    let importer = root.join("src/app.ts");
-    let broken_link = root.join("src/blocked.ts");
+    let root = virtual_root("io-error");
+    let importer = relative_path(&root, "src/app.ts");
+    let broken_link = relative_path(&root, "src/blocked.ts");
     let filesystem = MemoryFileSystem::with_files([
         (importer.clone(), String::new()),
         (broken_link.clone(), String::new()),
@@ -945,9 +960,9 @@ fn vue_graph_nodes_keep_the_javascript_resolver_live() {
 
 #[test]
 fn resolves_with_an_in_memory_filesystem() {
-    let root = Path::new("/virtual-hearth-test-root");
-    let importer = root.join("src/app.ts");
-    let expected = root.join("src/util.ts");
+    let root = virtual_root("relative-resolution");
+    let importer = relative_path(&root, "src/app.ts");
+    let expected = relative_path(&root, "src/util.ts");
     let filesystem = MemoryFileSystem::with_files([
         (importer.clone(), String::new()),
         (expected.clone(), "export const virtualValue = 1;".into()),
@@ -960,6 +975,97 @@ fn resolves_with_an_in_memory_filesystem() {
     );
 
     assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+}
+
+#[test]
+fn injected_filesystem_resolves_a_virtual_tsconfig_alias() {
+    let root = virtual_root("tsconfig-alias");
+    let importer = relative_path(&root, "src/app.ts");
+    let tsconfig = relative_path(&root, "tsconfig.json");
+    let expected = relative_path(&root, "virtual/mod.ts");
+    let filesystem = MemoryFileSystem::with_files([
+        (importer.clone(), String::new()),
+        (
+            tsconfig.clone(),
+            r##"{"compilerOptions":{"baseUrl":".","paths":{"#virtual/*":["virtual/*"]}}}"##.into(),
+        ),
+        (expected.clone(), "export const virtualValue = 1;".into()),
+    ]);
+    let resolver = js_resolver_with_fs(
+        filesystem,
+        JsResolveOptions {
+            tsconfig: Some(tsconfig.clone()),
+            ..JsResolveOptions::default()
+        },
+    );
+
+    let outcome = resolver.resolve(
+        path_str(&importer),
+        &raw_import("#virtual/mod", ImportKind::EsStatic),
+    );
+
+    assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+    assert_dependency(&outcome, &tsconfig);
+}
+
+#[test]
+fn injected_filesystem_resolves_virtual_package_exports() {
+    let root = virtual_root("package-exports");
+    let importer = relative_path(&root, "src/app.ts");
+    let package_json = relative_path(&root, "node_modules/virtual-package/package.json");
+    let expected = relative_path(&root, "node_modules/virtual-package/dist/index.js");
+    let filesystem = MemoryFileSystem::with_files([
+        (importer.clone(), String::new()),
+        (
+            package_json.clone(),
+            r#"{"name":"virtual-package","exports":"./dist/index.js"}"#.into(),
+        ),
+        (expected.clone(), "export const virtualValue = 1;".into()),
+    ]);
+    let resolver = js_resolver_with_fs(filesystem, JsResolveOptions::default());
+
+    let outcome = resolver.resolve(
+        path_str(&importer),
+        &raw_import("virtual-package", ImportKind::EsStatic),
+    );
+
+    assert_eq!(
+        outcome.resolved,
+        Resolved::External("virtual-package".into())
+    );
+    assert_dependency(&outcome, &package_json);
+    assert_dependency(&outcome, &expected);
+}
+
+#[test]
+fn injected_filesystem_rejects_an_unreadable_package_manifest() {
+    let root = virtual_root("unreadable-package-manifest");
+    let importer = relative_path(&root, "src/app.ts");
+    let package_json = relative_path(&root, "node_modules/unreadable-package/package.json");
+    let fallback = relative_path(&root, "node_modules/unreadable-package/index.js");
+    let filesystem = MemoryFileSystem::with_files([
+        (importer.clone(), String::new()),
+        (
+            package_json.clone(),
+            r#"{"name":"unreadable-package","main":"index.js"}"#.into(),
+        ),
+        (
+            fallback,
+            "module.exports = { unsafeFallback: true };".into(),
+        ),
+    ])
+    .with_unreadable_file(package_json.clone());
+    let resolver = js_resolver_with_fs(filesystem, JsResolveOptions::default());
+    let import = raw_import("unreadable-package", ImportKind::CommonJs);
+
+    for outcome in [
+        resolver.resolve(path_str(&importer), &import),
+        resolver.resolve(path_str(&importer), &import),
+    ] {
+        assert_dependency(&outcome, &package_json);
+        assert_eq!(failed_kind(&outcome), FailedKind::Config);
+        assert_eq!(outcome.completeness, ResolutionCompleteness::Partial);
+    }
 }
 
 #[test]
@@ -1036,7 +1142,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let tempdir = tempfile::tempdir().expect("create temp directory");
-        let root = fs::canonicalize(tempdir.path()).expect("canonicalize temp directory");
+        let root =
+            resolver_path(fs::canonicalize(tempdir.path()).expect("canonicalize temp directory"));
         Self {
             _tempdir: tempdir,
             root,
@@ -1048,7 +1155,7 @@ impl Fixture {
         fs::create_dir_all(path.parent().expect("fixture file parent"))
             .expect("create fixture directory");
         fs::write(&path, contents).expect("write fixture file");
-        fs::canonicalize(path).expect("canonicalize fixture file")
+        resolver_path(fs::canonicalize(path).expect("canonicalize fixture file"))
     }
 }
 
@@ -1059,6 +1166,62 @@ fn raw_import(specifier: &str, kind: ImportKind) -> RawImport {
         line: 1,
         span: (0, specifier.len() as u32),
     }
+}
+
+#[cfg(windows)]
+fn resolver_path(path: PathBuf) -> PathBuf {
+    let path = path.to_str().expect("fixture path must be UTF-8");
+    if let Some(path) = path
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| path.strip_prefix(r"\\.\UNC\"))
+    {
+        PathBuf::from(format!(r"\\{path}"))
+    } else if let Some(path) = path
+        .strip_prefix(r"\\?\")
+        .or_else(|| path.strip_prefix(r"\\.\"))
+    {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+#[cfg(not(windows))]
+fn resolver_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+#[cfg(windows)]
+#[test]
+fn resolver_fixture_paths_match_windows_resolver_representation() {
+    assert_eq!(
+        resolver_path(PathBuf::from(r"\\?\C:\workspace\src\app.ts")),
+        PathBuf::from(r"C:\workspace\src\app.ts")
+    );
+    assert_eq!(
+        resolver_path(PathBuf::from(r"\\?\UNC\server\share\app.ts")),
+        PathBuf::from(r"\\server\share\app.ts")
+    );
+    assert_eq!(
+        relative_path(Path::new(r"C:\workspace"), "src/app.ts"),
+        PathBuf::from(r"C:\workspace\src\app.ts")
+    );
+}
+
+fn relative_path(root: &Path, relative: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for component in relative.split('/') {
+        path.push(component);
+    }
+    path
+}
+
+fn virtual_root(name: &str) -> PathBuf {
+    let root = std::env::current_dir()
+        .expect("current directory must be available")
+        .join(format!(".hearth-virtual-{name}"));
+    assert!(root.is_absolute(), "virtual root must be absolute");
+    root
 }
 
 fn path_str(path: &Path) -> &str {
@@ -1093,6 +1256,7 @@ struct MemoryFileSystem {
     files: HashMap<PathBuf, String>,
     directories: HashSet<PathBuf>,
     broken_symlinks: HashSet<PathBuf>,
+    unreadable_files: HashSet<PathBuf>,
 }
 
 impl MemoryFileSystem {
@@ -1106,7 +1270,13 @@ impl MemoryFileSystem {
             files,
             directories,
             broken_symlinks: HashSet::new(),
+            unreadable_files: HashSet::new(),
         }
+    }
+
+    fn with_unreadable_file(mut self, path: PathBuf) -> Self {
+        self.unreadable_files.insert(path);
+        self
     }
 
     fn with_broken_symlink(mut self, path: PathBuf) -> Self {
@@ -1131,6 +1301,12 @@ impl FileSystem for MemoryFileSystem {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        if self.unreadable_files.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("virtual path is unreadable: {}", path.display()),
+            ));
+        }
         self.files
             .get(path)
             .map(|contents| contents.as_bytes().to_vec())
@@ -1138,6 +1314,12 @@ impl FileSystem for MemoryFileSystem {
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        if self.unreadable_files.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("virtual path is unreadable: {}", path.display()),
+            ));
+        }
         self.files.get(path).cloned().ok_or_else(|| not_found(path))
     }
 
