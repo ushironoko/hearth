@@ -186,7 +186,7 @@ fn tracks_missing_relative_tsconfig_extends_target() {
         "tsconfig.json",
         r#"{"extends":"./config/missing.json","include":["src/**/*"]}"#,
     );
-    let missing = fixture.root.join("config/missing.json");
+    let missing = relative_path(&fixture.root, "config/missing.json");
     let importer = fixture.write("src/app.ts", "");
     let resolver = js_resolver(JsResolveOptions {
         tsconfig: Some(tsconfig),
@@ -204,7 +204,7 @@ fn tracks_missing_relative_tsconfig_extends_target() {
 #[test]
 fn tracks_missing_absolute_tsconfig_extends_target() {
     let fixture = Fixture::new();
-    let missing = fixture.root.join("config/missing-absolute.json");
+    let missing = relative_path(&fixture.root, "config/missing-absolute.json");
     let config = serde_json::json!({
         "extends": path_str(&missing),
         "include": ["src/**/*"],
@@ -880,8 +880,8 @@ fn empty_specifier_is_an_invalid_specifier_failure() {
 #[test]
 fn filesystem_errors_are_partial_io_failures() {
     let root = virtual_root("io-error");
-    let importer = root.join("src/app.ts");
-    let broken_link = root.join("src/blocked.ts");
+    let importer = relative_path(&root, "src/app.ts");
+    let broken_link = relative_path(&root, "src/blocked.ts");
     let filesystem = MemoryFileSystem::with_files([
         (importer.clone(), String::new()),
         (broken_link.clone(), String::new()),
@@ -961,8 +961,8 @@ fn vue_graph_nodes_keep_the_javascript_resolver_live() {
 #[test]
 fn resolves_with_an_in_memory_filesystem() {
     let root = virtual_root("relative-resolution");
-    let importer = root.join("src/app.ts");
-    let expected = root.join("src/util.ts");
+    let importer = relative_path(&root, "src/app.ts");
+    let expected = relative_path(&root, "src/util.ts");
     let filesystem = MemoryFileSystem::with_files([
         (importer.clone(), String::new()),
         (expected.clone(), "export const virtualValue = 1;".into()),
@@ -980,9 +980,9 @@ fn resolves_with_an_in_memory_filesystem() {
 #[test]
 fn injected_filesystem_resolves_a_virtual_tsconfig_alias() {
     let root = virtual_root("tsconfig-alias");
-    let importer = root.join("src/app.ts");
-    let tsconfig = root.join("tsconfig.json");
-    let expected = root.join("virtual/mod.ts");
+    let importer = relative_path(&root, "src/app.ts");
+    let tsconfig = relative_path(&root, "tsconfig.json");
+    let expected = relative_path(&root, "virtual/mod.ts");
     let filesystem = MemoryFileSystem::with_files([
         (importer.clone(), String::new()),
         (
@@ -1011,9 +1011,9 @@ fn injected_filesystem_resolves_a_virtual_tsconfig_alias() {
 #[test]
 fn injected_filesystem_resolves_virtual_package_exports() {
     let root = virtual_root("package-exports");
-    let importer = root.join("src/app.ts");
-    let package_json = root.join("node_modules/virtual-package/package.json");
-    let expected = root.join("node_modules/virtual-package/dist/index.js");
+    let importer = relative_path(&root, "src/app.ts");
+    let package_json = relative_path(&root, "node_modules/virtual-package/package.json");
+    let expected = relative_path(&root, "node_modules/virtual-package/dist/index.js");
     let filesystem = MemoryFileSystem::with_files([
         (importer.clone(), String::new()),
         (
@@ -1040,9 +1040,9 @@ fn injected_filesystem_resolves_virtual_package_exports() {
 #[test]
 fn injected_filesystem_rejects_an_unreadable_package_manifest() {
     let root = virtual_root("unreadable-package-manifest");
-    let importer = root.join("src/app.ts");
-    let package_json = root.join("node_modules/unreadable-package/package.json");
-    let fallback = root.join("node_modules/unreadable-package/index.js");
+    let importer = relative_path(&root, "src/app.ts");
+    let package_json = relative_path(&root, "node_modules/unreadable-package/package.json");
+    let fallback = relative_path(&root, "node_modules/unreadable-package/index.js");
     let filesystem = MemoryFileSystem::with_files([
         (importer.clone(), String::new()),
         (
@@ -1202,6 +1202,18 @@ fn resolver_fixture_paths_match_windows_resolver_representation() {
         resolver_path(PathBuf::from(r"\\?\UNC\server\share\app.ts")),
         PathBuf::from(r"\\server\share\app.ts")
     );
+    assert_eq!(
+        relative_path(Path::new(r"C:\workspace"), "src/app.ts"),
+        PathBuf::from(r"C:\workspace\src\app.ts")
+    );
+}
+
+fn relative_path(root: &Path, relative: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for component in relative.split('/') {
+        path.push(component);
+    }
+    path
 }
 
 fn virtual_root(name: &str) -> PathBuf {
