@@ -36,7 +36,7 @@ use crate::imports::{ImportKind, RawImport};
 
 const MAX_TSCONFIG_BYTES: usize = 1024 * 1024;
 const MAX_RESOLVER_FILE_BYTES: u64 = 1024 * 1024;
-const REJECTED_PACKAGE_MANIFEST: &[u8] = b"{\"__hearth_rejected_package_manifest__\":";
+const REJECTED_PACKAGE_MANIFEST: &str = "{\"__hearth_rejected_package_manifest__\":";
 const MAX_TSCONFIG_EXTENDS_ENTRIES: usize = 32;
 const MAX_TSCONFIG_EXTENDS_VISITS: usize = 256;
 const MAX_RESOLUTION_MEMO_ENTRIES: usize = 65_536;
@@ -831,17 +831,34 @@ fn read_resolver_file(path: &Path) -> io::Result<Vec<u8>> {
     read_resolver_contents(&mut file, capacity)
 }
 
-fn read_resolver_path(path: &Path) -> io::Result<Vec<u8>> {
-    match read_resolver_file(path) {
-        Err(error)
-            if path.file_name().is_some_and(|name| name == "package.json")
-                && error.kind() != io::ErrorKind::NotFound =>
-        {
+fn rejected_package_manifest(path: &Path, error: &io::Error) -> bool {
+    path.file_name().is_some_and(|name| name == "package.json")
+        && error.kind() != io::ErrorKind::NotFound
+}
+
+fn fail_closed_package_manifest_bytes(
+    path: &Path,
+    result: io::Result<Vec<u8>>,
+) -> io::Result<Vec<u8>> {
+    match result {
+        Err(error) if rejected_package_manifest(path, &error) => {
             // oxc_resolver interprets every package-manifest read error as
             // "missing" and may fall back to index.js. Returning a malformed
             // marker makes its JSON parser propagate a configuration failure
             // instead of silently accepting a rejected existing manifest.
-            Ok(REJECTED_PACKAGE_MANIFEST.to_vec())
+            Ok(REJECTED_PACKAGE_MANIFEST.as_bytes().to_vec())
+        }
+        result => result,
+    }
+}
+
+fn fail_closed_package_manifest_string(
+    path: &Path,
+    result: io::Result<String>,
+) -> io::Result<String> {
+    match result {
+        Err(error) if rejected_package_manifest(path, &error) => {
+            Ok(REJECTED_PACKAGE_MANIFEST.to_owned())
         }
         result => result,
     }
@@ -856,7 +873,7 @@ impl FileSystem for SecureOsFileSystem {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        read_resolver_path(path)
+        read_resolver_file(path)
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
@@ -896,11 +913,11 @@ impl FileSystem for SharedFileSystem {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        self.0.read(path)
+        fail_closed_package_manifest_bytes(path, self.0.read(path))
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
-        self.0.read_to_string(path)
+        fail_closed_package_manifest_string(path, self.0.read_to_string(path))
     }
 
     fn metadata(&self, path: &Path) -> io::Result<oxc_resolver::FileMetadata> {

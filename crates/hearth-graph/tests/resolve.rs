@@ -1038,6 +1038,37 @@ fn injected_filesystem_resolves_virtual_package_exports() {
 }
 
 #[test]
+fn injected_filesystem_rejects_an_unreadable_package_manifest() {
+    let root = virtual_root("unreadable-package-manifest");
+    let importer = root.join("src/app.ts");
+    let package_json = root.join("node_modules/unreadable-package/package.json");
+    let fallback = root.join("node_modules/unreadable-package/index.js");
+    let filesystem = MemoryFileSystem::with_files([
+        (importer.clone(), String::new()),
+        (
+            package_json.clone(),
+            r#"{"name":"unreadable-package","main":"index.js"}"#.into(),
+        ),
+        (
+            fallback,
+            "module.exports = { unsafeFallback: true };".into(),
+        ),
+    ])
+    .with_unreadable_file(package_json.clone());
+    let resolver = js_resolver_with_fs(filesystem, JsResolveOptions::default());
+    let import = raw_import("unreadable-package", ImportKind::CommonJs);
+
+    for outcome in [
+        resolver.resolve(path_str(&importer), &import),
+        resolver.resolve(path_str(&importer), &import),
+    ] {
+        assert_dependency(&outcome, &package_json);
+        assert_eq!(failed_kind(&outcome), FailedKind::Config);
+        assert_eq!(outcome.completeness, ResolutionCompleteness::Partial);
+    }
+}
+
+#[test]
 fn clear_cache_reloads_a_rewritten_tsconfig() {
     let fixture = Fixture::new();
     let tsconfig = fixture.write(
@@ -1111,7 +1142,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let tempdir = tempfile::tempdir().expect("create temp directory");
-        let root = fs::canonicalize(tempdir.path()).expect("canonicalize temp directory");
+        let root =
+            resolver_path(fs::canonicalize(tempdir.path()).expect("canonicalize temp directory"));
         Self {
             _tempdir: tempdir,
             root,
@@ -1123,7 +1155,7 @@ impl Fixture {
         fs::create_dir_all(path.parent().expect("fixture file parent"))
             .expect("create fixture directory");
         fs::write(&path, contents).expect("write fixture file");
-        fs::canonicalize(path).expect("canonicalize fixture file")
+        resolver_path(fs::canonicalize(path).expect("canonicalize fixture file"))
     }
 }
 
@@ -1134,6 +1166,42 @@ fn raw_import(specifier: &str, kind: ImportKind) -> RawImport {
         line: 1,
         span: (0, specifier.len() as u32),
     }
+}
+
+#[cfg(windows)]
+fn resolver_path(path: PathBuf) -> PathBuf {
+    let path = path.to_str().expect("fixture path must be UTF-8");
+    if let Some(path) = path
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| path.strip_prefix(r"\\.\UNC\"))
+    {
+        PathBuf::from(format!(r"\\{path}"))
+    } else if let Some(path) = path
+        .strip_prefix(r"\\?\")
+        .or_else(|| path.strip_prefix(r"\\.\"))
+    {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+#[cfg(not(windows))]
+fn resolver_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+#[cfg(windows)]
+#[test]
+fn resolver_fixture_paths_match_windows_resolver_representation() {
+    assert_eq!(
+        resolver_path(PathBuf::from(r"\\?\C:\workspace\src\app.ts")),
+        PathBuf::from(r"C:\workspace\src\app.ts")
+    );
+    assert_eq!(
+        resolver_path(PathBuf::from(r"\\?\UNC\server\share\app.ts")),
+        PathBuf::from(r"\\server\share\app.ts")
+    );
 }
 
 fn virtual_root(name: &str) -> PathBuf {
@@ -1176,6 +1244,7 @@ struct MemoryFileSystem {
     files: HashMap<PathBuf, String>,
     directories: HashSet<PathBuf>,
     broken_symlinks: HashSet<PathBuf>,
+    unreadable_files: HashSet<PathBuf>,
 }
 
 impl MemoryFileSystem {
@@ -1189,7 +1258,13 @@ impl MemoryFileSystem {
             files,
             directories,
             broken_symlinks: HashSet::new(),
+            unreadable_files: HashSet::new(),
         }
+    }
+
+    fn with_unreadable_file(mut self, path: PathBuf) -> Self {
+        self.unreadable_files.insert(path);
+        self
     }
 
     fn with_broken_symlink(mut self, path: PathBuf) -> Self {
@@ -1214,6 +1289,12 @@ impl FileSystem for MemoryFileSystem {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        if self.unreadable_files.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("virtual path is unreadable: {}", path.display()),
+            ));
+        }
         self.files
             .get(path)
             .map(|contents| contents.as_bytes().to_vec())
@@ -1221,6 +1302,12 @@ impl FileSystem for MemoryFileSystem {
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        if self.unreadable_files.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("virtual path is unreadable: {}", path.display()),
+            ));
+        }
         self.files.get(path).cloned().ok_or_else(|| not_found(path))
     }
 
