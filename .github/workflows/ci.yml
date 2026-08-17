@@ -54,6 +54,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Test release version validator
+        run: node --test scripts/verify-napi-release-versions.test.mjs
+
       # Static analysis of these workflows themselves: template injection,
       # credential persistence, unpinned actions, over-broad permissions.
       - uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1

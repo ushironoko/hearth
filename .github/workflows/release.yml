@@ -141,6 +141,16 @@ jobs:
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile
 
+      # napi build embeds the root package version in index.js. Apply the tag
+      # before generation so its strict platform-package check expects the
+      # version that this run will publish.
+      - name: Set the generated loader version from the tag
+        if: startsWith(github.ref, 'refs/tags/napi-v')
+        run: |
+          version="${GITHUB_REF_NAME#napi-v}"
+          npm version "$version" --no-git-tag-version --allow-same-version --ignore-scripts
+        working-directory: crates/hearth-napi
+
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
@@ -154,7 +164,12 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bindings-${{ matrix.target }}
-          path: crates/hearth-napi/hearth.*.node
+          # Every target independently generates the target-neutral loader and
+          # declarations. Verify requires all copies to be byte-identical.
+          path: |
+            crates/hearth-napi/hearth.*.node
+            crates/hearth-napi/index.js
+            crates/hearth-napi/index.d.ts
           if-no-files-found: error
           retention-days: 7
 
@@ -187,17 +202,22 @@ jobs:
         with:
           path: crates/hearth-napi/artifacts
 
-      - name: Collect artifacts into platform packages
-        run: pnpm exec napi artifacts --output-dir artifacts
-        working-directory: crates/hearth-napi
-
       - name: Set the published version from the tag
         # napi-v1.2.3 → 1.2.3, applied to the root package and every platform one.
         if: startsWith(github.ref, 'refs/tags/napi-v')
         run: |
           version="${GITHUB_REF_NAME#napi-v}"
-          npm version "$version" --no-git-tag-version --allow-same-version
+          npm version "$version" --no-git-tag-version --allow-same-version --ignore-scripts
           pnpm exec napi version
+        working-directory: crates/hearth-napi
+
+      - name: Stage identical generated bindings from every target
+        run: |
+          node scripts/verify-napi-release-versions.mjs --stage-build-bindings \
+            crates/hearth-napi crates/hearth-napi/artifacts
+
+      - name: Collect artifacts into platform packages
+        run: pnpm exec napi artifacts --output-dir artifacts
         working-directory: crates/hearth-napi
 
       - name: Link the platform packages into the root package
@@ -210,17 +230,33 @@ jobs:
       - name: Every declared target has a binary
         run: bash scripts/verify-release-artifacts.sh
 
-      # The Linux x64 artifact is the one this runner can execute, so it is the
-      # one that gets an end-to-end check before anything is published.
-      - name: Verify the packed tarball on Node and Bun
+      - name: Root, loader, and platform versions agree
+        run: node scripts/verify-napi-release-versions.mjs
+
+      # `napi artifacts` also copies every collected addon into the root. The
+      # published root intentionally contains none, so remove those assembly
+      # copies before testing the package topology that will actually ship.
+      - name: Remove root-local assembly copies
+        run: rm -f crates/hearth-napi/hearth.*.node
+
+      # Exercise the topology consumers receive: a root package with no addon
+      # of its own loading the separately packed Linux x64 optional package.
+      - name: Pack and install the optional-package layout
+        env:
+          HEARTH_PLATFORM_PACKAGE_DIR: crates/hearth-napi/npm/linux-x64-gnu
+          NAPI_RS_ENFORCE_VERSION_CHECK: 1
+        run: bash scripts/verify-tarball.sh
+
+      # verify-tarball exports HEARTH_ENTRY through GITHUB_ENV, which becomes
+      # visible only to steps after the installer exits.
+      - name: Verify the installed tarball on Node and Bun
+        env:
+          NAPI_RS_ENFORCE_VERSION_CHECK: 1
         run: |
-          cp crates/hearth-napi/npm/linux-x64-gnu/hearth.linux-x64-gnu.node crates/hearth-napi/
-          bash scripts/verify-tarball.sh
           node crates/hearth-napi/smoke.mjs
           node crates/hearth-napi/__test__/contract.mjs
           bun crates/hearth-napi/smoke.mjs
           bun crates/hearth-napi/__test__/contract.mjs
-          rm -f crates/hearth-napi/hearth.linux-x64-gnu.node
 
       # Hand the *verified* tree to the publish job rather than rebuilding it,
       # so what gets published is exactly what was tested.
@@ -319,7 +355,9 @@ jobs:
           path: crates/hearth-napi
 
       - name: Re-check the assembled packages
-        run: bash scripts/verify-release-artifacts.sh
+        run: |
+          bash scripts/verify-release-artifacts.sh
+          node scripts/verify-napi-release-versions.mjs
 
       # No NODE_AUTH_TOKEN: npm authenticates via OIDC trusted publishing, and
       # generates provenance attestations automatically for it — `--provenance`

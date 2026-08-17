@@ -36,9 +36,13 @@ Adding a target means adding it there, adding a matching runner to
 `scripts/verify-release-artifacts.sh`, and running `pnpm run create-npm-dirs`
 to generate the new platform package.
 
-`index.js` and `index.d.ts` are **committed**, not generated at publish time:
-they are the package's public API surface, so a change to them belongs in a
-diff a reviewer sees. CI fails if they are out of date with the Rust source.
+`index.js` and `index.d.ts` are **committed** as the reviewable public API
+surface, and CI fails if they are out of date with the Rust source. A release
+has one necessary generated variation: `napi build` embeds the root package
+version in `index.js`, so each matrix build applies the tag version first and
+transports its generated bindings. The verify job requires all target copies to
+be byte-identical before staging one ESM loader into the release tree, and also
+requires every generated `index.d.ts` to match the committed declaration file.
 
 ## Versioning
 
@@ -49,26 +53,35 @@ from the git tag:
 napi-v<major>.<minor>.<patch>
 ```
 
-The release workflow strips the `napi-v` prefix, runs `npm version` on the root
-package and `napi version` to propagate it to `npm/*`. Nothing else needs
-editing — do not hand-bump `package.json` before tagging, or the workflow will
-be setting the version it already has (harmless, but it means the tag is no
-longer the single source of truth).
+The release workflow strips the `napi-v` prefix and runs `npm version` on the
+root package before each matrix build so the generated loader embeds that
+version. The verify job applies the same root version and runs `napi version`
+to propagate it to `npm/*`. Nothing needs hand-editing — do not bump
+`package.json` before tagging, or the tag is no longer the single source of
+truth.
 
 The Rust crates carry their own `version` in the workspace `Cargo.toml` and are
 released independently; they are not published to crates.io today.
 
 ## The jobs
 
-**build** — every target on a native runner, smoke-testing each fresh binary.
+**build** — applies the tag-derived root version, builds every target on a
+native runner, smoke-tests each fresh binary, and transports each target's
+binary plus generated ESM loader and declarations to verification.
 
-**verify** — downloads the artifacts, lays them out into `npm/*`
-(`napi artifacts`), applies the tag's version everywhere, writes the root
-package's `optionalDependencies` (`napi pre-publish`), asserts every declared
-target has a binary (`scripts/verify-release-artifacts.sh`), then packs the
-tarball, installs it into a scratch directory, and runs the smoke and contract
-suites against the *installed* copy on Node and Bun. It uploads the verified
-tree.
+**verify** — downloads the artifacts, applies the tag's version everywhere,
+byte-compares the generated bindings from all targets, stages the common
+loader, and lays the binaries out into `npm/*` (`napi artifacts`). It then
+writes the root package's `optionalDependencies` (`napi pre-publish`), asserts
+every declared target has a binary (`scripts/verify-release-artifacts.sh`), and
+checks that the root,
+loader guards, optional dependencies, and platform manifests carry exactly one
+version (`scripts/verify-napi-release-versions.mjs`). `napi artifacts` leaves
+assembly copies of the addons in the root, so verify removes them before it
+packs the root and Linux x64 platform packages separately. It installs both
+into a scratch directory with strict version checking enabled and runs the
+smoke and contract suites against the *installed* copy on Node and Bun. It
+uploads the verified tree.
 
 **publish** — gated on the `npm-publish` environment, and the only job with
 `id-token: write`. It publishes the tree the previous job verified, rather than

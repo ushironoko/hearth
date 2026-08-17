@@ -77,9 +77,16 @@ downloadable, so this needs no guessing:
 gh run download <run-id> --repo ushironoko/hearth --dir /tmp/rel-check
 ```
 
-Check that `release-tree/package.json` carries the tag's version and
-`optionalDependencies` pinned to that same version, and that each
-`release-tree/npm/*/` holds the `.node` its `main` field names.
+Confirm that the `Stage identical generated bindings from every target` step
+passed. Then check that `release-tree/package.json` carries the tag's version
+and `optionalDependencies` pinned to that same version, that the staged loader
+expects the release version, and that each `release-tree/npm/*/` holds the
+`.node` its `main` field names. From the repository checkout, the version
+invariant is executable:
+
+```bash
+node scripts/verify-napi-release-versions.mjs /tmp/rel-check/release-tree
+```
 
 ## 4. Verify after publishing
 
@@ -174,6 +181,8 @@ new target needs the one-time bootstrap for that package only — see
 ## Dry runs
 
 `workflow_dispatch` with `dry_run: true` builds and verifies everything and
-publishes nothing, writing the `npm pack` listing to the run summary. Use it to
-see what a release would ship. It does not exercise publish authentication —
-only a real publish does.
+publishes nothing, writing the `npm pack` listing to the run summary. When run
+from a `napi-v*` ref it also proves the tag-derived generated-loader version;
+on `main`, the repository version remains the expected version. Use it to see
+what a release would ship. It does not exercise publish authentication — only
+a real publish does.
