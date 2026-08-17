@@ -825,16 +825,6 @@ fn circular_tsconfig_extends_is_failed_and_tracks_the_cycle() {
     assert_eq!(failed_kind(&outcome), FailedKind::Config);
 }
 
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "from_file must be absolute")]
-fn relative_from_file_triggers_debug_assert() {
-    let resolver = js_resolver(JsResolveOptions::default());
-
-    let _ = resolver.resolve("src/app.ts", &raw_import("./module", ImportKind::EsStatic));
-}
-
-#[cfg(not(debug_assertions))]
 #[test]
 fn relative_from_file_returns_failed() {
     let resolver = js_resolver(JsResolveOptions::default());
@@ -864,7 +854,7 @@ fn empty_specifier_is_an_invalid_specifier_failure() {
 
 #[test]
 fn filesystem_errors_are_partial_io_failures() {
-    let root = Path::new("/virtual-hearth-io-error-root");
+    let root = virtual_root("io-error");
     let importer = root.join("src/app.ts");
     let broken_link = root.join("src/blocked.ts");
     let filesystem = MemoryFileSystem::with_files([
@@ -945,7 +935,7 @@ fn vue_graph_nodes_keep_the_javascript_resolver_live() {
 
 #[test]
 fn resolves_with_an_in_memory_filesystem() {
-    let root = Path::new("/virtual-hearth-test-root");
+    let root = virtual_root("relative-resolution");
     let importer = root.join("src/app.ts");
     let expected = root.join("src/util.ts");
     let filesystem = MemoryFileSystem::with_files([
@@ -960,6 +950,66 @@ fn resolves_with_an_in_memory_filesystem() {
     );
 
     assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+}
+
+#[test]
+fn injected_filesystem_resolves_a_virtual_tsconfig_alias() {
+    let root = virtual_root("tsconfig-alias");
+    let importer = root.join("src/app.ts");
+    let tsconfig = root.join("tsconfig.json");
+    let expected = root.join("virtual/mod.ts");
+    let filesystem = MemoryFileSystem::with_files([
+        (importer.clone(), String::new()),
+        (
+            tsconfig.clone(),
+            r##"{"compilerOptions":{"baseUrl":".","paths":{"#virtual/*":["virtual/*"]}}}"##.into(),
+        ),
+        (expected.clone(), "export const virtualValue = 1;".into()),
+    ]);
+    let resolver = js_resolver_with_fs(
+        filesystem,
+        JsResolveOptions {
+            tsconfig: Some(tsconfig.clone()),
+            ..JsResolveOptions::default()
+        },
+    );
+
+    let outcome = resolver.resolve(
+        path_str(&importer),
+        &raw_import("#virtual/mod", ImportKind::EsStatic),
+    );
+
+    assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+    assert_dependency(&outcome, &tsconfig);
+}
+
+#[test]
+fn injected_filesystem_resolves_virtual_package_exports() {
+    let root = virtual_root("package-exports");
+    let importer = root.join("src/app.ts");
+    let package_json = root.join("node_modules/virtual-package/package.json");
+    let expected = root.join("node_modules/virtual-package/dist/index.js");
+    let filesystem = MemoryFileSystem::with_files([
+        (importer.clone(), String::new()),
+        (
+            package_json.clone(),
+            r#"{"name":"virtual-package","exports":"./dist/index.js"}"#.into(),
+        ),
+        (expected.clone(), "export const virtualValue = 1;".into()),
+    ]);
+    let resolver = js_resolver_with_fs(filesystem, JsResolveOptions::default());
+
+    let outcome = resolver.resolve(
+        path_str(&importer),
+        &raw_import("virtual-package", ImportKind::EsStatic),
+    );
+
+    assert_eq!(
+        outcome.resolved,
+        Resolved::External("virtual-package".into())
+    );
+    assert_dependency(&outcome, &package_json);
+    assert_dependency(&outcome, &expected);
 }
 
 #[test]
@@ -1059,6 +1109,14 @@ fn raw_import(specifier: &str, kind: ImportKind) -> RawImport {
         line: 1,
         span: (0, specifier.len() as u32),
     }
+}
+
+fn virtual_root(name: &str) -> PathBuf {
+    let root = std::env::current_dir()
+        .expect("current directory must be available")
+        .join(format!(".hearth-virtual-{name}"));
+    assert!(root.is_absolute(), "virtual root must be absolute");
+    root
 }
 
 fn path_str(path: &Path) -> &str {

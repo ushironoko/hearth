@@ -83,7 +83,7 @@ impl Default for JsResolveOptions {
 
 /// Build a JavaScript resolver backed by the operating system filesystem.
 pub fn js_resolver(options: JsResolveOptions) -> Box<dyn Resolve> {
-    build_js_resolver(FileSystemOs::new(), options)
+    build_js_resolver(SecureOsFileSystem::new(), options)
 }
 
 /// Build a JavaScript resolver backed by an injected filesystem.
@@ -141,10 +141,6 @@ impl Resolve for JsResolver {
         }
 
         let from_path = Path::new(from_file);
-        debug_assert!(
-            from_path.is_absolute(),
-            "from_file must be absolute: {from_file}"
-        );
         if !from_path.is_absolute() {
             return unresolved(
                 failed(FailedKind::InvalidSpecifier, "from_file must be absolute"),
@@ -835,6 +831,40 @@ fn read_resolver_file(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 #[derive(Clone)]
+struct SecureOsFileSystem(FileSystemOs);
+
+impl FileSystem for SecureOsFileSystem {
+    fn new() -> Self {
+        Self(FileSystemOs::new())
+    }
+
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        read_resolver_file(path)
+    }
+
+    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        let bytes = self.read(path)?;
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<oxc_resolver::FileMetadata> {
+        self.0.metadata(path)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> io::Result<oxc_resolver::FileMetadata> {
+        self.0.symlink_metadata(path)
+    }
+
+    fn read_link(&self, path: &Path) -> Result<PathBuf, ResolveError> {
+        self.0.read_link(path)
+    }
+
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        self.0.canonicalize(path)
+    }
+}
+
+#[derive(Clone)]
 struct SharedFileSystem(Arc<dyn FileSystem>);
 
 impl SharedFileSystem {
@@ -845,16 +875,15 @@ impl SharedFileSystem {
 
 impl FileSystem for SharedFileSystem {
     fn new() -> Self {
-        Self::from_file_system(FileSystemOs::new())
+        Self::from_file_system(SecureOsFileSystem::new())
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        read_resolver_file(path)
+        self.0.read(path)
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
-        let bytes = self.read(path)?;
-        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        self.0.read_to_string(path)
     }
 
     fn metadata(&self, path: &Path) -> io::Result<oxc_resolver::FileMetadata> {
