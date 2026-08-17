@@ -103,6 +103,33 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets
 
+  hearth-graph-windows:
+    name: hearth-graph (windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: rustc --version && cargo --version && cargo clippy --version
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ env.RUST_CACHE_SAVE }}
+
+      - name: Check hearth-graph default features
+        run: cargo check -p hearth-graph --all-targets
+
+      - name: Lint focused resolve-js build
+        run: cargo clippy -p hearth-graph --no-default-features --features resolve-js --lib -- -D warnings
+
+      - name: Test focused resolve-js build
+        run: cargo test -p hearth-graph --no-default-features --features resolve-js --lib
+
   napi:
     name: napi (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}

@@ -1,12 +1,15 @@
 //! JavaScript and TypeScript resolution through `oxc_resolver`.
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, io,
     io::Read,
-    os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -29,6 +32,15 @@ const MAX_RESOLVER_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TSCONFIG_EXTENDS_ENTRIES: usize = 32;
 const MAX_TSCONFIG_EXTENDS_VISITS: usize = 256;
 const MAX_RESOLUTION_MEMO_ENTRIES: usize = 65_536;
+
+#[cfg(any(windows, test))]
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+#[cfg(any(windows, test))]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// Configuration for JavaScript and TypeScript module resolution.
 #[derive(Debug, Clone)]
@@ -712,6 +724,86 @@ struct TsconfigTracking {
     truncated: bool,
 }
 
+#[cfg(unix)]
+fn open_resolver_file(path: &Path) -> io::Result<std::fs::File> {
+    // O_NOFOLLOW binds final-component symlink rejection to this open, while
+    // O_NONBLOCK prevents a hostile FIFO from blocking before fstat rejects it.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_resolver_file(path: &Path) -> io::Result<std::fs::File> {
+    // Open the named object rather than traversing a reparse point. Backup
+    // semantics lets the same handle-based validation reject directories too.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_resolver_file(_path: &Path) -> io::Result<std::fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure resolver config reads are unsupported on this target",
+    ))
+}
+
+#[cfg(unix)]
+fn opened_resolver_file_is_regular(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
+#[cfg(windows)]
+fn opened_resolver_file_is_regular(metadata: &std::fs::Metadata) -> bool {
+    windows_file_attributes_are_regular(metadata.file_attributes())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn opened_resolver_file_is_regular(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(any(windows, test))]
+fn windows_file_attributes_are_regular(attributes: u32) -> bool {
+    attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
+}
+
+fn resolver_file_capacity(is_regular: bool, file_len: u64) -> io::Result<usize> {
+    if !is_regular || file_len > MAX_RESOLVER_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resolver config must be a regular file no larger than 1 MiB",
+        ));
+    }
+    Ok(file_len as usize)
+}
+
+fn read_resolver_contents(reader: &mut impl Read, initial_capacity: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    reader
+        .take(MAX_RESOLVER_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RESOLVER_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resolver config exceeds 1 MiB",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_resolver_file(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = open_resolver_file(path)?;
+    let metadata = file.metadata()?;
+    let capacity =
+        resolver_file_capacity(opened_resolver_file_is_regular(&metadata), metadata.len())?;
+    read_resolver_contents(&mut file, capacity)
+}
+
 #[derive(Clone)]
 struct SharedFileSystem(Arc<dyn FileSystem>);
 
@@ -727,28 +819,7 @@ impl FileSystem for SharedFileSystem {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > MAX_RESOLVER_FILE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "resolver config must be a regular file no larger than 1 MiB",
-            ));
-        }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.by_ref()
-            .take(MAX_RESOLVER_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_RESOLVER_FILE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "resolver config exceeds 1 MiB",
-            ));
-        }
-        Ok(bytes)
+        read_resolver_file(path)
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
@@ -792,5 +863,99 @@ impl Drop for InFlightResolve<'_> {
     fn drop(&mut self) {
         let previous = self.counter.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "in-flight resolve counter underflowed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn secure_resolver_read_accepts_a_regular_file_at_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        std::fs::write(&path, vec![b'x'; MAX_RESOLVER_FILE_BYTES as usize]).unwrap();
+
+        let contents = read_resolver_file(&path).unwrap();
+
+        assert_eq!(contents.len() as u64, MAX_RESOLVER_FILE_BYTES);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn secure_resolver_read_rejects_an_oversized_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        std::fs::write(&path, vec![b'x'; MAX_RESOLVER_FILE_BYTES as usize + 1]).unwrap();
+
+        let error = read_resolver_file(&path).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bounded_read_rejects_growth_after_opened_metadata_was_checked() {
+        let mut contents = Cursor::new(vec![b'x'; MAX_RESOLVER_FILE_BYTES as usize + 1]);
+
+        let error =
+            read_resolver_contents(&mut contents, MAX_RESOLVER_FILE_BYTES as usize).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn secure_resolver_read_rejects_a_directory() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let error = read_resolver_file(directory.path()).unwrap_err();
+
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_resolver_read_rejects_a_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.json");
+        let link = directory.path().join("link.json");
+        std::fs::write(&target, b"{}").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(read_resolver_file(&link).is_err());
+    }
+
+    #[test]
+    fn windows_attributes_reject_directories_and_all_reparse_points() {
+        const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+
+        assert!(windows_file_attributes_are_regular(FILE_ATTRIBUTE_NORMAL));
+        assert!(windows_file_attributes_are_regular(FILE_ATTRIBUTE_ARCHIVE));
+        assert!(!windows_file_attributes_are_regular(
+            FILE_ATTRIBUTE_DIRECTORY
+        ));
+        assert!(!windows_file_attributes_are_regular(
+            FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+        assert!(!windows_file_attributes_are_regular(
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    #[test]
+    fn secure_resolver_reads_fail_closed_on_unsupported_targets() {
+        let error = read_resolver_file(Path::new("config.json")).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 }
