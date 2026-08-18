@@ -136,6 +136,23 @@ function hearthTool(engine) {
 const piDefaultTool = createFindToolDefinition(CORPUS);
 const residentEngine = new HearthEngine(engineOptions);
 const hearthWarmTool = hearthTool(residentEngine);
+let activeFreshEngine;
+const hearthFreshTool = createFindToolDefinition(CORPUS, {
+  operations: {
+    exists,
+    glob: async (pattern, root, options) => {
+      assert.ok(activeFreshEngine, "fresh benchmark engine must be installed for the sample");
+      return (
+        await activeFreshEngine.findAsync({
+          pattern,
+          path: root,
+          limit: options.limit,
+          excludeGlobs: options.ignore,
+        })
+      ).paths;
+    },
+  },
+});
 
 async function execute(tool, args) {
   return tool.execute("find-benchmark", args, undefined, undefined, undefined);
@@ -258,9 +275,13 @@ function percentile(ordered, quantile) {
 async function benchmarkScenario(scenario, scenarioIndex) {
   const implementations = {
     pi: () => execute(piDefaultTool, scenario.args),
-    fresh: () => {
-      const engine = new HearthEngine(engineOptions);
-      return execute(hearthTool(engine), scenario.args);
+    fresh: async () => {
+      activeFreshEngine = new HearthEngine(engineOptions);
+      try {
+        return await execute(hearthFreshTool, scenario.args);
+      } finally {
+        activeFreshEngine = undefined;
+      }
     },
     warm: () => execute(hearthWarmTool, scenario.args),
   };
@@ -355,7 +376,7 @@ function renderMarkdown({ matchingPaths, results, fdVersion, fdSha256, generated
     "## Scope and fairness",
     "",
     "- This measures Pi's real tool-operation path, not raw `fd`: default execution includes child spawn, line parsing, path relativization, limit detection, and output truncation. The Hearth row goes through the same Pi wrapper and its custom `exists`/`glob` hooks, backed by `findAsync` so cold walks do not block the JavaScript event loop.",
-    "- Pi package import, Pi tool discovery/download, Hearth addon import, corpus generation, and UI rendering are outside the timed region.",
+    "- Pi package import, Pi tool discovery/download, Hearth addon import, corpus generation, Pi wrapper construction, and UI rendering are outside the timed region for every row. The fresh row includes only new Hearth engine construction plus execution.",
     "- `Hearth resident` reuses one engine and its walk snapshot. `Hearth fresh engine` constructs a new engine for every operation. All rows still benefit from the operating-system page cache; this is not a disk-cold benchmark.",
     "- Pi's custom `glob` hook does not expose the operation AbortSignal, so the adapter cannot forward cancellation even though direct `findAsync(params, signal)` callers can; async still preserves event-loop responsiveness.",
     "- The broad row intentionally uses Pi's default 1000-result limit. Uncapped path-set equality is checked first because fd does not promise the same capped prefix ordering as Hearth's deterministic raw-path order.",

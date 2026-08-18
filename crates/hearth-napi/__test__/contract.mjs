@@ -585,8 +585,8 @@ test("trustCache serves warm bytes until invalidated", () => {
   writeFileSync(path, "after\n"); // out of band, behind Hearth's back
   assert.equal(engine.read({ path }).content, "before\n");
 
-  const dropped = engine.invalidatePath(path);
-  assert.equal(dropped.filesInvalidated, 1);
+  const dropped = engine.invalidatePath("warm.txt");
+  assert.equal(dropped.filesInvalidated, 1, "relative invalidation resolves against engine cwd");
   assert.equal(engine.read({ path }).content, "after\n");
 });
 

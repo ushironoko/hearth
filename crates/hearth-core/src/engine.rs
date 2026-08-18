@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use hearth_proto::{CacheScope, InvalidateResult, ShellSpec};
 use parking_lot::Mutex;
 use std::any::{Any, TypeId};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -150,31 +150,20 @@ pub struct Engine {
     inner: Arc<EngineInner>,
 }
 
-fn absolute_lexical_cwd(path: PathBuf) -> PathBuf {
-    let absolute = if path.is_absolute() {
+fn absolute_cwd(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
         path
     } else {
+        // Preserve `.`/`..`: the OS must resolve them after any preceding
+        // symlink components. Lexical removal can change the filesystem target.
         std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(path))
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
     }
-    normalized
 }
 
 impl Engine {
     /// Build an engine with the given configuration, starting the optimizer.
     pub fn new(mut config: EngineConfig) -> Self {
-        config.default_cwd = absolute_lexical_cwd(config.default_cwd);
+        config.default_cwd = absolute_cwd(config.default_cwd);
         let files = Arc::new(FileCache::with_limits(
             config.max_cache_bytes,
             config.max_cached_files,
@@ -261,6 +250,16 @@ impl Engine {
     #[inline]
     pub fn tuning(&self) -> &Tuning {
         &self.inner.tuning
+    }
+
+    /// Resolve a caller path against this engine without lexically removing
+    /// `..`; the OS must process it after resolving preceding symlinks.
+    pub fn resolve_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.inner.config.default_cwd.join(path)
+        }
     }
 
     /// Get (creating on first use) a per-engine extension of type `T`. Tools use
@@ -351,9 +350,10 @@ impl Engine {
     /// Drop `path` from the file cache, and any cached walk that could have
     /// enumerated it. Use after a mutation Hearth did not perform itself.
     pub fn invalidate_path(&self, path: &Path) -> InvalidateResult {
-        let files = u64::from(self.inner.files.invalidate(path));
-        let walks = self.inner.walks.invalidate_under(path) as u64;
-        self.inner.invalidations.record(path);
+        let path = self.resolve_path(path);
+        let files = u64::from(self.inner.files.invalidate(&path));
+        let walks = self.inner.walks.invalidate_under(&path) as u64;
+        self.inner.invalidations.record(&path);
         InvalidateResult {
             files_invalidated: files,
             walks_invalidated: walks,
@@ -366,9 +366,10 @@ impl Engine {
     /// command: an arbitrary command can create, delete, rename, or rewrite
     /// anything under its cwd, and no cheaper invalidation is sound.
     pub fn invalidate_root(&self, root: &Path) -> InvalidateResult {
+        let root = self.resolve_path(root);
         let result = InvalidateResult {
-            files_invalidated: self.inner.files.invalidate_prefix(root) as u64,
-            walks_invalidated: self.inner.walks.invalidate_under(root) as u64,
+            files_invalidated: self.inner.files.invalidate_prefix(&root) as u64,
+            walks_invalidated: self.inner.walks.invalidate_under(&root) as u64,
         };
         self.inner.invalidations.record_wipe();
         result
@@ -376,18 +377,19 @@ impl Engine {
 
     /// The scoped/recursive form the protocol exposes.
     pub fn invalidate(&self, path: &Path, recursive: bool, scope: CacheScope) -> InvalidateResult {
+        let path = self.resolve_path(path);
         let files = matches!(scope, CacheScope::Files | CacheScope::All);
         let walks = matches!(scope, CacheScope::Walks | CacheScope::All);
         let result = InvalidateResult {
             files_invalidated: if !files {
                 0
             } else if recursive {
-                self.inner.files.invalidate_prefix(path) as u64
+                self.inner.files.invalidate_prefix(&path) as u64
             } else {
-                u64::from(self.inner.files.invalidate(path))
+                u64::from(self.inner.files.invalidate(&path))
             },
             walks_invalidated: if walks {
-                self.inner.walks.invalidate_under(path) as u64
+                self.inner.walks.invalidate_under(&path) as u64
             } else {
                 0
             },
@@ -395,7 +397,7 @@ impl Engine {
         if recursive {
             self.inner.invalidations.record_wipe();
         } else {
-            self.inner.invalidations.record(path);
+            self.inner.invalidations.record(&path);
         }
         result
     }
@@ -439,10 +441,11 @@ impl Engine {
     /// add or remove many. Overwriting an ordinary existing file changes
     /// nothing a walk recorded, so the common case costs one boolean test.
     pub fn note_mutation(&self, path: &Path, created: bool) {
-        if created || is_ignore_file(path) {
-            self.inner.walks.invalidate_under(path);
+        let path = self.resolve_path(path);
+        if created || is_ignore_file(&path) {
+            self.inner.walks.invalidate_under(&path);
         }
-        self.inner.invalidations.record(path);
+        self.inner.invalidations.record(&path);
     }
 
     /// Render the profiler report, prefixed with live cache/optimizer state.
@@ -573,18 +576,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relative_default_cwd_is_normalized_once_for_shared_cache_keys() {
+    fn relative_default_cwd_is_made_absolute_without_removing_parent_components() {
         let process_cwd = std::env::current_dir().unwrap();
+        let spelling = PathBuf::from("relative/base/../target");
         let engine = Engine::new(EngineConfig {
-            default_cwd: PathBuf::from("relative/./base/../base"),
+            default_cwd: spelling.clone(),
             enable_optimizer: false,
             ..EngineConfig::default()
         });
 
-        assert_eq!(
-            engine.config().default_cwd,
-            process_cwd.join("relative/base")
-        );
+        assert_eq!(engine.config().default_cwd, process_cwd.join(spelling));
         assert!(engine.config().default_cwd.is_absolute());
     }
 

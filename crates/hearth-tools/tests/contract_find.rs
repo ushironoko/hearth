@@ -333,6 +333,7 @@ fn symlink_results_follow_pi_entry_and_traversal_rules() {
     symlink("target/a.txt", dir.path().join("link-file")).unwrap();
     symlink("target", dir.path().join("link-dir")).unwrap();
     symlink("missing", dir.path().join("dangling")).unwrap();
+    symlink("missing-nested", dir.path().join("target/nested-dangling")).unwrap();
     let eng = engine(dir.path());
 
     let plain = find(&eng, &params(dir.path(), "link-*")).unwrap();
@@ -368,6 +369,15 @@ fn symlink_results_follow_pi_entry_and_traversal_rules() {
     )
     .unwrap();
     assert_eq!(descendant.paths, vec!["link-dir/a.txt"]);
+    let nested_dangling = find(
+        &eng,
+        &FindParams {
+            follow_symlinks: true,
+            ..params(dir.path(), "link-dir/nested-dangling")
+        },
+    )
+    .unwrap();
+    assert_eq!(nested_dangling.paths, vec!["link-dir/nested-dangling"]);
 
     symlink("missing-hidden", dir.path().join(".hidden-dangling")).unwrap();
     symlink("missing-ignored", dir.path().join("ignored-link")).unwrap();

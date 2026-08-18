@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use hearth_proto::ToolResult;
 use ignore::{WalkBuilder, WalkState};
 use parking_lot::Mutex;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,6 +70,10 @@ pub struct WalkEntry {
     pub symlinks: Arc<Vec<PathBuf>>,
     /// Present only when traversal failed. Failed snapshots are never cached.
     pub failure: Option<WalkFailure>,
+    /// Backward-compatible completeness bit. New callers should inspect
+    /// [`Self::failure`] for a typed cause when this is false.
+    #[deprecated(note = "inspect WalkEntry::failure for the typed cause")]
+    pub complete: bool,
     retained_path_bytes: usize,
     last_access: AtomicU64,
 }
@@ -175,12 +180,15 @@ impl WalkCache {
             .chain(&symlinks)
             .map(|path| path.as_os_str().len())
             .sum();
+        let complete = failure.is_none();
+        #[allow(deprecated)]
         let entry = Arc::new(WalkEntry {
             root: root.to_path_buf(),
             files: Arc::new(files),
             directories: Arc::new(directories),
             symlinks: Arc::new(symlinks),
             failure,
+            complete,
             retained_path_bytes,
             last_access: AtomicU64::new(0),
         });
@@ -323,14 +331,14 @@ impl WalkCache {
                             sink.lock().dangling_errors.push(path.to_path_buf());
                             return WalkState::Continue;
                         }
-                        sink.lock().failures.push(ignore_failure(&error, root));
+                        sink.lock().failures.extend(ignore_failures(&error, root));
                         return WalkState::Continue;
                     }
                 };
                 if let Some(error) = entry.error() {
                     sink.lock()
                         .failures
-                        .push(ignore_failure(error, entry.path()));
+                        .extend(ignore_failures(error, entry.path()));
                 }
                 // The walker yields the root at depth zero; it is traversal
                 // context, never a find result.
@@ -408,40 +416,43 @@ impl WalkCache {
         (files, directories, symlinks, failure)
     }
 
-    /// Re-run only the rare dangling-link admission decision without following
-    /// links. This is necessary because walkdir reports a followed dangling
-    /// target as an error before `ignore` can apply hidden/custom rules.
+    /// Apply the configured hidden/ignore policy directly to dangling-link
+    /// candidates. A traversal with following disabled cannot reach candidates
+    /// below a followed directory alias; incremental matchers can classify the
+    /// root-relative spelling without traversing it.
     fn admitted_dangling_symlinks(
         &self,
         root: &Path,
         opts: WalkKey,
         candidates: &[PathBuf],
     ) -> Result<Vec<PathBuf>, WalkFailure> {
-        let mut builder = self.configured_builder(root, opts, false);
-        builder.threads(1);
+        let builder = self.configured_builder(root, opts, false);
+        let mut matchers = builder.build_matchers();
+        let Some(mut matcher) = matchers.pop() else {
+            return Err(WalkFailure::Io {
+                kind: std::io::ErrorKind::InvalidData,
+                path: root.to_path_buf(),
+                message: "walk builder did not produce a root ignore matcher".to_string(),
+            });
+        };
         let mut admitted = Vec::new();
-        let mut visited = 0usize;
         let mut path_bytes = 0usize;
-        for result in builder.build() {
-            let entry = result.map_err(|error| ignore_failure(&error, root))?;
-            if let Some(error) = entry.error() {
-                return Err(ignore_failure(error, entry.path()));
-            }
-            visited = visited.saturating_add(1);
-            path_bytes = path_bytes.saturating_add(entry.path().as_os_str().len());
-            if visited > self.max_visited_entries || path_bytes > self.max_path_bytes {
+        for (visited, candidate) in candidates.iter().enumerate() {
+            path_bytes = path_bytes.saturating_add(candidate.as_os_str().len());
+            if visited >= self.max_visited_entries || path_bytes > self.max_path_bytes {
                 return Err(WalkFailure::BudgetExceeded);
             }
-            if entry.depth() > 0
-                && entry.path_is_symlink()
-                && candidates
-                    .binary_search_by(|path| path.as_path().cmp(entry.path()))
-                    .is_ok()
-            {
-                admitted.push(entry.into_path());
-                if admitted.len() == candidates.len() {
-                    break;
-                }
+            let relative = candidate.strip_prefix(root).map_err(|_| WalkFailure::Io {
+                kind: std::io::ErrorKind::InvalidData,
+                path: candidate.clone(),
+                message: "dangling candidate is outside its walk root".to_string(),
+            })?;
+            let (matched, error) = matcher.matched_with_errors(relative, false);
+            if let Some(error) = error {
+                return Err(primary_ignore_failure(&error, candidate));
+            }
+            if !matched.is_ignore() {
+                admitted.push(candidate.clone());
             }
         }
         Ok(admitted)
@@ -467,7 +478,8 @@ impl WalkCache {
                     .file_type()
                     .map_err(|error| WalkFailure::io(&path, &error))?;
                 let name = entry.file_name();
-                if matches!(name.to_str(), Some(".ignore" | ".rgignore")) {
+                if opts.respect_gitignore && matches!(name.to_str(), Some(".ignore" | ".rgignore"))
+                {
                     let metadata = std::fs::symlink_metadata(&path)
                         .map_err(|error| WalkFailure::io(&path, &error))?;
                     if !metadata.file_type().is_file() {
@@ -477,9 +489,23 @@ impl WalkCache {
                             message: "ignore path must be a regular file".to_string(),
                         });
                     }
-                    ignore_bytes = ignore_bytes.saturating_add(metadata.len());
-                    if ignore_bytes > MAX_IGNORE_BYTES {
+                    if metadata.len() > MAX_IGNORE_BYTES.saturating_sub(ignore_bytes) {
                         return Err(WalkFailure::BudgetExceeded);
+                    }
+                    let mut file = std::fs::File::open(&path)
+                        .map_err(|error| WalkFailure::io(&path, &error))?;
+                    let mut buffer = [0u8; 8192];
+                    loop {
+                        let read = file
+                            .read(&mut buffer)
+                            .map_err(|error| WalkFailure::io(&path, &error))?;
+                        if read == 0 {
+                            break;
+                        }
+                        ignore_bytes = ignore_bytes.saturating_add(read as u64);
+                        if ignore_bytes > MAX_IGNORE_BYTES {
+                            return Err(WalkFailure::BudgetExceeded);
+                        }
                     }
                 }
                 let followed_dir = if opts.follow_symlinks && file_type.is_symlink() {
@@ -552,26 +578,48 @@ fn walk_failure_order(left: &WalkFailure, right: &WalkFailure) -> std::cmp::Orde
     }
 }
 
-fn ignore_failure(error: &ignore::Error, fallback: &Path) -> WalkFailure {
-    WalkFailure::Io {
-        kind: error
-            .io_error()
-            .map_or(std::io::ErrorKind::InvalidData, std::io::Error::kind),
-        path: ignore_error_path(error).unwrap_or(fallback).to_path_buf(),
-        message: error.to_string(),
-    }
+fn primary_ignore_failure(error: &ignore::Error, fallback: &Path) -> WalkFailure {
+    ignore_failures(error, fallback)
+        .into_iter()
+        .min_by(walk_failure_order)
+        .expect("every ignore error has at least one leaf")
 }
 
-fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
-    match error {
-        ignore::Error::WithPath { path, .. } => Some(path),
-        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
-            ignore_error_path(err)
+fn ignore_failures(error: &ignore::Error, fallback: &Path) -> Vec<WalkFailure> {
+    fn collect(error: &ignore::Error, path: &Path, context: &str, failures: &mut Vec<WalkFailure>) {
+        match error {
+            ignore::Error::Partial(errors) => {
+                for error in errors {
+                    collect(error, path, &error.to_string(), failures);
+                }
+            }
+            ignore::Error::WithPath { path, err } => collect(err, path, context, failures),
+            ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+                collect(err, path, context, failures);
+            }
+            ignore::Error::Loop { child, .. } => failures.push(WalkFailure::Io {
+                kind: std::io::ErrorKind::Other,
+                path: child.clone(),
+                message: context.to_string(),
+            }),
+            ignore::Error::Io(error) => failures.push(WalkFailure::Io {
+                kind: error.kind(),
+                path: path.to_path_buf(),
+                message: context.to_string(),
+            }),
+            ignore::Error::Glob { .. }
+            | ignore::Error::UnrecognizedFileType(_)
+            | ignore::Error::InvalidDefinition => failures.push(WalkFailure::Io {
+                kind: std::io::ErrorKind::InvalidData,
+                path: path.to_path_buf(),
+                message: context.to_string(),
+            }),
         }
-        ignore::Error::Partial(errors) => errors.iter().filter_map(ignore_error_path).min(),
-        ignore::Error::Loop { child, .. } => Some(child),
-        _ => None,
     }
+
+    let mut failures = Vec::new();
+    collect(error, fallback, &error.to_string(), &mut failures);
+    failures
 }
 
 fn dangling_symlink_path(error: &ignore::Error) -> Option<&Path> {
@@ -648,6 +696,10 @@ mod tests {
         let (entry, _) = cache.get(dir.path(), key());
         assert!(entry.files.len() <= 2);
         assert_eq!(entry.failure, Some(WalkFailure::BudgetExceeded));
+        #[allow(deprecated)]
+        {
+            assert!(!entry.complete);
+        }
         assert!(
             entry
                 .files
@@ -696,6 +748,93 @@ mod tests {
     }
 
     #[test]
+    fn disabled_ignore_policy_does_not_validate_ignore_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".ignore")).unwrap();
+        std::fs::write(dir.path().join("file.rs"), b"x").unwrap();
+        let cache = WalkCache::new(1);
+
+        let (disabled, _) = cache.get(dir.path(), key());
+        assert_eq!(disabled.failure, None);
+        assert!(disabled.directories.contains(&dir.path().join(".ignore")));
+
+        let enabled_key = WalkKey {
+            respect_gitignore: true,
+            ..key()
+        };
+        let (enabled, _) = cache.get(dir.path(), enabled_key);
+        assert!(matches!(
+            enabled.failure.as_ref(),
+            Some(WalkFailure::Io {
+                kind: std::io::ErrorKind::InvalidData,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_enabled_ignore_is_a_permission_failure_when_enforced_by_the_os() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ignore = dir.path().join(".ignore");
+        std::fs::write(&ignore, "*.tmp\n").unwrap();
+        std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let os_enforces_mode = std::fs::File::open(&ignore).is_err();
+        let cache = WalkCache::new(1);
+        let opts = WalkKey {
+            respect_gitignore: true,
+            ..key()
+        };
+        let (entry, _) = cache.get(dir.path(), opts);
+        std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        if os_enforces_mode {
+            assert!(matches!(
+                entry.failure.as_ref(),
+                Some(WalkFailure::Io {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                    path,
+                    ..
+                }) if path == &ignore
+            ));
+            assert!(cache.is_empty());
+        }
+    }
+
+    #[test]
+    fn partial_ignore_errors_keep_each_leaf_kind_with_its_path() {
+        let first = PathBuf::from("a.ignore");
+        let second = PathBuf::from("z.ignore");
+        let error = ignore::Error::Partial(vec![
+            ignore::Error::WithPath {
+                path: second,
+                err: Box::new(ignore::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))),
+            },
+            ignore::Error::WithPath {
+                path: first.clone(),
+                err: Box::new(ignore::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "gone",
+                ))),
+            },
+        ]);
+
+        assert!(matches!(
+            primary_ignore_failure(&error, Path::new("fallback")),
+            WalkFailure::Io {
+                kind: std::io::ErrorKind::NotFound,
+                path,
+                ..
+            } if path == first
+        ));
+    }
+
+    #[test]
     fn cancellation_settles_while_the_global_build_lock_is_held() {
         use hearth_proto::ErrorKind;
         use std::sync::mpsc;
@@ -732,6 +871,28 @@ mod tests {
         );
         drop(build_guard);
         worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn followed_alias_admits_nested_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        symlink("missing", target.join("dangling")).unwrap();
+        symlink("target", dir.path().join("alias")).unwrap();
+        let cache = WalkCache::new(1);
+        let opts = WalkKey {
+            follow_symlinks: true,
+            ..key()
+        };
+
+        let (entry, _) = cache.get(dir.path(), opts);
+
+        assert_eq!(entry.failure, None);
+        assert!(entry.symlinks.contains(&dir.path().join("alias/dangling")));
     }
 
     #[cfg(unix)]

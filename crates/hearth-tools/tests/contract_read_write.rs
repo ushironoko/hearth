@@ -7,7 +7,7 @@ use common::{abs, engine, seed};
 use hearth_core::CancelToken;
 use hearth_proto::*;
 use hearth_tools::{read, read_bytes, read_bytes_cancellable, read_cancellable, write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 fn windowed(path: &str, offset: u64, limit: u64, mode: LineWindowMode) -> ReadParams {
     ReadParams {
@@ -75,6 +75,34 @@ fn a_file_without_a_trailing_newline_counts_the_same_in_both_modes() {
     assert!(!slice.ends_with_newline);
     assert_eq!(slice.content, "a\nb");
     assert_eq!(split.content, "a\nb");
+}
+
+#[test]
+fn parent_components_after_a_symlink_keep_os_resolution_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(outside.join("dir")).unwrap();
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("file.txt"), "inside\n").unwrap();
+    std::fs::write(outside.join("file.txt"), "outside\n").unwrap();
+    symlink(outside.join("dir"), repo.join("link")).unwrap();
+    let eng = engine(&repo);
+    let spelling = "link/../file.txt";
+
+    assert_eq!(
+        read(&eng, &ReadParams::new(spelling)).unwrap().content,
+        "outside\n"
+    );
+    write(&eng, &WriteParams::new(spelling, "updated\n")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(outside.join("file.txt")).unwrap(),
+        "updated\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+        "inside\n"
+    );
 }
 
 #[test]

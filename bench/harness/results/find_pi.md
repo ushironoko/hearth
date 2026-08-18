@@ -1,6 +1,6 @@
 # Pi default find vs Hearth-backed Pi find
 
-Generated: 2026-08-18T05:07:41.076Z
+Generated: 2026-08-18T05:37:02.027Z
 
 - Pi package: `@earendil-works/pi-coding-agent@0.84.1`
 - Pi implementation: `@earendil-works/pi-coding-agent/dist/core/tools/find.js` (private `createFindToolDefinition().execute`)
@@ -13,9 +13,9 @@ Generated: 2026-08-18T05:07:41.076Z
 
 | Scenario | Pi default mean | Hearth fresh mean | Hearth resident mean | Pi / fresh | Pi / resident |
 |---|---:|---:|---:|---:|---:|
-| selective `d000/*.rs` | 8.59 ms | 11.30 ms | 1.01 ms | 0.76× | 8.54× |
-| no-match `missing-*.rs` | 8.23 ms | 11.30 ms | 774.9 µs | 0.73× | 10.62× |
-| broad `*.rs`, limit 1000 | 9.54 ms | 11.72 ms | 1.11 ms | 0.81× | 8.59× |
+| selective `d000/*.rs` | 11.41 ms | 15.94 ms | 1.41 ms | 0.72× | 8.10× |
+| no-match `missing-*.rs` | 10.00 ms | 15.44 ms | 1.08 ms | 0.65× | 9.28× |
+| broad `*.rs`, limit 1000 | 13.55 ms | 15.63 ms | 1.75 ms | 0.87× | 7.73× |
 
 Ratios are Pi latency divided by Hearth latency; values above 1 mean Hearth is faster.
 
@@ -23,20 +23,20 @@ Ratios are Pi latency divided by Hearth latency; values above 1 mean Hearth is f
 
 | Scenario | Implementation | p50 | p95 | iterations |
 |---|---|---:|---:|---:|
-| selective `d000/*.rs` | Pi default | 8.80 ms | 9.63 ms | 233 |
-| selective `d000/*.rs` | Hearth fresh engine | 11.50 ms | 12.39 ms | 178 |
-| selective `d000/*.rs` | Hearth resident | 977.7 µs | 1.02 ms | 1989 |
-| no-match `missing-*.rs` | Pi default | 8.40 ms | 9.18 ms | 243 |
-| no-match `missing-*.rs` | Hearth fresh engine | 11.37 ms | 12.25 ms | 178 |
-| no-match `missing-*.rs` | Hearth resident | 773.1 µs | 794.4 µs | 2581 |
-| broad `*.rs`, limit 1000 | Pi default | 9.40 ms | 10.62 ms | 210 |
-| broad `*.rs`, limit 1000 | Hearth fresh engine | 11.59 ms | 13.71 ms | 171 |
-| broad `*.rs`, limit 1000 | Hearth resident | 1.11 ms | 1.14 ms | 1802 |
+| selective `d000/*.rs` | Pi default | 11.40 ms | 12.76 ms | 176 |
+| selective `d000/*.rs` | Hearth fresh engine | 15.16 ms | 17.14 ms | 126 |
+| selective `d000/*.rs` | Hearth resident | 1.38 ms | 1.52 ms | 1421 |
+| no-match `missing-*.rs` | Pi default | 9.88 ms | 11.05 ms | 201 |
+| no-match `missing-*.rs` | Hearth fresh engine | 15.37 ms | 17.42 ms | 130 |
+| no-match `missing-*.rs` | Hearth resident | 1.07 ms | 1.11 ms | 1856 |
+| broad `*.rs`, limit 1000 | Pi default | 13.12 ms | 16.91 ms | 148 |
+| broad `*.rs`, limit 1000 | Hearth fresh engine | 15.37 ms | 18.62 ms | 128 |
+| broad `*.rs`, limit 1000 | Hearth resident | 1.56 ms | 2.24 ms | 1141 |
 
 ## Scope and fairness
 
 - This measures Pi's real tool-operation path, not raw `fd`: default execution includes child spawn, line parsing, path relativization, limit detection, and output truncation. The Hearth row goes through the same Pi wrapper and its custom `exists`/`glob` hooks, backed by `findAsync` so cold walks do not block the JavaScript event loop.
-- Pi package import, Pi tool discovery/download, Hearth addon import, corpus generation, and UI rendering are outside the timed region.
+- Pi package import, Pi tool discovery/download, Hearth addon import, corpus generation, Pi wrapper construction, and UI rendering are outside the timed region for every row. The fresh row includes only new Hearth engine construction plus execution.
 - `Hearth resident` reuses one engine and its walk snapshot. `Hearth fresh engine` constructs a new engine for every operation. All rows still benefit from the operating-system page cache; this is not a disk-cold benchmark.
 - Pi's custom `glob` hook does not expose the operation AbortSignal, so the adapter cannot forward cancellation even though direct `findAsync(params, signal)` callers can; async still preserves event-loop responsiveness.
 - The broad row intentionally uses Pi's default 1000-result limit. Uncapped path-set equality is checked first because fd does not promise the same capped prefix ordering as Hearth's deterministic raw-path order.

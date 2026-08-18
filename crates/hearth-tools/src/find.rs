@@ -9,7 +9,7 @@ use hearth_core::cache::{WalkEntry, WalkKey};
 use hearth_core::{CancelToken, Engine, profile};
 use hearth_proto::{FindParams, FindResult, ToolError, ToolResult};
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 const MAX_PATTERN_BYTES: usize = 4 * 1024;
 const MAX_EXCLUDE_GLOBS: usize = 128;
@@ -39,7 +39,7 @@ pub fn find_cancellable(
         let excludes = ExcludeMatchers::new(&params.exclude_globs)?;
         let limit = params.limit.unwrap_or(DEFAULT_FIND_LIMIT);
 
-        let root = resolve_path(engine, &params.path);
+        let root = lexical_absolute(engine, &params.path)?;
         let metadata = std::fs::metadata(&root).map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => ToolError::not_found(root.display().to_string()),
             _ => ToolError::from(error).with_path(root.display().to_string()),
@@ -137,6 +137,32 @@ fn validate_params(params: &FindParams) -> ToolResult<()> {
         return Err(ToolError::invalid("find exclusion globs exceed 16 KiB"));
     }
     Ok(())
+}
+
+/// Reproduce Pi/Node `path.resolve` for the find root without touching the
+/// filesystem. Other tools retain OS `..` semantics across symlinks.
+fn lexical_absolute(engine: &Engine, path: &str) -> ToolResult<PathBuf> {
+    let resolved = resolve_path(engine, path);
+    let absolute = if resolved.is_absolute() {
+        resolved
+    } else {
+        std::env::current_dir()
+            .map_err(ToolError::from)?
+            .join(resolved)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
 }
 
 fn build_glob(pattern: &str, label: &str, case_insensitive: bool) -> ToolResult<Glob> {
@@ -321,7 +347,7 @@ mod tests {
             enable_optimizer: false,
             ..hearth_core::EngineConfig::default()
         });
-        let normalized = resolve_path(&engine, "a/../b");
+        let normalized = lexical_absolute(&engine, "a/../b").unwrap();
         assert!(normalized.is_absolute());
         assert!(normalized.ends_with("relative/base/b"));
     }

@@ -94,13 +94,13 @@ timing. Results on Apple M4, Node 24.6.0, Pi 0.84.1, and fd 10.4.2:
 
 | Pi find scenario | Pi default | Hearth fresh engine | Hearth resident | resident speedup |
 |---|---:|---:|---:|---:|
-| selective `d000/*.rs` | 8.59 ms | 11.30 ms | **1.01 ms** | **8.54×** |
-| no-match `missing-*.rs` | 8.23 ms | 11.30 ms | **0.775 ms** | **10.62×** |
-| broad `*.rs`, limit 1000 | 9.54 ms | 11.72 ms | **1.11 ms** | **8.59×** |
+| selective `d000/*.rs` | 11.41 ms | 15.94 ms | **1.41 ms** | **8.10×** |
+| no-match `missing-*.rs` | 10.00 ms | 15.44 ms | **1.08 ms** | **9.28×** |
+| broad `*.rs`, limit 1000 | 13.55 ms | 15.63 ms | **1.75 ms** | **7.73×** |
 
 The result is specifically a **resident-cache win**: a fresh Hearth engine is
-1.23–1.37× slower than Pi's fd-backed default, while reuse of one walk snapshot
-makes the replacement 8.54–10.62× faster. The broad Hearth row also computes
+1.15–1.54× slower than Pi's fd-backed default, while reuse of one walk snapshot
+makes the replacement 7.73–9.28× faster. The broad Hearth row also computes
 exact `totalMatches`, even though Pi consumes only `paths`; fd can stop at
 `--max-results 1000`, so Hearth does more semantic work in that row.
 
@@ -109,8 +109,10 @@ discovery/download, module imports, corpus generation, and UI rendering are
 outside the timed region, and every row benefits from the OS page cache. Pi's
 custom `glob` hook does not expose its operation `AbortSignal`, so the adapter
 cannot forward cancellation; direct `findAsync(params, signal)` callers can.
-The async adapter still keeps cold traversal off the JavaScript event loop. The
-harness rejects Pi/fd version drift, records the managed fd binary hash, and
+The async adapter still keeps cold traversal off the JavaScript event loop. Pi
+wrapper construction is outside every timed row; the fresh row includes new
+Hearth engine construction and execution. The harness rejects Pi/fd version
+drift, records the managed fd binary hash, and
 isolates global/system Git ignore configuration. See
 [`bench/harness/results/find_pi.md`](../bench/harness/results/find_pi.md) for
 p50/p95, sample counts, correctness gates, and all reproduction caveats.
