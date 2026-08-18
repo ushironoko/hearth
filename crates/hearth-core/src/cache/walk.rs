@@ -28,10 +28,18 @@ struct CacheKey {
     opts: WalkKey,
 }
 
-/// A cached enumeration of the files under one root.
+/// A cached enumeration of the entries under one root.
 pub struct WalkEntry {
     pub root: PathBuf,
+    /// Target-regular files. This retains the pre-find classification used by
+    /// grep and graph, including followed symlinks to regular files.
     pub files: Arc<Vec<PathBuf>>,
+    /// Target-directories, excluding the root itself. A followed symlink to a
+    /// directory appears here so path-oriented consumers can render `/`.
+    pub directories: Arc<Vec<PathBuf>>,
+    /// Symlinks whose target type was not followed/classified by the walker,
+    /// including dangling links and all links when following is disabled.
+    pub symlinks: Arc<Vec<PathBuf>>,
     /// False when the preflight or walker exhausted a hard work budget.
     pub complete: bool,
     retained_path_bytes: usize,
@@ -110,11 +118,18 @@ impl WalkCache {
             return (Arc::clone(entry.value()), true);
         }
         let generation = self.generation.load(Ordering::Acquire);
-        let (files, complete) = self.build(root, opts);
-        let retained_path_bytes = files.iter().map(|path| path.as_os_str().len()).sum();
+        let (files, directories, symlinks, complete) = self.build(root, opts);
+        let retained_path_bytes = files
+            .iter()
+            .chain(&directories)
+            .chain(&symlinks)
+            .map(|path| path.as_os_str().len())
+            .sum();
         let entry = Arc::new(WalkEntry {
             root: root.to_path_buf(),
             files: Arc::new(files),
+            directories: Arc::new(directories),
+            symlinks: Arc::new(symlinks),
             complete,
             retained_path_bytes,
             last_access: AtomicU64::new(0),
@@ -169,16 +184,7 @@ impl WalkCache {
         }
     }
 
-    fn build(&self, root: &Path, opts: WalkKey) -> (Vec<PathBuf>, bool) {
-        if !self.preflight(root, opts) {
-            return (Vec::new(), false);
-        }
-        // A second preflight immediately before the real walk narrows mutation
-        // races. Correctness under an actively hostile concurrent filesystem is
-        // not claimed; the per-UID daemon is not a sandbox boundary.
-        if !self.preflight(root, opts) {
-            return (Vec::new(), false);
-        }
+    fn configured_builder(&self, root: &Path, opts: WalkKey, follow_links: bool) -> WalkBuilder {
         let mut builder = WalkBuilder::new(root);
         builder
             .hidden(!opts.hidden)
@@ -192,11 +198,35 @@ impl WalkCache {
             .git_exclude(false)
             .ignore(opts.respect_gitignore)
             .parents(false)
-            .follow_links(opts.follow_symlinks)
+            .follow_links(follow_links)
             .threads(self.threads);
+        if opts.respect_gitignore {
+            builder.add_custom_ignore_filename(".rgignore");
+        }
+        builder
+    }
+
+    fn build(
+        &self,
+        root: &Path,
+        opts: WalkKey,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
+        if !self.preflight(root, opts) {
+            return (Vec::new(), Vec::new(), Vec::new(), false);
+        }
+        // A second preflight immediately before the real walk narrows mutation
+        // races. Correctness under an actively hostile concurrent filesystem is
+        // not claimed; the per-UID daemon is not a sandbox boundary.
+        if !self.preflight(root, opts) {
+            return (Vec::new(), Vec::new(), Vec::new(), false);
+        }
+        let mut builder = self.configured_builder(root, opts, opts.follow_symlinks);
 
         struct Sink {
             files: Vec<PathBuf>,
+            directories: Vec<PathBuf>,
+            symlinks: Vec<PathBuf>,
+            dangling_errors: Vec<PathBuf>,
             path_bytes: usize,
             exhausted: bool,
             io_failed: bool,
@@ -215,6 +245,9 @@ impl WalkCache {
         });
         let sink = Mutex::new(Sink {
             files: Vec::new(),
+            directories: Vec::new(),
+            symlinks: Vec::new(),
+            dangling_errors: Vec::new(),
             path_bytes: 0,
             exhausted: false,
             io_failed: false,
@@ -223,24 +256,55 @@ impl WalkCache {
             Box::new(|result| {
                 let entry = match result {
                     Ok(entry) => entry,
-                    Err(_) => {
+                    Err(error) => {
+                        // With link following enabled, walkdir reports a
+                        // dangling link as NotFound before the ignore layer can
+                        // classify it. Defer admission until a non-following
+                        // walk with the same hidden/ignore policy can verify it.
+                        if let Some(path) = dangling_symlink_path(&error)
+                            && std::fs::symlink_metadata(path)
+                                .is_ok_and(|meta| meta.file_type().is_symlink())
+                        {
+                            sink.lock().dangling_errors.push(path.to_path_buf());
+                            return WalkState::Continue;
+                        }
                         sink.lock().io_failed = true;
                         return WalkState::Continue;
                     }
                 };
-                if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    let path = entry.into_path();
-                    let path_bytes = path.as_os_str().len();
-                    let mut sink = sink.lock();
-                    if sink.files.len() >= self.max_files
-                        || path_bytes > self.max_path_bytes.saturating_sub(sink.path_bytes)
-                    {
-                        sink.exhausted = true;
-                        return WalkState::Quit;
-                    }
-                    sink.path_bytes += path_bytes;
-                    sink.files.push(path);
+                // The walker yields the root at depth zero; it is traversal
+                // context, never a find result.
+                if entry.depth() == 0 {
+                    return WalkState::Continue;
                 }
+                let file_type = entry.file_type();
+                let is_file = file_type.is_some_and(|kind| kind.is_file());
+                let is_dir = file_type.is_some_and(|kind| kind.is_dir());
+                let is_symlink =
+                    entry.path_is_symlink() || file_type.is_some_and(|kind| kind.is_symlink());
+                let path = entry.into_path();
+                let path_bytes = path.as_os_str().len();
+                let mut sink = sink.lock();
+                if (is_file && sink.files.len() >= self.max_files)
+                    || path_bytes > self.max_path_bytes.saturating_sub(sink.path_bytes)
+                {
+                    sink.exhausted = true;
+                    return WalkState::Quit;
+                }
+                if is_file {
+                    // Do not move followed symlink-to-file entries out of this
+                    // slice: grep and graph have always consumed them here.
+                    sink.files.push(path);
+                } else if is_dir {
+                    sink.directories.push(path);
+                } else if is_symlink {
+                    sink.symlinks.push(path);
+                } else {
+                    // Sockets/devices are intentionally not search results and
+                    // retain the existing file-walk behavior.
+                    return WalkState::Continue;
+                }
+                sink.path_bytes += path_bytes;
                 WalkState::Continue
             })
         });
@@ -248,9 +312,70 @@ impl WalkCache {
         // once makes every consumer deterministic — and lets `grep` treat the
         // index order as path order when it applies a global match limit.
         let mut sink = sink.into_inner();
+        let mut dangling_scan_complete = true;
+        if !sink.dangling_errors.is_empty() {
+            sink.dangling_errors.sort_unstable();
+            sink.dangling_errors.dedup();
+            let (admitted, complete) =
+                self.admitted_dangling_symlinks(root, opts, &sink.dangling_errors);
+            dangling_scan_complete = complete;
+            for path in admitted {
+                let path_bytes = path.as_os_str().len();
+                if path_bytes > self.max_path_bytes.saturating_sub(sink.path_bytes) {
+                    sink.exhausted = true;
+                    break;
+                }
+                sink.path_bytes += path_bytes;
+                sink.symlinks.push(path);
+            }
+        }
         sink.files.sort_unstable();
-        let complete = !sink.exhausted && !sink.io_failed && !exhausted.load(Ordering::Relaxed);
-        (sink.files, complete)
+        sink.directories.sort_unstable();
+        sink.symlinks.sort_unstable();
+        let complete = !sink.exhausted
+            && !sink.io_failed
+            && dangling_scan_complete
+            && !exhausted.load(Ordering::Relaxed);
+        (sink.files, sink.directories, sink.symlinks, complete)
+    }
+
+    /// Re-run only the rare dangling-link admission decision without following
+    /// links. This is necessary because walkdir reports a followed dangling
+    /// target as an error before `ignore` can apply hidden/custom rules.
+    fn admitted_dangling_symlinks(
+        &self,
+        root: &Path,
+        opts: WalkKey,
+        candidates: &[PathBuf],
+    ) -> (Vec<PathBuf>, bool) {
+        let mut builder = self.configured_builder(root, opts, false);
+        builder.threads(1);
+        let mut admitted = Vec::new();
+        let mut visited = 0usize;
+        let mut path_bytes = 0usize;
+        for result in builder.build() {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(_) => return (admitted, false),
+            };
+            visited = visited.saturating_add(1);
+            path_bytes = path_bytes.saturating_add(entry.path().as_os_str().len());
+            if visited > self.max_visited_entries || path_bytes > self.max_path_bytes {
+                return (admitted, false);
+            }
+            if entry.depth() > 0
+                && entry.path_is_symlink()
+                && candidates
+                    .binary_search_by(|path| path.as_path().cmp(entry.path()))
+                    .is_ok()
+            {
+                admitted.push(entry.into_path());
+                if admitted.len() == candidates.len() {
+                    break;
+                }
+            }
+        }
+        (admitted, true)
     }
 
     fn preflight(&self, root: &Path, opts: WalkKey) -> bool {
@@ -329,6 +454,23 @@ impl WalkCache {
     }
 }
 
+fn dangling_symlink_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, err }
+            if err
+                .io_error()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Some(path)
+        }
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            dangling_symlink_path(err)
+        }
+        ignore::Error::Partial(errors) if errors.len() == 1 => dangling_symlink_path(&errors[0]),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,9 +531,38 @@ mod tests {
             entry
                 .files
                 .iter()
+                .chain(entry.directories.iter())
+                .chain(entry.symlinks.iter())
                 .map(|path| path.as_os_str().len())
                 .sum::<usize>()
                 <= one_path * 2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_directories_and_unfollowed_symlinks_without_changing_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+        symlink("file", dir.path().join("link-file")).unwrap();
+        symlink("empty", dir.path().join("link-dir")).unwrap();
+        symlink("missing", dir.path().join("dangling")).unwrap();
+        let cache = WalkCache::new(1);
+
+        let (entry, _) = cache.get(dir.path(), key());
+
+        assert_eq!(entry.files, Arc::new(vec![dir.path().join("file")]));
+        assert_eq!(entry.directories, Arc::new(vec![dir.path().join("empty")]));
+        assert_eq!(
+            entry.symlinks,
+            Arc::new(vec![
+                dir.path().join("dangling"),
+                dir.path().join("link-dir"),
+                dir.path().join("link-file"),
+            ])
         );
     }
 }

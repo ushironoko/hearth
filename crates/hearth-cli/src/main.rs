@@ -105,6 +105,27 @@ enum Cmd {
         #[arg(long)]
         no_ignore: bool,
     },
+    /// Find files and directories by glob pattern.
+    Find {
+        pattern: String,
+        #[arg(default_value = ".")]
+        path: String,
+        /// Maximum paths to retain (default 1000).
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Exclude hidden entries (pi compatibility includes them by default).
+        #[arg(long)]
+        no_hidden: bool,
+        /// Do not honor root-local `.ignore`/`.rgignore` files.
+        #[arg(long)]
+        no_ignore: bool,
+        /// Follow symbolic links while walking.
+        #[arg(long)]
+        follow_symlinks: bool,
+        /// Exclude a root-relative path glob before applying result limits.
+        #[arg(long = "exclude")]
+        exclude_globs: Vec<String>,
+    },
     /// Query the code symbol and module graph.
     Graph {
         #[command(subcommand)]
@@ -290,6 +311,23 @@ fn build_request(cmd: &Cmd) -> Request {
                 follow_symlinks: false,
             })
         }
+        Cmd::Find {
+            pattern,
+            path,
+            limit,
+            no_hidden,
+            no_ignore,
+            follow_symlinks,
+            exclude_globs,
+        } => Request::Find(FindParams {
+            pattern: pattern.clone(),
+            path: path.clone(),
+            limit: *limit,
+            hidden: !*no_hidden,
+            respect_gitignore: !*no_ignore,
+            follow_symlinks: *follow_symlinks,
+            exclude_globs: exclude_globs.clone(),
+        }),
         Cmd::Graph { op } => {
             let (op, args) = match op {
                 GraphCmd::Symbols { path, args } => (GraphOp::Symbols { path: path.clone() }, args),
@@ -505,6 +543,18 @@ fn render(global: &Global, cmd: &Cmd, resp: &Response) -> i32 {
             } else {
                 0
             }
+        }
+        Response::Find(result) => {
+            if !result.paths.is_empty() {
+                println!("{}", result.paths.join("\n"));
+            }
+            if result.limit_reached {
+                eprintln!("warning: find result limit reached");
+            }
+            if result.output_limit_reached {
+                eprintln!("warning: find 50 KiB output limit reached");
+            }
+            0
         }
         Response::EditBatch(r) => {
             eprintln!("{} replacement(s)", r.replacements);
@@ -815,6 +865,108 @@ mod tests {
             panic!("response loss after delivery must not fall back inline");
         };
         assert_eq!(error.kind, ErrorKind::Indeterminate);
+    }
+
+    #[test]
+    fn find_cli_builds_the_pi_compatible_request() {
+        let cli = Cli::try_parse_from([
+            "hearth",
+            "find",
+            "src/**/*.rs",
+            "project",
+            "--limit",
+            "7",
+            "--no-hidden",
+            "--no-ignore",
+            "--follow-symlinks",
+            "--exclude",
+            "**/.git/**",
+        ])
+        .unwrap();
+        let Request::Find(params) = build_request(&cli.cmd) else {
+            panic!("find command built the wrong request variant");
+        };
+        assert_eq!(params.pattern, "src/**/*.rs");
+        assert_eq!(params.path, "project");
+        assert_eq!(params.limit, Some(7));
+        assert!(!params.hidden);
+        assert!(!params.respect_gitignore);
+        assert!(params.follow_symlinks);
+        assert_eq!(params.exclude_globs, vec!["**/.git/**"]);
+    }
+
+    #[test]
+    fn find_round_trips_over_the_negotiated_daemon_transport() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let hello: Request = read_msg(&mut daemon).unwrap();
+            assert!(matches!(hello, Request::Hello(_)));
+            hearth_tools::transport::write_msg(
+                &mut daemon,
+                &Response::Hello(ProtocolAck {
+                    version: PROTOCOL_VERSION,
+                }),
+            )
+            .unwrap();
+            let Request::Find(params) = read_msg::<_, Request>(&mut daemon).unwrap() else {
+                panic!("daemon did not receive find");
+            };
+            assert_eq!(params.pattern, "*.rs");
+            hearth_tools::transport::write_msg(
+                &mut daemon,
+                &Response::Find(FindResult {
+                    paths: vec!["src/lib.rs".into()],
+                    total_matches: 1,
+                    walk_cache_hit: true,
+                    limit_reached: false,
+                    output_limit_reached: false,
+                    root: "/tmp/project".into(),
+                }),
+            )
+            .unwrap();
+        });
+
+        let response = dispatch_connected(
+            &test_global(),
+            client,
+            Request::Find(FindParams::new("*.rs")),
+        );
+        worker.join().unwrap();
+        let Response::Find(result) = response else {
+            panic!("find response did not survive daemon transport");
+        };
+        assert_eq!(result.paths, vec!["src/lib.rs"]);
+        assert!(result.walk_cache_hit);
+    }
+
+    #[test]
+    fn an_empty_find_is_a_successful_cli_result() {
+        let cmd = Cmd::Find {
+            pattern: "*.missing".into(),
+            path: ".".into(),
+            limit: None,
+            no_hidden: false,
+            no_ignore: false,
+            follow_symlinks: false,
+            exclude_globs: Vec::new(),
+        };
+        let response = Response::Find(FindResult {
+            paths: Vec::new(),
+            total_matches: 0,
+            walk_cache_hit: false,
+            limit_reached: false,
+            output_limit_reached: false,
+            root: "/tmp/project".into(),
+        });
+        assert_eq!(render(&test_global_with_json(false), &cmd, &response), 0);
+    }
+
+    fn test_global_with_json(json: bool) -> Global {
+        Global {
+            socket: None,
+            no_daemon: false,
+            json,
+        }
     }
 
     fn graph_node(path: &str, node_id: &str) -> GraphNode {

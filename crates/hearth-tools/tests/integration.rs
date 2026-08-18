@@ -1,10 +1,10 @@
-//! End-to-end coverage of the five tools against one engine.
+//! End-to-end coverage of the resident tools against one engine.
 
 mod common;
 
 use common::{abs, engine, trusting_engine, warm_engine};
 use hearth_proto::*;
-use hearth_tools::{bash, edit, grep, read, write};
+use hearth_tools::{bash, edit, find, grep, read, write};
 
 fn run(eng: &hearth_core::Engine, command: &str, timeout_ms: Option<u64>) -> BashResult {
     bash(
@@ -147,6 +147,42 @@ fn grep_content_and_files() {
     .unwrap();
     assert!(g2.walk_cache_hit, "second grep should reuse the walk cache");
     assert_eq!(g2.files.len(), 2);
+}
+
+#[test]
+fn find_and_grep_share_the_same_walk_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    write(
+        &eng,
+        &WriteParams::new(abs(dir.path(), "src/a.rs"), "needle\n"),
+    )
+    .unwrap();
+    write(
+        &eng,
+        &WriteParams::new(abs(dir.path(), "src/b.txt"), "needle\n"),
+    )
+    .unwrap();
+
+    let found = find(
+        &eng,
+        &FindParams {
+            path: dir.path().display().to_string(),
+            hidden: false,
+            ..FindParams::new("*.rs")
+        },
+    )
+    .unwrap();
+    assert_eq!(found.paths, vec!["src/a.rs"]);
+    assert!(!found.walk_cache_hit);
+
+    let searched = grep(
+        &eng,
+        &GrepParams::new("needle", dir.path().display().to_string()),
+    )
+    .unwrap();
+    assert!(searched.walk_cache_hit);
+    assert_eq!(searched.total_matches, 2);
 }
 
 #[test]

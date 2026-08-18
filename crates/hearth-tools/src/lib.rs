@@ -13,6 +13,7 @@
 mod bash;
 mod edit;
 mod edit_text;
+mod find;
 mod graph;
 mod grep;
 mod read;
@@ -23,6 +24,7 @@ mod write;
 
 pub use bash::{bash, bash_cancellable, bash_stream};
 pub use edit::{edit, edit_batch, edit_batch_cancellable, edit_cancellable};
+pub use find::{find, find_cancellable};
 pub use graph::{graph, graph_cancellable, graph_clear};
 pub use grep::{grep, grep_cancellable};
 pub use read::{read, read_bytes, read_bytes_cancellable, read_cancellable};
@@ -88,6 +90,10 @@ pub fn dispatch_cancellable(
         },
         Request::Grep(p) => match grep_cancellable(engine, &p, cancel) {
             Ok(r) => Response::Grep(r),
+            Err(e) => Response::Error(e),
+        },
+        Request::Find(p) => match find_cancellable(engine, &p, cancel) {
+            Ok(r) => Response::Find(r),
             Err(e) => Response::Error(e),
         },
         Request::Graph(p) => match graph_cancellable(engine, &p, cancel) {

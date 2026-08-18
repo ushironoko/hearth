@@ -461,6 +461,40 @@ impl HearthEngine {
         )
     }
 
+    // -- find ------------------------------------------------------------
+
+    /// Synchronous glob discovery. Prefer `findAsync` for cold large trees.
+    #[napi]
+    pub fn find(&self, env: Env, params: FindParams) -> Result<FindResult> {
+        let params = proto::FindParams::try_from(params).map_err(|e| structured_err(&env, e))?;
+        hearth_tools::find(&self.engine, &params)
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
+    }
+
+    #[napi(
+        ts_args_type = "params: FindParams, signal?: AbortSignal",
+        ts_return_type = "Promise<FindResult>"
+    )]
+    pub fn find_async(
+        &self,
+        env: Env,
+        params: FindParams,
+        signal: Option<Abort>,
+    ) -> Result<AsyncTask<FindTask>> {
+        let params = proto::FindParams::try_from(params).map_err(|e| structured_err(&env, e))?;
+        let (cancel, signal) = split(signal);
+        Ok(AsyncTask::with_optional_signal(
+            FindTask {
+                engine: self.engine.clone(),
+                params,
+                cancel,
+                failure: None,
+            },
+            signal,
+        ))
+    }
+
     // -- graph -----------------------------------------------------------
 
     /// Synchronously list symbols extracted from one file.
@@ -876,6 +910,13 @@ tool_task!(
     proto::GrepResult,
     GrepResult,
     hearth_tools::grep_cancellable
+);
+tool_task!(
+    FindTask,
+    proto::FindParams,
+    proto::FindResult,
+    FindResult,
+    hearth_tools::find_cancellable
 );
 tool_task!(
     GraphTask,

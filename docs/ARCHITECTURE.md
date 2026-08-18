@@ -12,7 +12,7 @@ transport-agnostic **core + tools** from the three **surfaces** that expose them
 | `hearth-proto` | The single contract: `ReadParams`/`ReadResult`/… and the `Request`/`Response` envelope. `serde`, `camelCase`, dependency-light. Shared by every surface so they never drift. |
 | `hearth-core` | The resident `Engine`: shared caches, cancellation, per-path mutation locks, profiler, self-optimizer, fs-watch. No tool logic. |
 | `hearth-graph` | The code-index and module-graph layer: language registry, symbol/import extraction, `SymbolIndex`, `ModuleGraph`, and resolver abstractions. |
-| `hearth-tools` | The six tools as plain `fn(&Engine, &Params) -> Result<Result>`, each with a `*_cancellable` twin. Plus `dispatch()` and the msgpack `transport`. |
+| `hearth-tools` | The seven tools as plain `fn(&Engine, &Params) -> Result<Result>`, each with a `*_cancellable` twin. Plus `dispatch()` and the msgpack `transport`. |
 | `hearth-daemon` | `hearthd`: one `Engine`, a Unix-socket server, thread-per-connection. |
 | `hearth-cli` | `hearth`: thin client; connects to the daemon or runs inline (cold) as a fallback. |
 | `hearth-napi` | `@hearthdev/napi`: a `#[napi]` `HearthEngine` object; typed sync methods + cancellable `*Async` (libuv worker) twins + `bashStream`. |
@@ -31,10 +31,12 @@ transport-agnostic **core + tools** from the three **surfaces** that expose them
   through a `SingleFlight`. `get_bounded` refuses to cache oversize files so one
   grep over a huge tree can't flood memory.
 * **`WalkCache`** (`cache/walk.rs`) — a parallel `ignore`-walk (ripgrep's
-  walker) cached per `(root, ignore-config)`. The file list is **sorted** once at
-  build time, so every consumer is deterministic and `grep` can treat index order
-  as path order. Globs post-filter the cached list, so one walk serves every glob
-  over the same tree.
+  walker) cached per `(root, ignore-config)`. Files, directories, and unresolved/
+  unfollowed symlinks are retained in separate **sorted** slices; followed
+  symlink-to-file entries stay in the original file slice consumed by grep and
+  graph. All slices share one bounded completeness snapshot and resident path-byte
+  accounting. Globs post-filter the snapshot, so one walk serves every find/grep
+  pattern over the same tree.
 * **`PathLocks`** (`pathlock.rs`) — one mutex per **canonical** path, taken for
   the whole read-modify-write of any mutation. Two concurrent `edit`s of the same
   file each compute a whole-file image from the original, so without this the
@@ -78,6 +80,7 @@ settles:
 | `read` / `readBytes` | Rejects. A pre-aborted call never touches the cache. |
 | `write` / `edit` / `editBatch` | Rejects **before** the write is issued, or completes it. The path's mutation lock is held across the write *and* the cache refresh, so the token is never observed while native work could still commit — releasing early would let a queued mutation of the same file interleave. |
 | `grep` | Stops scheduling files, abandons the file being searched at its next match, **joins every worker**, then rejects. No search thread outlives the call. |
+| `find` | Rejects before/after the walk or while filtering. A cold bounded walk is one non-preemptive safe step, so cancellation may not settle until that step returns; a warm filter polls every candidate. |
 | `bash` | SIGKILLs the command's whole process group, reaps it, and **resolves** with `aborted: true` and the partial output — a streaming caller keeps what it already rendered rather than losing it to an exception. |
 
 A pre-aborted signal is detected by reading `signal.aborted` while converting it,
@@ -101,6 +104,9 @@ signal blocks on its real deadline as before.
 * `grep` → `WalkCache` for the file set + `FileCache` (`get_bounded`) for the
   bytes, searched with `grep-searcher`/`grep-regex` across worker threads. Warm =
   no walk, no file opens.
+* `find` → `WalkCache` only. It allocation-free merges the three sorted entry
+  slices, applies path exclusions and a compiled include glob, counts every
+  match, and retains a bounded deterministic prefix.
 * `graph` → `WalkCache` for the universe + `FileCache` for bytes and hashes +
   the `GraphState` engine extension + `InvalidationLog` for derived-state
   coherence.
@@ -235,6 +241,37 @@ broke its protocol is never handed to another command.
 
 Correctness relies on a fresh random 128-bit nonce not occurring in command
 output — roughly 2^-128 per command.
+
+## Find
+
+`find` reproduces Pi 0.84.1's `fd --glob --hidden` path contract without
+spawning `fd`. Patterns without `/` match each entry basename. Slash-containing
+relative patterns gain Pi's `**/` prefix and match the lexical absolute
+candidate with literal separator semantics (`*` never crosses `/`, legal `**`
+does); absolute and already-`**/` patterns are unchanged. Output is sorted by
+raw path, rendered root-relative with POSIX separators, and directories carry a
+trailing `/`. Unfollowed and dangling symlinks are plain entries; followed
+symlink directories carry `/` and are traversed.
+
+The result separately reports count truncation and Pi's 50 KiB path-text
+truncation while `totalMatches` remains exact. It retains the first complete
+path that crosses 50 KiB as bounded headroom, allowing Pi's custom-operation
+wrapper to detect the oversized joined text and emit its standard warning.
+Exclusion globs are applied
+before counting and limiting, so a Pi adapter can pass
+`["**/node_modules/**", "**/.git/**"]` without discarding valid later paths.
+Matching uses fd-compatible smart-case (all-lowercase patterns ignore case;
+uppercase makes them sensitive), and an empty pattern matches all entries. The
+include pattern is capped at 4 KiB; exclusions at 128 patterns / 16 KiB; and
+the caller limit at 1,000,000. Exclusions are post-filters over the shared
+snapshot and therefore do not reduce cold-walk work or its safety budget.
+
+Ignore behavior is intentionally narrower than `fd`: Hearth discovers only
+bounded root-local `.ignore`/`.rgignore`, not ancestor/global Git configuration.
+A warm walk is a structural snapshot. After a mutation performed outside Hearth,
+an adapter must use fs-watch or call `invalidateRoot`; otherwise newly created,
+removed, or renamed entries (including empty directories) remain stale.
+Non-UTF-8 Unix names use lossy stdout-compatible rendering.
 
 ## Grep
 
