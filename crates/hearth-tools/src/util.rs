@@ -1,11 +1,12 @@
 //! Shared helpers for the tools: path resolution and the two write strategies.
 
 use hearth_core::Engine;
-use hearth_proto::{ToolError, WriteMode};
+use hearth_core::cache::{WalkEntry, WalkFailure};
+use hearth_proto::{ToolError, ToolResult, WriteMode};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 const TEMP_ATTEMPTS: usize = 128;
@@ -14,10 +15,45 @@ const TEMP_ATTEMPTS: usize = 128;
 /// default cwd when it is relative.
 pub fn resolve_path(engine: &Engine, path: &str) -> PathBuf {
     let p = Path::new(path);
-    if p.is_absolute() {
+    let resolved = if p.is_absolute() {
         p.to_path_buf()
     } else {
         engine.config().default_cwd.join(p)
+    };
+    lexical_normalize(&resolved)
+}
+
+/// Normalize `.` and `..` without resolving symlinks. Engine roots are made
+/// absolute at construction, so every tool derives identical cache identities.
+pub fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+/// Map a typed walk failure into the stable cross-surface tool error contract.
+pub fn ensure_walk_succeeded(entry: &WalkEntry, operation: &str) -> ToolResult<()> {
+    match &entry.failure {
+        None => Ok(()),
+        Some(WalkFailure::BudgetExceeded) => Err(ToolError::invalid(format!(
+            "{operation} walk exceeded its work budget"
+        ))),
+        Some(WalkFailure::Io {
+            kind,
+            path,
+            message,
+        }) => Err(ToolError::from(std::io::Error::new(*kind, message.clone()))
+            .with_path(path.as_os_str().to_string_lossy().into_owned())),
     }
 }
 

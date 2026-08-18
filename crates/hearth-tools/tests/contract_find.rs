@@ -224,6 +224,29 @@ fn hidden_ignore_and_warm_cache_options_share_walk_snapshots() {
 }
 
 #[test]
+fn malformed_ignore_is_an_io_error_and_is_not_cached() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), "a.txt", "");
+    let ignore = seed(dir.path(), ".rgignore", "[z-a]\n");
+    let eng = engine(dir.path());
+    let mut p = params(dir.path(), "*.txt");
+    p.respect_gitignore = true;
+
+    let error = find(&eng, &p).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Io);
+    assert_eq!(error.path.as_deref(), Some(ignore.as_str()));
+
+    std::fs::write(&ignore, "*.tmp\n").unwrap();
+    let recovered = find(&eng, &p).unwrap();
+    assert_eq!(recovered.paths, vec!["a.txt"]);
+    assert!(
+        !recovered.walk_cache_hit,
+        "an errored snapshot must be rebuilt without explicit invalidation"
+    );
+    assert!(find(&eng, &p).unwrap().walk_cache_hit);
+}
+
+#[test]
 fn explicit_invalidation_refreshes_a_warm_find() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path(), "before.txt", "");

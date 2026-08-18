@@ -85,7 +85,8 @@ baseline follows Pi's default branch through `ensureTool`, an `fd` child
 process, readline parsing, path relativization, the 1000-result limit, and the
 50 KiB output limit. The comparison uses the same Pi wrapper but supplies its
 custom `exists`/`glob` hooks, with `glob` backed by a release
-`HearthEngine.find` N-API call.
+`HearthEngine.findAsync` N-API call so cold walks do not block the JavaScript
+event loop.
 
 The generated 3000-file corpus gives both implementations equivalent ignore
 rules and asserts the complete uncapped `*.rs` path set (3001 paths) before any
@@ -93,19 +94,22 @@ timing. Results on Apple M4, Node 24.6.0, Pi 0.84.1, and fd 10.4.2:
 
 | Pi find scenario | Pi default | Hearth fresh engine | Hearth resident | resident speedup |
 |---|---:|---:|---:|---:|
-| selective `d000/*.rs` | 10.10 ms | 11.66 ms | **0.980 ms** | **10.31×** |
-| no-match `missing-*.rs` | 8.72 ms | 11.80 ms | **0.761 ms** | **11.46×** |
-| broad `*.rs`, limit 1000 | 10.16 ms | 11.76 ms | **1.13 ms** | **9.03×** |
+| selective `d000/*.rs` | 8.59 ms | 11.30 ms | **1.01 ms** | **8.54×** |
+| no-match `missing-*.rs` | 8.23 ms | 11.30 ms | **0.775 ms** | **10.62×** |
+| broad `*.rs`, limit 1000 | 9.54 ms | 11.72 ms | **1.11 ms** | **8.59×** |
 
 The result is specifically a **resident-cache win**: a fresh Hearth engine is
-1.15–1.35× slower than Pi's fd-backed default, while reuse of one walk snapshot
-makes the replacement 9.03–11.46× faster. The broad Hearth row also computes
+1.23–1.37× slower than Pi's fd-backed default, while reuse of one walk snapshot
+makes the replacement 8.54–10.62× faster. The broad Hearth row also computes
 exact `totalMatches`, even though Pi consumes only `paths`; fd can stop at
 `--max-results 1000`, so Hearth does more semantic work in that row.
 
 “Fresh” means a new Hearth engine on every operation, not cold storage. Pi tool
 discovery/download, module imports, corpus generation, and UI rendering are
-outside the timed region, and every row benefits from the OS page cache. The
+outside the timed region, and every row benefits from the OS page cache. Pi's
+custom `glob` hook does not expose its operation `AbortSignal`, so the adapter
+cannot forward cancellation; direct `findAsync(params, signal)` callers can.
+The async adapter still keeps cold traversal off the JavaScript event loop. The
 harness rejects Pi/fd version drift, records the managed fd binary hash, and
 isolates global/system Git ignore configuration. See
 [`bench/harness/results/find_pi.md`](../bench/harness/results/find_pi.md) for

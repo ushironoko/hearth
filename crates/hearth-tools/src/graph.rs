@@ -5,7 +5,7 @@
 //! one incrementally revalidated index per root.
 
 use crate::grep::grep_cancellable;
-use crate::util::resolve_path;
+use crate::util::{ensure_walk_succeeded, resolve_path};
 use compact_str::CompactString;
 use dashmap::DashMap;
 use hearth_core::cache::WalkKey;
@@ -1033,10 +1033,8 @@ fn build_sweep_delta(
             follow_symlinks: params.follow_symlinks,
         };
         engine.watch_root(root);
-        let (entry, hit) = engine.walks().get(root, key);
-        if !entry.complete {
-            return Err(ToolError::invalid("graph walk exceeded its work budget"));
-        }
+        let (entry, hit) = engine.walks().get_cancellable(root, key, cancel)?;
+        ensure_walk_succeeded(&entry, "graph")?;
         if entry.files.len() > MAX_GRAPH_FILES {
             return Err(ToolError::invalid(
                 "graph implicit universe exceeds 100000 files",

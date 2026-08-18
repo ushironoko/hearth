@@ -6,12 +6,15 @@
 //! `(root, ignore-config)`. Later searches over the same tree skip the walk
 //! entirely and just re-filter the cached list by glob in memory.
 
+use crate::CancelToken;
 use dashmap::DashMap;
+use hearth_proto::ToolResult;
 use ignore::{WalkBuilder, WalkState};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// The walk-affecting knobs. Globs are *not* here: they post-filter the cached
 /// list, so one walk serves every glob over the same tree.
@@ -28,6 +31,30 @@ struct CacheKey {
     opts: WalkKey,
 }
 
+/// Why a bounded walk could not produce a cacheable complete snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalkFailure {
+    /// One of the entry-count, file-count, path-byte, or ignore-byte caps fired.
+    BudgetExceeded,
+    /// Traversal or ignore-file processing failed. `kind` preserves stable
+    /// permission/not-found/I/O classification for tool adapters.
+    Io {
+        kind: std::io::ErrorKind,
+        path: PathBuf,
+        message: String,
+    },
+}
+
+impl WalkFailure {
+    fn io(path: &Path, error: &std::io::Error) -> Self {
+        Self::Io {
+            kind: error.kind(),
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        }
+    }
+}
+
 /// A cached enumeration of the entries under one root.
 pub struct WalkEntry {
     pub root: PathBuf,
@@ -40,8 +67,8 @@ pub struct WalkEntry {
     /// Symlinks whose target type was not followed/classified by the walker,
     /// including dangling links and all links when following is disabled.
     pub symlinks: Arc<Vec<PathBuf>>,
-    /// False when the preflight or walker exhausted a hard work budget.
-    pub complete: bool,
+    /// Present only when traversal failed. Failed snapshots are never cached.
+    pub failure: Option<WalkFailure>,
     retained_path_bytes: usize,
     last_access: AtomicU64,
 }
@@ -102,6 +129,19 @@ impl WalkCache {
     /// Get (or build) the file list for `root` under `opts`. `hit` reports
     /// whether the cached walk was reused.
     pub fn get(&self, root: &Path, opts: WalkKey) -> (Arc<WalkEntry>, bool) {
+        self.get_cancellable(root, opts, &CancelToken::none())
+            .expect("a non-cancellable walk cannot be cancelled")
+    }
+
+    /// As [`Self::get`], but cancellation can settle while waiting for the
+    /// global cold-build lock and is re-checked before starting a walk.
+    pub fn get_cancellable(
+        &self,
+        root: &Path,
+        opts: WalkKey,
+        cancel: &CancelToken,
+    ) -> ToolResult<(Arc<WalkEntry>, bool)> {
+        cancel.check()?;
         let key = CacheKey {
             root: root.to_path_buf(),
             opts,
@@ -109,16 +149,26 @@ impl WalkCache {
         if let Some(entry) = self.map.get(&key) {
             self.touch(entry.value());
             crate::profiler::count("cache.walk.hit", 1);
-            return (Arc::clone(entry.value()), true);
+            return Ok((Arc::clone(entry.value()), true));
         }
         crate::profiler::count("cache.walk.miss", 1);
-        let _build = self.build.lock();
+        let _build = if cancel.is_live() {
+            loop {
+                cancel.check()?;
+                if let Some(guard) = self.build.try_lock_for(Duration::from_millis(10)) {
+                    break guard;
+                }
+            }
+        } else {
+            self.build.lock()
+        };
+        cancel.check()?;
         if let Some(entry) = self.map.get(&key) {
             self.touch(entry.value());
-            return (Arc::clone(entry.value()), true);
+            return Ok((Arc::clone(entry.value()), true));
         }
         let generation = self.generation.load(Ordering::Acquire);
-        let (files, directories, symlinks, complete) = self.build(root, opts);
+        let (files, directories, symlinks, failure) = self.build(root, opts);
         let retained_path_bytes = files
             .iter()
             .chain(&directories)
@@ -130,7 +180,7 @@ impl WalkCache {
             files: Arc::new(files),
             directories: Arc::new(directories),
             symlinks: Arc::new(symlinks),
-            complete,
+            failure,
             retained_path_bytes,
             last_access: AtomicU64::new(0),
         });
@@ -138,18 +188,18 @@ impl WalkCache {
 
         let _mutation = self.mutation.lock();
         if self.generation.load(Ordering::Acquire) != generation {
-            return (entry, false);
+            return Ok((entry, false));
         }
-        if self.max_entries == 0 || !entry.complete {
-            return (entry, false);
+        if self.max_entries == 0 || entry.failure.is_some() {
+            return Ok((entry, false));
         }
         if let Some(existing) = self.map.get(&key) {
             self.touch(existing.value());
-            return (Arc::clone(existing.value()), true);
+            return Ok((Arc::clone(existing.value()), true));
         }
         self.map.insert(key, Arc::clone(&entry));
         self.evict_locked();
-        (entry, false)
+        Ok((entry, false))
     }
 
     fn evict_locked(&self) {
@@ -210,15 +260,20 @@ impl WalkCache {
         &self,
         root: &Path,
         opts: WalkKey,
-    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
-        if !self.preflight(root, opts) {
-            return (Vec::new(), Vec::new(), Vec::new(), false);
+    ) -> (
+        Vec<PathBuf>,
+        Vec<PathBuf>,
+        Vec<PathBuf>,
+        Option<WalkFailure>,
+    ) {
+        if let Err(failure) = self.preflight(root, opts) {
+            return (Vec::new(), Vec::new(), Vec::new(), Some(failure));
         }
         // A second preflight immediately before the real walk narrows mutation
         // races. Correctness under an actively hostile concurrent filesystem is
         // not claimed; the per-UID daemon is not a sandbox boundary.
-        if !self.preflight(root, opts) {
-            return (Vec::new(), Vec::new(), Vec::new(), false);
+        if let Err(failure) = self.preflight(root, opts) {
+            return (Vec::new(), Vec::new(), Vec::new(), Some(failure));
         }
         let mut builder = self.configured_builder(root, opts, opts.follow_symlinks);
 
@@ -227,9 +282,9 @@ impl WalkCache {
             directories: Vec<PathBuf>,
             symlinks: Vec<PathBuf>,
             dangling_errors: Vec<PathBuf>,
+            failures: Vec<WalkFailure>,
             path_bytes: usize,
             exhausted: bool,
-            io_failed: bool,
         }
         let visited = Arc::new(AtomicU64::new(0));
         let exhausted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -248,9 +303,9 @@ impl WalkCache {
             directories: Vec::new(),
             symlinks: Vec::new(),
             dangling_errors: Vec::new(),
+            failures: Vec::new(),
             path_bytes: 0,
             exhausted: false,
-            io_failed: false,
         });
         builder.build_parallel().run(|| {
             Box::new(|result| {
@@ -268,10 +323,15 @@ impl WalkCache {
                             sink.lock().dangling_errors.push(path.to_path_buf());
                             return WalkState::Continue;
                         }
-                        sink.lock().io_failed = true;
+                        sink.lock().failures.push(ignore_failure(&error, root));
                         return WalkState::Continue;
                     }
                 };
+                if let Some(error) = entry.error() {
+                    sink.lock()
+                        .failures
+                        .push(ignore_failure(error, entry.path()));
+                }
                 // The walker yields the root at depth zero; it is traversal
                 // context, never a find result.
                 if entry.depth() == 0 {
@@ -312,31 +372,40 @@ impl WalkCache {
         // once makes every consumer deterministic — and lets `grep` treat the
         // index order as path order when it applies a global match limit.
         let mut sink = sink.into_inner();
-        let mut dangling_scan_complete = true;
         if !sink.dangling_errors.is_empty() {
             sink.dangling_errors.sort_unstable();
             sink.dangling_errors.dedup();
-            let (admitted, complete) =
-                self.admitted_dangling_symlinks(root, opts, &sink.dangling_errors);
-            dangling_scan_complete = complete;
-            for path in admitted {
-                let path_bytes = path.as_os_str().len();
-                if path_bytes > self.max_path_bytes.saturating_sub(sink.path_bytes) {
-                    sink.exhausted = true;
-                    break;
+            match self.admitted_dangling_symlinks(root, opts, &sink.dangling_errors) {
+                Ok(admitted) => {
+                    for path in admitted {
+                        let path_bytes = path.as_os_str().len();
+                        if path_bytes > self.max_path_bytes.saturating_sub(sink.path_bytes) {
+                            sink.exhausted = true;
+                            break;
+                        }
+                        sink.path_bytes += path_bytes;
+                        sink.symlinks.push(path);
+                    }
                 }
-                sink.path_bytes += path_bytes;
-                sink.symlinks.push(path);
+                Err(failure) => sink.failures.push(failure),
             }
         }
         sink.files.sort_unstable();
         sink.directories.sort_unstable();
         sink.symlinks.sort_unstable();
-        let complete = !sink.exhausted
-            && !sink.io_failed
-            && dangling_scan_complete
-            && !exhausted.load(Ordering::Relaxed);
-        (sink.files, sink.directories, sink.symlinks, complete)
+        let Sink {
+            files,
+            directories,
+            symlinks,
+            failures,
+            exhausted: sink_exhausted,
+            ..
+        } = sink;
+        let failure = failures.into_iter().min_by(walk_failure_order).or_else(|| {
+            (sink_exhausted || exhausted.load(Ordering::Relaxed))
+                .then_some(WalkFailure::BudgetExceeded)
+        });
+        (files, directories, symlinks, failure)
     }
 
     /// Re-run only the rare dangling-link admission decision without following
@@ -347,21 +416,21 @@ impl WalkCache {
         root: &Path,
         opts: WalkKey,
         candidates: &[PathBuf],
-    ) -> (Vec<PathBuf>, bool) {
+    ) -> Result<Vec<PathBuf>, WalkFailure> {
         let mut builder = self.configured_builder(root, opts, false);
         builder.threads(1);
         let mut admitted = Vec::new();
         let mut visited = 0usize;
         let mut path_bytes = 0usize;
         for result in builder.build() {
-            let entry = match result {
-                Ok(entry) => entry,
-                Err(_) => return (admitted, false),
-            };
+            let entry = result.map_err(|error| ignore_failure(&error, root))?;
+            if let Some(error) = entry.error() {
+                return Err(ignore_failure(error, entry.path()));
+            }
             visited = visited.saturating_add(1);
             path_bytes = path_bytes.saturating_add(entry.path().as_os_str().len());
             if visited > self.max_visited_entries || path_bytes > self.max_path_bytes {
-                return (admitted, false);
+                return Err(WalkFailure::BudgetExceeded);
             }
             if entry.depth() > 0
                 && entry.path_is_symlink()
@@ -375,52 +444,59 @@ impl WalkCache {
                 }
             }
         }
-        (admitted, true)
+        Ok(admitted)
     }
 
-    fn preflight(&self, root: &Path, opts: WalkKey) -> bool {
+    fn preflight(&self, root: &Path, opts: WalkKey) -> Result<(), WalkFailure> {
         const MAX_IGNORE_BYTES: u64 = 16 * 1024 * 1024;
         let mut stack = vec![root.to_path_buf()];
         let mut visited = 0usize;
         let mut path_bytes = root.as_os_str().len();
         let mut ignore_bytes = 0u64;
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                return false;
-            };
+            let entries = std::fs::read_dir(&dir).map_err(|error| WalkFailure::io(&dir, &error))?;
             for entry in entries {
-                let Ok(entry) = entry else {
-                    return false;
-                };
+                let entry = entry.map_err(|error| WalkFailure::io(&dir, &error))?;
                 visited = visited.saturating_add(1);
                 let path = entry.path();
                 path_bytes = path_bytes.saturating_add(path.as_os_str().len());
                 if visited > self.max_visited_entries || path_bytes > self.max_path_bytes {
-                    return false;
+                    return Err(WalkFailure::BudgetExceeded);
                 }
+                let file_type = entry
+                    .file_type()
+                    .map_err(|error| WalkFailure::io(&path, &error))?;
                 let name = entry.file_name();
                 if matches!(name.to_str(), Some(".ignore" | ".rgignore")) {
-                    let metadata = std::fs::symlink_metadata(&path).ok();
-                    if metadata
-                        .as_ref()
-                        .is_none_or(|meta| !meta.file_type().is_file())
-                    {
-                        return false;
+                    let metadata = std::fs::symlink_metadata(&path)
+                        .map_err(|error| WalkFailure::io(&path, &error))?;
+                    if !metadata.file_type().is_file() {
+                        return Err(WalkFailure::Io {
+                            kind: std::io::ErrorKind::InvalidData,
+                            path,
+                            message: "ignore path must be a regular file".to_string(),
+                        });
                     }
-                    ignore_bytes = ignore_bytes
-                        .saturating_add(metadata.map_or(MAX_IGNORE_BYTES + 1, |meta| meta.len()));
+                    ignore_bytes = ignore_bytes.saturating_add(metadata.len());
                     if ignore_bytes > MAX_IGNORE_BYTES {
-                        return false;
+                        return Err(WalkFailure::BudgetExceeded);
                     }
                 }
-                let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir())
-                    || (opts.follow_symlinks && path.metadata().is_ok_and(|meta| meta.is_dir()));
-                if is_dir {
+                let followed_dir = if opts.follow_symlinks && file_type.is_symlink() {
+                    match path.metadata() {
+                        Ok(metadata) => metadata.is_dir(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(error) => return Err(WalkFailure::io(&path, &error)),
+                    }
+                } else {
+                    false
+                };
+                if file_type.is_dir() || followed_dir {
                     stack.push(path);
                 }
             }
         }
-        true
+        Ok(())
     }
 
     /// Invalidate every cached walk that overlaps `path` — both walks rooted at
@@ -451,6 +527,50 @@ impl WalkCache {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+}
+
+fn walk_failure_order(left: &WalkFailure, right: &WalkFailure) -> std::cmp::Ordering {
+    match (left, right) {
+        (
+            WalkFailure::Io {
+                path: left_path,
+                message: left_message,
+                ..
+            },
+            WalkFailure::Io {
+                path: right_path,
+                message: right_message,
+                ..
+            },
+        ) => left_path
+            .cmp(right_path)
+            .then_with(|| left_message.cmp(right_message)),
+        (WalkFailure::Io { .. }, WalkFailure::BudgetExceeded) => std::cmp::Ordering::Less,
+        (WalkFailure::BudgetExceeded, WalkFailure::Io { .. }) => std::cmp::Ordering::Greater,
+        (WalkFailure::BudgetExceeded, WalkFailure::BudgetExceeded) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn ignore_failure(error: &ignore::Error, fallback: &Path) -> WalkFailure {
+    WalkFailure::Io {
+        kind: error
+            .io_error()
+            .map_or(std::io::ErrorKind::InvalidData, std::io::Error::kind),
+        path: ignore_error_path(error).unwrap_or(fallback).to_path_buf(),
+        message: error.to_string(),
+    }
+}
+
+fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            ignore_error_path(err)
+        }
+        ignore::Error::Partial(errors) => errors.iter().filter_map(ignore_error_path).min(),
+        ignore::Error::Loop { child, .. } => Some(child),
+        _ => None,
     }
 }
 
@@ -527,6 +647,7 @@ mod tests {
         let cache = WalkCache::with_limits(1, 1, 2, one_path * 2);
         let (entry, _) = cache.get(dir.path(), key());
         assert!(entry.files.len() <= 2);
+        assert_eq!(entry.failure, Some(WalkFailure::BudgetExceeded));
         assert!(
             entry
                 .files
@@ -537,6 +658,80 @@ mod tests {
                 .sum::<usize>()
                 <= one_path * 2
         );
+    }
+
+    #[test]
+    fn malformed_custom_ignore_is_typed_and_never_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let ignore = dir.path().join(".rgignore");
+        std::fs::write(&ignore, "[z-a]\n").unwrap();
+        std::fs::write(dir.path().join("file.rs"), b"x").unwrap();
+        let cache = WalkCache::new(1);
+        let opts = WalkKey {
+            respect_gitignore: true,
+            ..key()
+        };
+
+        let (failed, hit) = cache.get(dir.path(), opts);
+        assert!(!hit);
+        assert!(
+            matches!(
+                failed.failure.as_ref(),
+                Some(WalkFailure::Io {
+                    kind: std::io::ErrorKind::InvalidData,
+                    path,
+                    ..
+                }) if path == &ignore
+            ),
+            "unexpected failure: {:?}",
+            failed.failure
+        );
+        assert!(cache.is_empty(), "an errored snapshot must not be retained");
+
+        std::fs::write(&ignore, "*.tmp\n").unwrap();
+        let (recovered, hit) = cache.get(dir.path(), opts);
+        assert!(!hit, "recovery must rebuild rather than reuse a failure");
+        assert_eq!(recovered.failure, None);
+        assert!(cache.get(dir.path(), opts).1);
+    }
+
+    #[test]
+    fn cancellation_settles_while_the_global_build_lock_is_held() {
+        use hearth_proto::ErrorKind;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+        let cache = Arc::new(WalkCache::new(1));
+        let build_guard = cache.build.lock();
+        let cancel = CancelToken::new();
+        let worker_cancel = cancel.clone();
+        let worker_cache = Arc::clone(&cache);
+        let root = dir.path().to_path_buf();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let error = worker_cache
+                .get_cancellable(&root, key(), &worker_cancel)
+                .err()
+                .expect("a cancelled waiter must fail");
+            done_tx.send(error.kind).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        for _ in 0..100 {
+            std::thread::yield_now();
+        }
+        cancel.cancel();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ErrorKind::Cancelled,
+            "the waiter must settle before the held build lock is released"
+        );
+        drop(build_guard);
+        worker.join().unwrap();
     }
 
     #[cfg(unix)]

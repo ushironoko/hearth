@@ -3,13 +3,13 @@
 //! Inclusion and exclusion globs are deliberately post-filters: one bounded,
 //! path-sorted walk serves every pattern without fragmenting the cache key.
 
-use crate::util::resolve_path;
+use crate::util::{ensure_walk_succeeded, resolve_path};
 use globset::{Glob, GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use hearth_core::cache::{WalkEntry, WalkKey};
 use hearth_core::{CancelToken, Engine, profile};
 use hearth_proto::{FindParams, FindResult, ToolError, ToolResult};
 use std::borrow::Cow;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
 const MAX_PATTERN_BYTES: usize = 4 * 1024;
 const MAX_EXCLUDE_GLOBS: usize = 128;
@@ -39,7 +39,7 @@ pub fn find_cancellable(
         let excludes = ExcludeMatchers::new(&params.exclude_globs)?;
         let limit = params.limit.unwrap_or(DEFAULT_FIND_LIMIT);
 
-        let root = lexical_absolute(engine, &params.path)?;
+        let root = resolve_path(engine, &params.path);
         let metadata = std::fs::metadata(&root).map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => ToolError::not_found(root.display().to_string()),
             _ => ToolError::from(error).with_path(root.display().to_string()),
@@ -54,11 +54,9 @@ pub fn find_cancellable(
             follow_symlinks: params.follow_symlinks,
         };
         engine.watch_root(&root);
-        let (entry, walk_cache_hit) = engine.walks().get(&root, key);
+        let (entry, walk_cache_hit) = engine.walks().get_cancellable(&root, key, cancel)?;
         cancel.check()?;
-        if !entry.complete {
-            return Err(ToolError::invalid("find walk exceeded its work budget"));
-        }
+        ensure_walk_succeeded(&entry, "find")?;
 
         let mut paths = Vec::with_capacity((limit as usize).min(1_000));
         let mut retained_bytes = 0usize;
@@ -139,33 +137,6 @@ fn validate_params(params: &FindParams) -> ToolResult<()> {
         return Err(ToolError::invalid("find exclusion globs exceed 16 KiB"));
     }
     Ok(())
-}
-
-/// Make the cache key and reported root absolute without resolving symlinks.
-fn lexical_absolute(engine: &Engine, path: &str) -> ToolResult<PathBuf> {
-    let resolved = resolve_path(engine, path);
-    let absolute = if resolved.is_absolute() {
-        resolved
-    } else {
-        std::env::current_dir()
-            .map_err(ToolError::from)?
-            .join(resolved)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // An absolute path cannot escape its root; `pop` on the root is
-                // a no-op. This is lexical normalization, not canonicalization.
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    Ok(normalized)
 }
 
 fn build_glob(pattern: &str, label: &str, case_insensitive: bool) -> ToolResult<Glob> {
@@ -334,6 +305,7 @@ impl<'a> Iterator for MergedEntries<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn pi_full_path_transform_keeps_literal_separator() {
@@ -349,7 +321,7 @@ mod tests {
             enable_optimizer: false,
             ..hearth_core::EngineConfig::default()
         });
-        let normalized = lexical_absolute(&engine, "a/../b").unwrap();
+        let normalized = resolve_path(&engine, "a/../b");
         assert!(normalized.is_absolute());
         assert!(normalized.ends_with("relative/base/b"));
     }

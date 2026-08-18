@@ -107,12 +107,12 @@ const operations = {
     try { await access(path); return true; } catch { return false; }
   },
   glob: async (pattern: string, root: string, options: { ignore: string[]; limit: number }) =>
-    engine.find({
+    (await engine.findAsync({
       pattern,
       path: root,
       limit: options.limit,
       excludeGlobs: options.ignore,
-    }).paths,
+    })).paths,
 };
 ```
 
@@ -125,7 +125,10 @@ so Pi's wrapper detects the overflow and emits its standard warning. Hearth's
 ignore discovery is deliberately bounded to root-local `.ignore`/`.rgignore`;
 it does not inherit ancestor/global Git configuration like Pi's bundled `fd`.
 Exclusions post-filter the shared snapshot, so they do not reduce cold-walk work
-or its safety budget.
+or its safety budget. Use `findAsync` in the adapter so a cold walk runs off the
+JavaScript event loop. Pi's current custom `glob` hook does not pass its
+`AbortSignal` through `options`, so that adapter cannot forward cancellation;
+direct `findAsync(params, signal)` callers retain the full cancellation contract.
 
 ## Cache coherence
 

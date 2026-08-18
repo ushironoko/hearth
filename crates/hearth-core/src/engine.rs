@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use hearth_proto::{CacheScope, InvalidateResult, ShellSpec};
 use parking_lot::Mutex;
 use std::any::{Any, TypeId};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -150,9 +150,31 @@ pub struct Engine {
     inner: Arc<EngineInner>,
 }
 
+fn absolute_lexical_cwd(path: PathBuf) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(path))
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
 impl Engine {
     /// Build an engine with the given configuration, starting the optimizer.
-    pub fn new(config: EngineConfig) -> Self {
+    pub fn new(mut config: EngineConfig) -> Self {
+        config.default_cwd = absolute_lexical_cwd(config.default_cwd);
         let files = Arc::new(FileCache::with_limits(
             config.max_cache_bytes,
             config.max_cached_files,
@@ -549,6 +571,22 @@ fn optimizer_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_default_cwd_is_normalized_once_for_shared_cache_keys() {
+        let process_cwd = std::env::current_dir().unwrap();
+        let engine = Engine::new(EngineConfig {
+            default_cwd: PathBuf::from("relative/./base/../base"),
+            enable_optimizer: false,
+            ..EngineConfig::default()
+        });
+
+        assert_eq!(
+            engine.config().default_cwd,
+            process_cwd.join("relative/base")
+        );
+        assert!(engine.config().default_cwd.is_absolute());
+    }
 
     #[test]
     fn watcher_root_budget_is_synchronous() {
