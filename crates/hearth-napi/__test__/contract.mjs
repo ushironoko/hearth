@@ -470,6 +470,98 @@ test("a pre-aborted search rejects", async () => {
 });
 
 // ---------------------------------------------------------------------------
+suite("find");
+
+test("returns pi-compatible relative paths and reuses the walk cache", async () => {
+  const dir = tempDir();
+  mkdirSync(join(dir, "src", "nested"), { recursive: true });
+  mkdirSync(join(dir, "empty"));
+  seed(dir, "root.rs", "");
+  seed(dir, ".hidden", "");
+  seed(dir, "src/a.rs", "");
+  seed(dir, "src/nested/b.rs", "");
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+
+  const first = engine.find({ pattern: "*", path: dir, respectGitignore: false });
+  assert.deepEqual(first.paths, [
+    ".hidden",
+    "empty/",
+    "root.rs",
+    "src/",
+    "src/a.rs",
+    "src/nested/",
+    "src/nested/b.rs",
+  ]);
+  assert.equal(first.totalMatches, 7);
+  assert.equal(first.walkCacheHit, false);
+
+  const warm = await engine.findAsync({ pattern: "src/*.rs", path: dir, respectGitignore: false });
+  assert.deepEqual(warm.paths, ["src/a.rs"]);
+  assert.equal(warm.walkCacheHit, true);
+  assert.equal(warm.limitReached, false);
+  assert.equal(warm.outputLimitReached, false);
+});
+
+test("applies pi custom-operation exclusions before limits", () => {
+  const dir = tempDir();
+  mkdirSync(join(dir, "node_modules", "pkg"), { recursive: true });
+  mkdirSync(join(dir, "src"));
+  seed(dir, "node_modules/pkg/a.js", "");
+  seed(dir, "src/a.js", "");
+  seed(dir, "src/b.js", "");
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+
+  const result = engine.find({
+    pattern: "*.js",
+    path: dir,
+    limit: 2,
+    respectGitignore: false,
+    excludeGlobs: ["**/node_modules/**", "**/.git/**"],
+  });
+  assert.deepEqual(result.paths, ["src/a.js", "src/b.js"]);
+  assert.equal(result.totalMatches, 2);
+  assert.equal(result.limitReached, false);
+});
+
+test("keeps one complete crossing path so Pi can report its 50 KiB truncation", () => {
+  const dir = tempDir();
+  for (let i = 0; i < 240; i++) {
+    seed(dir, `${String(i).padStart(3, "0")}-${"x".repeat(230)}.txt`, "");
+  }
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+
+  const result = engine.find({ pattern: "*.txt", path: dir, limit: 1000 });
+  const joinedBytes = Buffer.byteLength(result.paths.join("\n"));
+  const prefixBytes = Buffer.byteLength(result.paths.slice(0, -1).join("\n"));
+  assert.equal(result.totalMatches, 240);
+  assert.equal(result.outputLimitReached, true);
+  assert.ok(prefixBytes <= 50 * 1024);
+  assert.ok(joinedBytes > 50 * 1024);
+});
+
+test("rejects non-integral or out-of-range limits with a structured error", () => {
+  const dir = tempDir();
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  for (const limit of [-1, 1.5, 1_000_001]) {
+    const error = throws(() => engine.find({ pattern: "*", path: dir, limit }));
+    assert.equal(errorKind(error), "invalidInput");
+  }
+});
+
+test("a pre-aborted find rejects as cancelled", async () => {
+  const dir = tempDir();
+  seed(dir, "a", "");
+  const engine = new HearthEngine({ cwd: dir, enableOptimizer: false });
+  const controller = new AbortController();
+  controller.abort();
+
+  const error = await rejects(() =>
+    engine.findAsync({ pattern: "*", path: dir }, controller.signal),
+  );
+  assert.equal(errorKind(error), "cancelled");
+});
+
+// ---------------------------------------------------------------------------
 suite("write + cache");
 
 test("writing through a symlink keeps the link", () => {
@@ -493,8 +585,8 @@ test("trustCache serves warm bytes until invalidated", () => {
   writeFileSync(path, "after\n"); // out of band, behind Hearth's back
   assert.equal(engine.read({ path }).content, "before\n");
 
-  const dropped = engine.invalidatePath(path);
-  assert.equal(dropped.filesInvalidated, 1);
+  const dropped = engine.invalidatePath("warm.txt");
+  assert.equal(dropped.filesInvalidated, 1, "relative invalidation resolves against engine cwd");
   assert.equal(engine.read({ path }).content, "after\n");
 });
 

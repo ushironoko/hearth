@@ -38,6 +38,9 @@ export declare class HearthEngine {
   /** Synchronous grep. Prefer `grepAsync` for large trees. */
   grep(params: GrepParams): GrepResult
   grepAsync(params: GrepParams, signal?: AbortSignal): Promise<GrepResult>
+  /** Synchronous glob discovery. Prefer `findAsync` for cold large trees. */
+  find(params: FindParams): FindResult
+  findAsync(params: FindParams, signal?: AbortSignal): Promise<FindResult>
   /** Synchronously list symbols extracted from one file. */
   graphSymbols(params: GraphSymbolsParams): GraphResult
   /** Synchronously return the nested symbol outline for one file. */
@@ -310,6 +313,40 @@ export interface FileMatches {
   matchCount: number
   /** Matching and context lines; empty outside `content` mode. */
   lines: Array<GrepLine>
+}
+
+export interface FindParams {
+  /**
+   * Smart-case glob pattern. Empty matches all; basename-only patterns
+   * match at every depth.
+   */
+  pattern: string
+  /** Directory root. Defaults to the engine cwd. */
+  path?: string
+  /** Maximum paths retained. Defaults to 1000; zero is valid. */
+  limit?: number
+  /** Include hidden entries. Defaults to true for pi compatibility. */
+  hidden?: boolean
+  /** Honor root-local `.ignore`/`.rgignore`. Defaults to true. */
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  /** Root-relative path globs removed before matching/counting/limits. */
+  excludeGlobs?: Array<string>
+}
+
+export interface FindResult {
+  /** Search-root-relative POSIX paths; directories end in `/`. */
+  paths: Array<string>
+  totalMatches: number
+  walkCacheHit: boolean
+  limitReached: boolean
+  /**
+   * Pi's 50 KiB presentation budget was crossed. `paths` includes the
+   * first complete crossing path so Pi emits its standard warning.
+   */
+  outputLimitReached: boolean
+  /** Absolute lexical root used by the walk cache. */
+  root: string
 }
 
 export interface GraphBasisEntry {

@@ -1,7 +1,7 @@
 {
   "name": "hearth",
   "version": "0.1.0",
-  "description": "The fastest resident agent-tool orchestrator: read/write/edit/bash/grep as one warm server",
+  "description": "Resident agent-tool orchestrator: read/write/edit/bash/grep/find/graph as one warm server",
   "private": true,
   "type": "commonjs",
   "scripts": {
@@ -14,7 +14,8 @@
     "test:napi:bun": "pnpm --filter @hearthdev/napi run test:bun",
     "test:pi": "pnpm --filter @hearthdev/napi run test:pi",
     "test:tarball": "bash scripts/verify-tarball.sh",
-    "bench": "cargo bench -p hearth-bench"
+    "bench": "cargo bench -p hearth-bench",
+    "bench:pi-find": "bash bench/harness/pi-find.sh"
   },
   "packageManager": "pnpm@11.5.0"
 }

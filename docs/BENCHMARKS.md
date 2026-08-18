@@ -1,6 +1,7 @@
 # Benchmarks & methodology
 
-Two layers are measured because Hearth has two very different surfaces:
+Three layers are measured because Hearth has distinct engine, CLI, and adapter
+surfaces:
 
 1. **Engine level** — `cargo bench -p hearth-bench` (criterion, in-process).
    A function call against a warm engine: no socket, no serialization, no
@@ -10,6 +11,10 @@ Two layers are measured because Hearth has two very different surfaces:
    process connects to a long-lived `hearthd` over a Unix socket each run, vs
    the real installed tool (`rg`/`cat`/`sed`). This is the product-level,
    end-to-end comparison; it pays an IPC tax ∝ payload size.
+3. **Pi tool-operation level** — `bench/harness/pi-find.sh` (Node timing). It
+   executes Pi's installed default find implementation and the same Pi wrapper
+   with Hearth's custom glob adapter. This measures the replacement boundary,
+   including Pi's result processing but excluding package import and UI render.
 
 Hardware: Apple Silicon, 10 cores, 32 GB, macOS 25.3, Rust 1.95, `--release`
 (`lto="fat"`, `codegen-units=1`). Corpus (`gen-corpus`): a **`git init`-ed**
@@ -72,6 +77,46 @@ no per-call spawn. This is exactly why `grep` *does* win at the CLI — the work
 it amortizes (walking + reading + searching thousands of files) dwarfs the
 ~0.7 ms client floor, whereas a small read's saved work does not.
 
+## Pi tool-operation level — default find vs Hearth adapter
+
+`pnpm bench:pi-find` imports Pi 0.84.1's actual private
+`dist/core/tools/find.js` and calls `createFindToolDefinition().execute()`. The
+baseline follows Pi's default branch through `ensureTool`, an `fd` child
+process, readline parsing, path relativization, the 1000-result limit, and the
+50 KiB output limit. The comparison uses the same Pi wrapper but supplies its
+custom `exists`/`glob` hooks, with `glob` backed by a release
+`HearthEngine.findAsync` N-API call so cold walks do not block the JavaScript
+event loop.
+
+The generated 3000-file corpus gives both implementations equivalent ignore
+rules and asserts the complete uncapped `*.rs` path set (3001 paths) before any
+timing. Results on Apple M4, Node 24.6.0, Pi 0.84.1, and fd 10.4.2:
+
+| Pi find scenario | Pi default | Hearth fresh engine | Hearth resident | resident speedup |
+|---|---:|---:|---:|---:|
+| selective `d000/*.rs` | 10.36 ms | 14.83 ms | **1.73 ms** | **5.98×** |
+| no-match `missing-*.rs` | 12.87 ms | 17.16 ms | **1.34 ms** | **9.61×** |
+| broad `*.rs`, limit 1000 | 13.17 ms | 15.08 ms | **2.47 ms** | **5.33×** |
+
+The result is specifically a **resident-cache win**: a fresh Hearth engine is
+1.15–1.43× slower than Pi's fd-backed default, while reuse of one walk snapshot
+makes the replacement 5.33–9.61× faster. The broad Hearth row also computes
+exact `totalMatches`, even though Pi consumes only `paths`; fd can stop at
+`--max-results 1000`, so Hearth does more semantic work in that row.
+
+“Fresh” means a new Hearth engine on every operation, not cold storage. Pi tool
+discovery/download, module imports, corpus generation, and UI rendering are
+outside the timed region, and every row benefits from the OS page cache. Pi's
+custom `glob` hook does not expose its operation `AbortSignal`, so the adapter
+cannot forward cancellation; direct `findAsync(params, signal)` callers can.
+The async adapter still keeps cold traversal off the JavaScript event loop. Pi
+wrapper construction is outside every timed row; the fresh row includes new
+Hearth engine construction and execution. The harness rejects Pi/fd version
+drift, records the managed fd binary hash, and
+isolates global/system Git ignore configuration. See
+[`bench/harness/results/find_pi.md`](../bench/harness/results/find_pi.md) for
+p50/p95, sample counts, correctness gates, and all reproduction caveats.
+
 ## Engine level — component microbenchmarks (criterion)
 
 ### `read` — warm vs `std::fs::read_to_string`
@@ -129,6 +174,7 @@ cargo bench -p hearth-bench --bench grep_bench
 cargo bench -p hearth-bench --bench edit_bench
 cargo bench -p hearth-bench --bench bash_bench
 CORPUS=/tmp/hearth-corpus NUM_FILES=3000 bash bench/harness/compare.sh
+pnpm bench:pi-find
 ```
 
 ## Orchestrator-level & cross-runtime benchmarks

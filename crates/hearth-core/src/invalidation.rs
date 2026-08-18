@@ -220,18 +220,19 @@ mod tests {
         });
         let path = Path::new("src/lib.rs");
         let root = Path::new("src");
+        let resolved = engine.resolve_path(path);
 
         engine.invalidate_path(path);
         let invalidated = engine.invalidations().since(0);
-        assert_eq!(invalidated.paths, Some(vec![path.to_path_buf()]));
+        assert_eq!(invalidated.paths, Some(vec![resolved.clone()]));
 
         engine.note_mutation(path, false);
         let mutated = engine.invalidations().since(invalidated.revision);
-        assert_eq!(mutated.paths, Some(vec![path.to_path_buf()]));
+        assert_eq!(mutated.paths, Some(vec![resolved.clone()]));
 
         engine.invalidate(path, false, CacheScope::All);
         let non_recursive = engine.invalidations().since(mutated.revision);
-        assert_eq!(non_recursive.paths, Some(vec![path.to_path_buf()]));
+        assert_eq!(non_recursive.paths, Some(vec![resolved]));
 
         engine.clear_caches();
         let cleared = engine.invalidations().since(non_recursive.revision);

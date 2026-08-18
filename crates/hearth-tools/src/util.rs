@@ -1,7 +1,8 @@
 //! Shared helpers for the tools: path resolution and the two write strategies.
 
 use hearth_core::Engine;
-use hearth_proto::{ToolError, WriteMode};
+use hearth_core::cache::{WalkEntry, WalkFailure};
+use hearth_proto::{ToolError, ToolResult, WriteMode};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -13,11 +14,22 @@ const TEMP_ATTEMPTS: usize = 128;
 /// Resolve a caller-supplied path to an absolute path, joining the engine's
 /// default cwd when it is relative.
 pub fn resolve_path(engine: &Engine, path: &str) -> PathBuf {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        engine.config().default_cwd.join(p)
+    engine.resolve_path(Path::new(path))
+}
+
+/// Map a typed walk failure into the stable cross-surface tool error contract.
+pub fn ensure_walk_succeeded(entry: &WalkEntry, operation: &str) -> ToolResult<()> {
+    match &entry.failure {
+        None => Ok(()),
+        Some(WalkFailure::BudgetExceeded) => Err(ToolError::invalid(format!(
+            "{operation} walk exceeded its work budget"
+        ))),
+        Some(WalkFailure::Io {
+            kind,
+            path,
+            message,
+        }) => Err(ToolError::from(std::io::Error::new(*kind, message.clone()))
+            .with_path(path.as_os_str().to_string_lossy().into_owned())),
     }
 }
 

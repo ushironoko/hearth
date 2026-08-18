@@ -1,7 +1,7 @@
 # Hearth 🔥
 
 **A resident, all-in-one agent-tool orchestrator.** `read`, `write`, `edit`,
-`bash`, and `grep` are served by one warm, long-lived engine that bundles a file
+`bash`, `grep`, `find`, and `graph` are served by one warm, long-lived engine that bundles a file
 cache, a directory-walk cache, and a warm-shell pool — all shared across every
 tool and reachable from native Rust, from Node.js (napi-rs), and over a
 Unix-socket daemon + CLI.
@@ -13,7 +13,7 @@ Built in Rust, inspired by the *corsa-bind* orchestration model and the
 
 ## Overview
 
-The six tools an agent leans on most, behind one engine:
+Seven tools an agent leans on most, behind one engine:
 
 | Tool | What it does |
 |------|--------------|
@@ -22,14 +22,16 @@ The six tools an agent leans on most, behind one engine:
 | `edit` | One exact replacement, or a batch of disjoint ones applied atomically — matched against the original file, preserving BOM and CRLF, with diff hunks in the result. |
 | `bash` | Shell commands with ordered output streaming, configurable shell, timeout + process-group kill, and an opt-in **warm-shell pool** with at-most-once semantics. |
 | `grep` | ripgrep-grade search (`grep-searcher` + `grep-regex`) over a **cached walk** and **cached file bytes**, with a deterministic global match limit. |
+| `find` | Pi-compatible glob discovery over the resident walk: relative POSIX files and directories, stable limits, exclusions, and symlink controls. |
 | `graph` | Cached symbols, outlines, search, definitions, dependency/reverse-dependency traversal (`deps`/`rdeps`), bidirectional neighborhoods, and index status. |
 
-Every operation is cancellable: pass an `AbortSignal` and the native work stops
-at its next safe point, with nothing left running once the promise settles.
+Every operation is cancellable: pass an `AbortSignal` and native work stops at
+its next safe point, with nothing left running once the promise settles. A cold
+`find` walk is one bounded non-preemptive step; warm filtering polls each entry.
 
 Three surfaces, one core:
 
-- **Native Rust** — `hearth_tools::{read,write,edit,bash,grep,graph}(&Engine, &params)`.
+- **Native Rust** — `hearth_tools::{read,write,edit,bash,grep,find,graph}(&Engine, &params)`.
 - **Node.js** — `@hearthdev/napi`'s `HearthEngine` class (typed sync + cancellable
   async methods, streaming `bash`).
 - **Daemon + CLI** — `hearthd` (a resident server) and the thin `hearth` client,
@@ -81,7 +83,7 @@ What that buys, **measured** (Apple Silicon, `--release`; see
 
 ### Limits
 
-Safety ceilings are enforced even with the optimizer disabled: 256 MiB wire frames with bounded MessagePack structure, 30 s frame receipt, 64 MiB read/edit files, 16 MiB per searched file, 4 MiB aggregate grep results, bounded walk/build/result state, and a 24 h maximum Bash timeout. Directory walks honor only bounded root-local `.ignore`/`.rgignore`; ancestor/global Git ignore files and project-reference tsconfig fan-out are intentionally not expanded.
+Safety ceilings are enforced even with the optimizer disabled: 256 MiB wire frames with bounded MessagePack structure, 30 s frame receipt, 64 MiB read/edit files, 16 MiB per searched file, 4 MiB aggregate grep results, and a 24 h maximum Bash timeout. `find` accepts a 4 KiB include glob, at most 128 exclusion globs / 16 KiB exclusion text, a maximum count limit of 1,000,000, and retains Pi's 50 KiB path-text prefix plus the first complete crossing path (so Pi emits its normal truncation warning) while still counting every match. Walks are bounded by visited entries and retained path bytes. Directory walks honor only bounded root-local `.ignore`/`.rgignore`; ancestor/global Git ignore files and project-reference tsconfig fan-out are intentionally not expanded.
 
 Hearth wins where the amortized work it saves exceeds the cost of reaching it.
 Where it doesn't:
@@ -119,8 +121,9 @@ call.
 
 ### The mechanisms that make it fast
 
-- **Cached walk + cached-bytes grep.** The directory traversal and `.gitignore`
-  parse happen once (`WalkCache`); files ≤ 4 MiB are searched straight from the
+- **Cached walk find + cached-bytes grep.** The sorted file/directory/symlink
+  snapshot and root-local ignore parse happen once (`WalkCache`); `find`
+  re-filters it in memory for every glob, while files ≤ 4 MiB are searched straight from the
   `FileCache` (`search_slice`), so a repeated search does **zero** `open`/`read`
   syscalls — only one `stat` per file for coherence.
 - **UTF-8-validity-cached read.** A warm `read` is a `stat`, an `Arc` clone, and
@@ -206,6 +209,7 @@ bun  bench/harness/bun/compare.js          # fair vs Bun fs
 runtime_dir="$(mktemp -d)"
 chmod 700 "$runtime_dir"
 ./target/release/hearthd --socket "$runtime_dir/hearth.sock" --cwd "$PWD" --trust-cache &
+./target/release/hearth  --socket "$runtime_dir/hearth.sock" find '**/*.rs' . --exclude '**/target/**'
 ./target/release/hearth  --socket "$runtime_dir/hearth.sock" grep -l "TODO" .
 ./target/release/hearth  --socket "$runtime_dir/hearth.sock" stop
 ```
@@ -224,6 +228,16 @@ const r  = eng.read({ path: "src/main.rs" });               // { content, totalL
 const b  = eng.readBytes({ path: "assets/logo.png" });      // binary-safe Buffer
 
 const controller = new AbortController();
+const files = await eng.findAsync(
+  {
+    pattern: "**/*.rs",
+    path: ".",
+    limit: 1000,
+    excludeGlobs: ["**/node_modules/**", "**/.git/**"],
+  },
+  controller.signal,
+); // root-relative POSIX paths; directories end in '/'
+
 const g = await eng.grepAsync(
   { pattern: "fn ", path: "src", globs: ["*.rs"], maxTotalCount: 100 },
   controller.signal,
@@ -249,10 +263,11 @@ await eng.bashStream({ command: "cargo build" }, (chunk) =>
 
 ```rust
 use hearth_core::Engine;
-use hearth_tools::grep;
-use hearth_proto::{GrepParams, GrepMode};
+use hearth_tools::{find, grep};
+use hearth_proto::{FindParams, GrepParams, GrepMode};
 
 let engine = Engine::with_defaults();
+let paths = find(&engine, &FindParams::new("**/*.rs"))?;
 let hits = grep(&engine, &GrepParams {
     pattern: "fn ".into(), path: "src".into(),
     mode: GrepMode::FilesWithMatches, ..Default::default()
@@ -266,7 +281,7 @@ let hits = grep(&engine, &GrepParams {
 | `hearth-proto` | Shared request/response types (the one contract; `serde`, `camelCase`). |
 | `hearth-core`  | The resident `Engine`: the shared caches, warm-shells, and fs-watch. |
 | `hearth-graph` | The I/O-free language registry, symbol extraction, and code-index layer. |
-| `hearth-tools` | The six tools + msgpack transport, built on the engine. |
+| `hearth-tools` | The seven tools + msgpack transport, built on the engine. |
 | `hearth-daemon`| `hearthd` — the Unix-socket server. |
 | `hearth-cli`   | `hearth` — the thin client (daemon or inline). |
 | `hearth-napi`  | `@hearthdev/napi` — the Node addon. |

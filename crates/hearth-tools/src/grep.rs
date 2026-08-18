@@ -11,7 +11,7 @@
 //! Files above the cap fall back to `grep-searcher`'s own IO (`search_path`).
 //! Per-file search is parallelised across worker threads.
 
-use crate::util::resolve_path;
+use crate::util::{ensure_walk_succeeded, resolve_path};
 use dashmap::DashMap;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
@@ -81,10 +81,8 @@ pub fn grep_cancellable(
                 follow_symlinks: params.follow_symlinks,
             };
             engine.watch_root(&root);
-            let (entry, hit) = engine.walks().get(&root, key);
-            if !entry.complete {
-                return Err(ToolError::invalid("grep walk exceeded its work budget"));
-            }
+            let (entry, hit) = engine.walks().get_cancellable(&root, key, cancel)?;
+            ensure_walk_succeeded(&entry, "grep")?;
             if entry.files.len() > MAX_GREP_FILES {
                 return Err(ToolError::invalid("grep file set exceeds 1000000 files"));
             }

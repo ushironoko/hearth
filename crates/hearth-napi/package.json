@@ -1,11 +1,13 @@
 {
   "name": "@hearthdev/napi",
   "version": "0.1.0",
-  "description": "Node.js bindings for the Hearth tool orchestrator: cancellable, streaming read/write/edit/bash/grep on one resident engine",
+  "description": "Node.js bindings for Hearth: cancellable read/write/edit/bash/grep/find/graph on one resident engine",
   "keywords": [
     "napi-rs",
     "agent-tools",
     "grep",
+    "find",
+    "glob",
     "ripgrep",
     "file-cache"
   ],

@@ -3,11 +3,11 @@
 
 mod common;
 
-use common::{abs, engine, seed};
+use common::{abs, engine, seed, trusting_engine};
 use hearth_core::CancelToken;
 use hearth_proto::*;
-use hearth_tools::{read, read_bytes, read_bytes_cancellable, read_cancellable, write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use hearth_tools::{find, read, read_bytes, read_bytes_cancellable, read_cancellable, write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 fn windowed(path: &str, offset: u64, limit: u64, mode: LineWindowMode) -> ReadParams {
     ReadParams {
@@ -75,6 +75,61 @@ fn a_file_without_a_trailing_newline_counts_the_same_in_both_modes() {
     assert!(!slice.ends_with_newline);
     assert_eq!(slice.content, "a\nb");
     assert_eq!(split.content, "a\nb");
+}
+
+#[test]
+fn parent_components_after_a_symlink_keep_os_resolution_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(outside.join("dir")).unwrap();
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("file.txt"), "inside\n").unwrap();
+    std::fs::write(outside.join("file.txt"), "outside\n").unwrap();
+    symlink(outside.join("dir"), repo.join("link")).unwrap();
+    let eng = trusting_engine(&repo);
+    let spelling = "link/../file.txt";
+    let canonical = outside.join("file.txt");
+    let canonical_params = ReadParams::new(canonical.display().to_string());
+
+    assert_eq!(
+        read(&eng, &ReadParams::new(spelling)).unwrap().content,
+        "outside\n"
+    );
+    assert!(!read(&eng, &canonical_params).unwrap().cache_hit);
+    assert!(read(&eng, &canonical_params).unwrap().cache_hit);
+
+    let find_params = FindParams {
+        pattern: "*.txt".to_string(),
+        path: outside.display().to_string(),
+        ..FindParams::default()
+    };
+    assert!(!find(&eng, &find_params).unwrap().walk_cache_hit);
+    assert!(find(&eng, &find_params).unwrap().walk_cache_hit);
+
+    write(&eng, &WriteParams::new(spelling, "updated\n")).unwrap();
+    let refreshed = read(&eng, &canonical_params).unwrap();
+    assert_eq!(refreshed.content, "updated\n");
+    assert!(
+        !refreshed.cache_hit,
+        "the canonical trusted-cache spelling must be invalidated"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+        "inside\n"
+    );
+
+    let revision = eng.invalidations().since(0).revision;
+    write(&eng, &WriteParams::new("link/../created.txt", "created\n")).unwrap();
+    let refreshed_find = find(&eng, &find_params).unwrap();
+    assert!(!refreshed_find.walk_cache_hit);
+    assert!(refreshed_find.paths.contains(&"created.txt".to_string()));
+    let delta = eng.invalidations().since(revision);
+    assert!(delta.paths.as_ref().is_some_and(|paths| {
+        paths
+            .iter()
+            .any(|path| path.ends_with("link/../created.txt"))
+    }));
 }
 
 #[test]

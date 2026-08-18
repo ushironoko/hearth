@@ -17,7 +17,7 @@ use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -254,6 +254,57 @@ fn verification_03_trust_cache_waits_for_invalidation_but_hearth_write_is_immedi
     )
     .unwrap();
     assert_eq!(symbol_names(&query()), ["hearth_write_is_immediate"]);
+}
+
+#[test]
+fn alias_root_reindexes_after_a_canonical_hearth_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let file = seed(&outside, "lib.rs", "pub fn original_alias_symbol() {}\n");
+    symlink(&outside, repo.join("link")).unwrap();
+
+    let alias_root = repo.join("link");
+    let eng = trusting_engine(&repo);
+    let query = || {
+        graph(
+            &eng,
+            &params(
+                &alias_root,
+                GraphOp::Symbols {
+                    path: "lib.rs".to_string(),
+                },
+            ),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(symbol_names(&query()), ["original_alias_symbol"]);
+    write(
+        &eng,
+        &WriteParams::new(&file, "pub fn refreshed_alias_symbol() {}\n"),
+    )
+    .unwrap();
+    let refreshed = query();
+    assert_eq!(symbol_names(&refreshed), ["refreshed_alias_symbol"]);
+    assert_eq!(refreshed.meta.reindexed_files, 1);
+
+    std::fs::create_dir(outside.join("dir")).unwrap();
+    symlink(outside.join("dir"), repo.join("step")).unwrap();
+    let parent_spelling = repo.join("step").join("..").join("lib.rs");
+    write(
+        &eng,
+        &WriteParams::new(
+            parent_spelling.display().to_string(),
+            "pub fn parent_alias_symbol() {}\n",
+        ),
+    )
+    .unwrap();
+    let parent_refreshed = query();
+    assert_eq!(symbol_names(&parent_refreshed), ["parent_alias_symbol"]);
+    assert_eq!(parent_refreshed.meta.reindexed_files, 1);
 }
 
 #[test]

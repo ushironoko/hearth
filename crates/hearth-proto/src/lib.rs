@@ -654,6 +654,80 @@ pub struct GrepResult {
 }
 
 // ---------------------------------------------------------------------------
+// find
+// ---------------------------------------------------------------------------
+
+/// Parameters for pi-compatible glob discovery over a directory tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindParams {
+    /// Glob pattern. Patterns without `/` match entry basenames; patterns with
+    /// `/` use pi's absolute full-path transform.
+    pub pattern: String,
+    /// Directory root. Relative paths are resolved from the engine cwd.
+    #[serde(default = "default_find_path")]
+    pub path: String,
+    /// Maximum number of paths retained. `None` uses 1000; zero is valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    /// Include hidden entries (default true, matching pi's `fd --hidden`).
+    #[serde(default = "default_true")]
+    pub hidden: bool,
+    /// Honor Hearth's bounded root-local `.ignore`/`.rgignore` policy.
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
+    /// Follow symbolic links while walking.
+    #[serde(default)]
+    pub follow_symlinks: bool,
+    /// Root-relative path globs removed before include matching and limits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_globs: Vec<String>,
+}
+
+impl Default for FindParams {
+    fn default() -> Self {
+        Self {
+            pattern: String::new(),
+            path: default_find_path(),
+            limit: None,
+            hidden: true,
+            respect_gitignore: true,
+            follow_symlinks: false,
+            exclude_globs: Vec::new(),
+        }
+    }
+}
+
+impl FindParams {
+    /// A pi-compatible find rooted at the engine cwd.
+    pub fn new(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Deterministic path-discovery result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindResult {
+    /// Search-root-relative POSIX paths. Directories end in `/`.
+    pub paths: Vec<String>,
+    /// Exact matches after exclusions and before result/output limits.
+    pub total_matches: u64,
+    /// True when the resident directory snapshot was reused.
+    pub walk_cache_hit: bool,
+    /// True when the requested/default count limit omitted a match.
+    pub limit_reached: bool,
+    /// True when pi's 50 KiB presentation budget was crossed. `paths` keeps
+    /// the first complete crossing path so pi can detect and report truncation.
+    pub output_limit_reached: bool,
+    /// Absolute lexical root used for the walk-cache key.
+    pub root: String,
+}
+
+// ---------------------------------------------------------------------------
 // graph
 // ---------------------------------------------------------------------------
 
@@ -1197,7 +1271,7 @@ pub struct InvalidateResult {
 
 /// Current daemon transport contract. A client negotiates this before sending
 /// an operation, so incompatible peers fail before mutation or FD transfer.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1226,6 +1300,7 @@ pub enum Request {
     EditBatch(EditBatchParams),
     Bash(BashParams),
     Grep(GrepParams),
+    Find(FindParams),
     Invalidate(InvalidateParams),
     /// Drop every cached file and walk.
     ClearCaches,
@@ -1250,6 +1325,7 @@ pub enum Response {
     EditBatch(EditBatchResult),
     Bash(BashResult),
     Grep(GrepResult),
+    Find(FindResult),
     Invalidate(InvalidateResult),
     Pong,
     Stats(String),
@@ -1273,6 +1349,10 @@ pub struct StreamedResult {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_find_path() -> String {
+    ".".into()
 }
 
 fn default_search_limit() -> u64 {

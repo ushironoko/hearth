@@ -759,6 +759,85 @@ impl From<proto::GrepResult> for GrepResult {
 }
 
 // ---------------------------------------------------------------------------
+// find
+// ---------------------------------------------------------------------------
+
+#[napi(object)]
+pub struct FindParams {
+    /// Smart-case glob pattern. Empty matches all; basename-only patterns
+    /// match at every depth.
+    pub pattern: String,
+    /// Directory root. Defaults to the engine cwd.
+    pub path: Option<String>,
+    /// Maximum paths retained. Defaults to 1000; zero is valid.
+    pub limit: Option<f64>,
+    /// Include hidden entries. Defaults to true for pi compatibility.
+    pub hidden: Option<bool>,
+    /// Honor root-local `.ignore`/`.rgignore`. Defaults to true.
+    pub respect_gitignore: Option<bool>,
+    pub follow_symlinks: Option<bool>,
+    /// Root-relative path globs removed before matching/counting/limits.
+    pub exclude_globs: Option<Vec<String>>,
+}
+
+impl TryFrom<FindParams> for proto::FindParams {
+    type Error = proto::ToolError;
+
+    fn try_from(p: FindParams) -> Result<Self, Self::Error> {
+        let limit = match p.limit {
+            Some(value)
+                if !value.is_finite()
+                    || value < 0.0
+                    || value.fract() != 0.0
+                    || value > 1_000_000.0 =>
+            {
+                return Err(proto::ToolError::invalid(
+                    "find limit must be an integer from 0 through 1000000",
+                ));
+            }
+            Some(value) => Some(value as u64),
+            None => None,
+        };
+        Ok(Self {
+            pattern: p.pattern,
+            path: p.path.unwrap_or_else(|| ".".into()),
+            limit,
+            hidden: p.hidden.unwrap_or(true),
+            respect_gitignore: p.respect_gitignore.unwrap_or(true),
+            follow_symlinks: p.follow_symlinks.unwrap_or(false),
+            exclude_globs: p.exclude_globs.unwrap_or_default(),
+        })
+    }
+}
+
+#[napi(object)]
+pub struct FindResult {
+    /// Search-root-relative POSIX paths; directories end in `/`.
+    pub paths: Vec<String>,
+    pub total_matches: i64,
+    pub walk_cache_hit: bool,
+    pub limit_reached: bool,
+    /// Pi's 50 KiB presentation budget was crossed. `paths` includes the
+    /// first complete crossing path so Pi emits its standard warning.
+    pub output_limit_reached: bool,
+    /// Absolute lexical root used by the walk cache.
+    pub root: String,
+}
+
+impl From<proto::FindResult> for FindResult {
+    fn from(r: proto::FindResult) -> Self {
+        Self {
+            paths: r.paths,
+            total_matches: as_i64(r.total_matches),
+            walk_cache_hit: r.walk_cache_hit,
+            limit_reached: r.limit_reached,
+            output_limit_reached: r.output_limit_reached,
+            root: r.root,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // graph
 // ---------------------------------------------------------------------------
 

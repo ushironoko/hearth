@@ -1,7 +1,8 @@
 # `@hearthdev/napi`
 
 Node.js bindings for [Hearth](https://github.com/ushironoko/hearth) — one
-resident engine serving `read`, `write`, `edit`, `bash`, and `grep` from shared
+resident engine serving `read`, `write`, `edit`, `bash`, `grep`, `find`, and
+`graph` from shared
 warm caches and a warm shell pool.
 
 Prebuilt binaries ship for macOS (arm64, x64) and Linux (x64, arm64 glibc); no
@@ -21,6 +22,13 @@ import { HearthEngine } from "@hearthdev/napi";
 const engine = new HearthEngine({ cwd: process.cwd(), warmShell: true });
 
 const file = await engine.readAsync({ path: "src/main.rs" });
+
+const paths = await engine.findAsync({
+  pattern: "**/*.rs",
+  path: ".",
+  limit: 1000,
+  excludeGlobs: ["**/node_modules/**", "**/.git/**"],
+}); // { paths: ["src/lib.rs", ...], totalMatches, walkCacheHit, ... }
 
 const found = await engine.grepAsync({
   pattern: "TODO",
@@ -55,6 +63,8 @@ controller.abort();
 
 An already-aborted signal rejects before any work starts. An abort mid-flight
 stops the native work at its next safe point: `grep` joins every worker,
+`find` polls every warm-snapshot candidate (a cold bounded walk completes as one
+non-preemptive step),
 `bash` kills the command's whole process group, and a file mutation keeps its
 per-path lock until its bytes are committed — so when the promise settles,
 nothing is still running.
@@ -83,6 +93,43 @@ a warm shell and the shell then died before reporting a result. Hearth
 guarantees **at-most-once** execution, so it never retries such a command —
 and neither should the caller without checking what actually happened.
 
+## Pi `find` adapter
+
+`find` returns deterministic search-root-relative POSIX paths and marks
+directories with `/`. It accepts the exclusion list Pi supplies to custom glob
+operations before applying count/output limits:
+
+```ts
+import { access } from "node:fs/promises";
+
+const operations = {
+  exists: async (path: string) => {
+    try { await access(path); return true; } catch { return false; }
+  },
+  glob: async (pattern: string, root: string, options: { ignore: string[]; limit: number }) =>
+    (await engine.findAsync({
+      pattern,
+      path: root,
+      limit: options.limit,
+      excludeGlobs: options.ignore,
+    })).paths,
+};
+```
+
+Patterns without `/` match basenames at every depth. Slash patterns follow Pi's
+full-path `**/` transform; matching is fd-compatible smart-case and an empty
+pattern matches all entries. The result reports `limitReached` and
+`outputLimitReached` separately and always gives exact `totalMatches`. When the
+joined text crosses 50 KiB, `paths` includes that first complete crossing path
+so Pi's wrapper detects the overflow and emits its standard warning. Hearth's
+ignore discovery is deliberately bounded to root-local `.ignore`/`.rgignore`;
+it does not inherit ancestor/global Git configuration like Pi's bundled `fd`.
+Exclusions post-filter the shared snapshot, so they do not reduce cold-walk work
+or its safety budget. Use `findAsync` in the adapter so a cold walk runs off the
+JavaScript event loop. Pi's current custom `glob` hook does not pass its
+`AbortSignal` through `options`, so that adapter cannot forward cancellation;
+direct `findAsync(params, signal)` callers retain the full cancellation contract.
+
 ## Cache coherence
 
 `trustCache: true` skips the per-read freshness `stat`, which is where most of
@@ -97,7 +144,9 @@ engine.clearCaches();                        // everything
 
 After a shell command, `invalidateRoot(cwd)` is the sound choice: an arbitrary
 command can create, delete, rename or rewrite anything under its working
-directory.
+directory. This also refreshes `find`'s warm structural snapshot; without
+watching or explicit invalidation, out-of-band file and empty-directory changes
+remain absent/present in that snapshot.
 
 ## Documentation
 
