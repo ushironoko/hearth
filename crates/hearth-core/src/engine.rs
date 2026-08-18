@@ -351,7 +351,7 @@ impl Engine {
     /// enumerated it. Use after a mutation Hearth did not perform itself.
     pub fn invalidate_path(&self, path: &Path) -> InvalidateResult {
         let path = self.resolve_path(path);
-        let files = u64::from(self.inner.files.invalidate(&path));
+        let files = self.inner.files.invalidate_aliases(&path) as u64;
         let walks = self.inner.walks.invalidate_under(&path) as u64;
         self.inner.invalidations.record(&path);
         InvalidateResult {
@@ -386,7 +386,7 @@ impl Engine {
             } else if recursive {
                 self.inner.files.invalidate_prefix(&path) as u64
             } else {
-                u64::from(self.inner.files.invalidate(&path))
+                self.inner.files.invalidate_aliases(&path) as u64
             },
             walks_invalidated: if walks {
                 self.inner.walks.invalidate_under(&path) as u64
@@ -433,15 +433,17 @@ impl Engine {
         result
     }
 
-    /// Keep the walk cache coherent after Hearth itself mutated `path`.
+    /// Keep resident filesystem state coherent after Hearth mutated `path`.
     ///
-    /// A walk caches *which files exist* under a root, so it only goes stale
-    /// when a mutation changes the answer: creating a path adds an entry, and
-    /// rewriting a file that drives traversal (`.gitignore` and friends) can
-    /// add or remove many. Overwriting an ordinary existing file changes
-    /// nothing a walk recorded, so the common case costs one boolean test.
+    /// File invalidation removes every cached symlink spelling with the same
+    /// canonical identity; the tool republishes the just-written spelling only
+    /// after this method returns. A walk caches *which files exist* under a
+    /// root, so it only goes stale when a mutation changes the answer: creating
+    /// a path adds an entry, and rewriting an ignore file can add or remove
+    /// many. Overwriting an ordinary existing file leaves walks intact.
     pub fn note_mutation(&self, path: &Path, created: bool) {
         let path = self.resolve_path(path);
+        self.inner.files.invalidate(&path);
         if created || is_ignore_file(&path) {
             self.inner.walks.invalidate_under(&path);
         }

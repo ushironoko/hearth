@@ -1,6 +1,6 @@
 # Pi default find vs Hearth-backed Pi find
 
-Generated: 2026-08-18T05:37:02.027Z
+Generated: 2026-08-18T06:14:33.200Z
 
 - Pi package: `@earendil-works/pi-coding-agent@0.84.1`
 - Pi implementation: `@earendil-works/pi-coding-agent/dist/core/tools/find.js` (private `createFindToolDefinition().execute`)
@@ -13,9 +13,9 @@ Generated: 2026-08-18T05:37:02.027Z
 
 | Scenario | Pi default mean | Hearth fresh mean | Hearth resident mean | Pi / fresh | Pi / resident |
 |---|---:|---:|---:|---:|---:|
-| selective `d000/*.rs` | 11.41 ms | 15.94 ms | 1.41 ms | 0.72× | 8.10× |
-| no-match `missing-*.rs` | 10.00 ms | 15.44 ms | 1.08 ms | 0.65× | 9.28× |
-| broad `*.rs`, limit 1000 | 13.55 ms | 15.63 ms | 1.75 ms | 0.87× | 7.73× |
+| selective `d000/*.rs` | 10.36 ms | 14.83 ms | 1.73 ms | 0.70× | 5.98× |
+| no-match `missing-*.rs` | 12.87 ms | 17.16 ms | 1.34 ms | 0.75× | 9.61× |
+| broad `*.rs`, limit 1000 | 13.17 ms | 15.08 ms | 2.47 ms | 0.87× | 5.33× |
 
 Ratios are Pi latency divided by Hearth latency; values above 1 mean Hearth is faster.
 
@@ -23,15 +23,15 @@ Ratios are Pi latency divided by Hearth latency; values above 1 mean Hearth is f
 
 | Scenario | Implementation | p50 | p95 | iterations |
 |---|---|---:|---:|---:|
-| selective `d000/*.rs` | Pi default | 11.40 ms | 12.76 ms | 176 |
-| selective `d000/*.rs` | Hearth fresh engine | 15.16 ms | 17.14 ms | 126 |
-| selective `d000/*.rs` | Hearth resident | 1.38 ms | 1.52 ms | 1421 |
-| no-match `missing-*.rs` | Pi default | 9.88 ms | 11.05 ms | 201 |
-| no-match `missing-*.rs` | Hearth fresh engine | 15.37 ms | 17.42 ms | 130 |
-| no-match `missing-*.rs` | Hearth resident | 1.07 ms | 1.11 ms | 1856 |
-| broad `*.rs`, limit 1000 | Pi default | 13.12 ms | 16.91 ms | 148 |
-| broad `*.rs`, limit 1000 | Hearth fresh engine | 15.37 ms | 18.62 ms | 128 |
-| broad `*.rs`, limit 1000 | Hearth resident | 1.56 ms | 2.24 ms | 1141 |
+| selective `d000/*.rs` | Pi default | 10.19 ms | 11.51 ms | 194 |
+| selective `d000/*.rs` | Hearth fresh engine | 14.69 ms | 16.76 ms | 135 |
+| selective `d000/*.rs` | Hearth resident | 1.61 ms | 3.02 ms | 1154 |
+| no-match `missing-*.rs` | Pi default | 11.66 ms | 19.59 ms | 156 |
+| no-match `missing-*.rs` | Hearth fresh engine | 16.99 ms | 23.16 ms | 117 |
+| no-match `missing-*.rs` | Hearth resident | 1.31 ms | 1.63 ms | 1494 |
+| broad `*.rs`, limit 1000 | Pi default | 12.70 ms | 17.58 ms | 152 |
+| broad `*.rs`, limit 1000 | Hearth fresh engine | 14.83 ms | 19.00 ms | 133 |
+| broad `*.rs`, limit 1000 | Hearth resident | 2.40 ms | 3.32 ms | 810 |
 
 ## Scope and fairness
 

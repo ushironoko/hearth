@@ -71,22 +71,21 @@ pub fn write_owned_cancellable(
         let bytes_written = content.len() as u64;
         let meta = write_bytes(&target, content.as_bytes(), params.create_dirs, params.mode)?;
 
+        // Invalidate every cached spelling of the target before republishing
+        // the freshly-written bytes. Doing this after `put_written` would let
+        // alias invalidation remove the replacement too.
+        engine.note_mutation(&target, !meta.existed);
+        if followed_symlink {
+            // Preserve the requested spelling in the journal as well. This is
+            // required both for creation (walk membership) and overwrite
+            // (derived state rooted through the alias).
+            engine.note_mutation(&requested, !meta.existed);
+        }
         // Move the content's own allocation into the cache Arc (no extra copy).
         let arc: Arc<[u8]> = Arc::from(content.into_bytes().into_boxed_slice());
         engine
             .files()
             .put_written(&target, arc, meta.size, meta.mtime_ns);
-        if followed_symlink {
-            // The link path is a separate cache key; drop it so a `trustCache`
-            // read through the link cannot serve the pre-write bytes.
-            engine.files().invalidate(&requested);
-        }
-        // Creating a file, or rewriting one that steers traversal, changes what
-        // a cached directory walk would have returned.
-        engine.note_mutation(&target, !meta.existed);
-        if followed_symlink && !meta.existed {
-            engine.note_mutation(&requested, true);
-        }
 
         hearth_core::profiler::count("tool.write.bytes", bytes_written);
         Ok(WriteResult {

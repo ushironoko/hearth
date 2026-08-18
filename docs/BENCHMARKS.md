@@ -94,13 +94,13 @@ timing. Results on Apple M4, Node 24.6.0, Pi 0.84.1, and fd 10.4.2:
 
 | Pi find scenario | Pi default | Hearth fresh engine | Hearth resident | resident speedup |
 |---|---:|---:|---:|---:|
-| selective `d000/*.rs` | 11.41 ms | 15.94 ms | **1.41 ms** | **8.10×** |
-| no-match `missing-*.rs` | 10.00 ms | 15.44 ms | **1.08 ms** | **9.28×** |
-| broad `*.rs`, limit 1000 | 13.55 ms | 15.63 ms | **1.75 ms** | **7.73×** |
+| selective `d000/*.rs` | 10.36 ms | 14.83 ms | **1.73 ms** | **5.98×** |
+| no-match `missing-*.rs` | 12.87 ms | 17.16 ms | **1.34 ms** | **9.61×** |
+| broad `*.rs`, limit 1000 | 13.17 ms | 15.08 ms | **2.47 ms** | **5.33×** |
 
 The result is specifically a **resident-cache win**: a fresh Hearth engine is
-1.15–1.54× slower than Pi's fd-backed default, while reuse of one walk snapshot
-makes the replacement 7.73–9.28× faster. The broad Hearth row also computes
+1.15–1.43× slower than Pi's fd-backed default, while reuse of one walk snapshot
+makes the replacement 5.33–9.61× faster. The broad Hearth row also computes
 exact `totalMatches`, even though Pi consumes only `paths`; fd can stop at
 `--max-results 1000`, so Hearth does more semantic work in that row.
 

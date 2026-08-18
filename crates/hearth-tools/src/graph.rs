@@ -992,7 +992,7 @@ fn build_sweep_delta(
             snapshot
                 .config_dependencies
                 .iter()
-                .any(|dependency| path == Path::new(dependency.as_str()))
+                .any(|dependency| same_invalidation_identity(path, Path::new(dependency.as_str())))
         }),
     };
     let mut config_changed = config_invalidated;
@@ -1009,7 +1009,7 @@ fn build_sweep_delta(
         None => records.clear(),
         Some(paths) => {
             for path in paths {
-                if let Some(relative) = relative_path(root, &path) {
+                if let Some(relative) = relative_invalidation_path(root, &path) {
                     records.remove(relative.as_str());
                 }
             }
@@ -2824,7 +2824,7 @@ fn stale_file_count(engine: &Engine, root: &Path, state: &RootState) -> u64 {
             } else {
                 root.join(path)
             };
-            relative_path(root, &absolute)
+            relative_invalidation_path(root, &absolute)
         })
         .filter(|path| state.index.file_hash(path.as_str()).is_some())
         .collect::<FxHashSet<_>>()
@@ -3018,6 +3018,31 @@ fn relative_path(root: &Path, path: &Path) -> Option<CompactString> {
         RelativePath::Inside { relative, .. } => Some(relative),
         RelativePath::OutsideRoot | RelativePath::NonUtf8 => None,
     }
+}
+
+/// Match trusted mutation metadata by canonical filesystem identity when it is
+/// available, then fall back to the public lexical spelling for deleted paths.
+/// Query containment remains lexical and cannot use symlinks to escape the
+/// graph root.
+fn relative_invalidation_path(root: &Path, path: &Path) -> Option<CompactString> {
+    canonical_identity(root)
+        .zip(canonical_identity(path))
+        .and_then(|(root, path)| relative_path(&root, &path))
+        .or_else(|| relative_path(root, path))
+}
+
+fn same_invalidation_identity(left: &Path, right: &Path) -> bool {
+    left == right
+        || canonical_identity(left)
+            .zip(canonical_identity(right))
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn canonical_identity(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok().or_else(|| {
+        let parent = std::fs::canonicalize(path.parent()?).ok()?;
+        Some(parent.join(path.file_name()?))
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]

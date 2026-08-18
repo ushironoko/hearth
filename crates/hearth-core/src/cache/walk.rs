@@ -7,6 +7,7 @@
 //! entirely and just re-filter the cached list by glob in memory.
 
 use crate::CancelToken;
+use crate::pathlock::mutation_key;
 use dashmap::DashMap;
 use hearth_proto::ToolResult;
 use ignore::{WalkBuilder, WalkState};
@@ -29,6 +30,9 @@ pub struct WalkKey {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     root: PathBuf,
+    /// Canonical identity of `root`, retained separately so invalidation of a
+    /// mutation through any symlink spelling drops every overlapping snapshot.
+    identity: PathBuf,
     opts: WalkKey,
 }
 
@@ -72,7 +76,6 @@ pub struct WalkEntry {
     pub failure: Option<WalkFailure>,
     /// Backward-compatible completeness bit. New callers should inspect
     /// [`Self::failure`] for a typed cause when this is false.
-    #[deprecated(note = "inspect WalkEntry::failure for the typed cause")]
     pub complete: bool,
     retained_path_bytes: usize,
     last_access: AtomicU64,
@@ -149,6 +152,7 @@ impl WalkCache {
         cancel.check()?;
         let key = CacheKey {
             root: root.to_path_buf(),
+            identity: mutation_key(root),
             opts,
         };
         if let Some(entry) = self.map.get(&key) {
@@ -181,7 +185,6 @@ impl WalkCache {
             .map(|path| path.as_os_str().len())
             .sum();
         let complete = failure.is_none();
-        #[allow(deprecated)]
         let entry = Arc::new(WalkEntry {
             root: root.to_path_buf(),
             files: Arc::new(files),
@@ -530,11 +533,16 @@ impl WalkCache {
     /// beneath it (which `path` may have just replaced wholesale). Returns the
     /// number of entries dropped.
     pub fn invalidate_under(&self, path: &Path) -> usize {
+        let identity = mutation_key(path);
         let _mutation = self.mutation.lock();
         self.generation.fetch_add(1, Ordering::AcqRel);
         let before = self.map.len();
-        self.map
-            .retain(|k, _| !path.starts_with(&k.root) && !k.root.starts_with(path));
+        self.map.retain(|key, _| {
+            let raw_overlaps = path.starts_with(&key.root) || key.root.starts_with(path);
+            let identity_overlaps =
+                identity.starts_with(&key.identity) || key.identity.starts_with(&identity);
+            !raw_overlaps && !identity_overlaps
+        });
         before.saturating_sub(self.map.len())
     }
 

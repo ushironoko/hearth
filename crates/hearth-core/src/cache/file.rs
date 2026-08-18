@@ -10,6 +10,7 @@
 //! a transient, opt-in fast path for very large files inside `grep`.
 
 use crate::line_index::LineIndex;
+use crate::pathlock::mutation_key;
 use crate::singleflight::SingleFlight;
 use dashmap::DashMap;
 use hearth_proto::ToolError;
@@ -25,6 +26,9 @@ use xxhash_rust::xxh3::xxh3_64;
 /// One cached file: its bytes plus lazily-computed derived data.
 pub struct FileEntry {
     pub path: PathBuf,
+    /// Canonical filesystem identity used to invalidate every cached symlink
+    /// spelling of the same file after a Hearth-owned mutation.
+    identity: PathBuf,
     data: Arc<[u8]>,
     pub size: u64,
     pub mtime_ns: i128,
@@ -44,8 +48,10 @@ impl FileEntry {
         let accounted_bytes = source_bytes.and_then(|source_bytes| {
             source_bytes.checked_add(LineIndex::max_heap_bytes(data.len())?)
         });
+        let identity = mutation_key(&path);
         Self {
             path,
+            identity,
             data,
             size,
             mtime_ns,
@@ -528,28 +534,51 @@ impl FileCache {
             .0
     }
 
-    /// Drop a single path (called by fs-watch invalidation). Returns whether an
-    /// entry was actually removed.
+    /// Drop a single path and every cached symlink spelling with the same
+    /// canonical filesystem identity. Returns whether any entry was removed.
     pub fn invalidate(&self, path: &Path) -> bool {
-        let mut state = self.state.lock();
-        self.remove_key_locked(&mut state, path)
+        self.invalidate_aliases(path) > 0
     }
 
-    /// Drop `root` and every entry beneath it. Returns the number removed.
+    /// As [`Self::invalidate`], returning the exact number of alias entries
+    /// removed for public invalidation accounting.
+    pub fn invalidate_aliases(&self, path: &Path) -> usize {
+        let identity = mutation_key(path);
+        let mut state = self.state.lock();
+        let victims: Vec<PathBuf> = self
+            .map
+            .iter()
+            .filter(|entry| entry.key() == path || entry.value().identity == identity)
+            .map(|entry| entry.key().clone())
+            .collect();
+        let mut removed = 0;
+        for victim in victims {
+            if self.remove_key_locked(&mut state, &victim) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Drop `root`, every entry beneath it, and equivalent cached alias paths.
     ///
     /// Cost is proportional to the number of *cached* entries, not to the size
     /// of the tree on disk, so this stays bounded by the cache's own entry cap
     /// even when pointed at a huge directory.
     pub fn invalidate_prefix(&self, root: &Path) -> usize {
-        let mut removed = 0;
+        let identity = mutation_key(root);
+        let mut state = self.state.lock();
         let victims: Vec<PathBuf> = self
             .map
             .iter()
-            .map(|e| e.key().clone())
-            .filter(|p| p.starts_with(root))
+            .filter(|entry| {
+                entry.key().starts_with(root) || entry.value().identity.starts_with(&identity)
+            })
+            .map(|entry| entry.key().clone())
             .collect();
-        for path in victims {
-            if self.invalidate(&path) {
+        let mut removed = 0;
+        for victim in victims {
+            if self.remove_key_locked(&mut state, &victim) {
                 removed += 1;
             }
         }

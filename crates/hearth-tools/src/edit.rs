@@ -324,20 +324,23 @@ fn commit(
 /// `path`'s mutation lock.
 fn commit_with(
     engine: &Engine,
-    _requested: &std::path::Path,
+    requested: &std::path::Path,
     path: &std::path::Path,
     new_text: String,
     mode: hearth_proto::WriteMode,
 ) -> ToolResult<u64> {
     let byte_len = new_text.len() as u64;
     let meta = write_bytes(path, new_text.as_bytes(), false, mode)?;
+    // Invalidate every cached alias before republishing the fresh entry. An
+    // edit never creates the file, but rewriting an ignore file can still
+    // change what a cached walk enumerates.
+    engine.note_mutation(path, false);
+    if requested != path {
+        engine.note_mutation(requested, false);
+    }
     let arc: Arc<[u8]> = Arc::from(new_text.into_bytes().into_boxed_slice());
     engine
         .files()
         .put_written(path, arc, meta.size, meta.mtime_ns);
-    // An edit never creates the file, but it can rewrite one that steers
-    // directory traversal — `.gitignore` and friends — which changes what a
-    // cached walk would enumerate.
-    engine.note_mutation(path, false);
     Ok(byte_len)
 }
