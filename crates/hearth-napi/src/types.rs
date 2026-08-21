@@ -841,6 +841,152 @@ impl From<proto::FindResult> for FindResult {
 // graph
 // ---------------------------------------------------------------------------
 
+const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+fn graph_prefetch_limit(value: Option<f64>, field: &str) -> Result<Option<u64>, proto::ToolError> {
+    match value {
+        Some(value)
+            if !value.is_finite()
+                || value < 0.0
+                || value.fract() != 0.0
+                || value > JS_MAX_SAFE_INTEGER =>
+        {
+            Err(proto::ToolError::invalid(format!(
+                "graph prefetch {field} must be a non-negative safe integer"
+            )))
+        }
+        Some(value) => Ok(Some(value as u64)),
+        None => Ok(None),
+    }
+}
+
+/// Bounded depth-one graph prefetch for integration adapters.
+#[napi(object)]
+pub struct GraphPrefetchParams {
+    /// Root that contains every admitted seed and resolved target.
+    pub root: String,
+    /// Explicit seed paths. Relative paths are resolved beneath `root`.
+    pub files: Option<Vec<String>>,
+    /// Optional caller reduction of the native seed cap.
+    pub max_seeds: Option<f64>,
+    /// Optional caller reduction of imports examined for each seed.
+    pub max_targets_per_seed: Option<f64>,
+    /// Optional caller reduction of the unique resolved-target cap.
+    pub max_targets: Option<f64>,
+    /// Optional caller reduction of the native per-file byte cap.
+    pub max_file_bytes: Option<f64>,
+    /// Optional caller reduction of the native total-source byte cap.
+    pub max_total_bytes: Option<f64>,
+    /// Retained for graph-call parity; explicit paths are never hidden-filtered.
+    pub hidden: Option<bool>,
+    /// Retained for graph-call parity; prefetch never discovers ignore files.
+    pub respect_gitignore: Option<bool>,
+    /// Follow explicit symlink components whose targets remain under `root`.
+    pub follow_symlinks: Option<bool>,
+}
+
+impl TryFrom<GraphPrefetchParams> for proto::GraphPrefetchParams {
+    type Error = proto::ToolError;
+
+    fn try_from(p: GraphPrefetchParams) -> Result<Self, Self::Error> {
+        Ok(Self {
+            root: p.root,
+            files: p.files.unwrap_or_default(),
+            max_seeds: graph_prefetch_limit(p.max_seeds, "maxSeeds")?,
+            max_targets_per_seed: graph_prefetch_limit(
+                p.max_targets_per_seed,
+                "maxTargetsPerSeed",
+            )?,
+            max_targets: graph_prefetch_limit(p.max_targets, "maxTargets")?,
+            max_file_bytes: graph_prefetch_limit(p.max_file_bytes, "maxFileBytes")?,
+            max_total_bytes: graph_prefetch_limit(p.max_total_bytes, "maxTotalBytes")?,
+            hidden: p.hidden.unwrap_or(false),
+            respect_gitignore: p.respect_gitignore.unwrap_or(true),
+            follow_symlinks: p.follow_symlinks.unwrap_or(false),
+        })
+    }
+}
+
+/// Per-reason accounting for candidates that prefetch did not warm.
+#[napi(object)]
+pub struct GraphPrefetchSkips {
+    pub seed_limit: i64,
+    pub duplicate_seeds: i64,
+    pub duplicate_targets: i64,
+    pub target_limit: i64,
+    pub byte_limit: i64,
+    pub external: i64,
+    pub unresolved: i64,
+    pub missing: i64,
+    pub unsupported: i64,
+    pub oversize: i64,
+    pub root_escaping: i64,
+    pub ignored: i64,
+    pub symlink: i64,
+    pub non_utf8: i64,
+    pub io: i64,
+}
+
+impl From<proto::GraphPrefetchSkips> for GraphPrefetchSkips {
+    fn from(s: proto::GraphPrefetchSkips) -> Self {
+        Self {
+            seed_limit: as_i64(s.seed_limit),
+            duplicate_seeds: as_i64(s.duplicate_seeds),
+            duplicate_targets: as_i64(s.duplicate_targets),
+            target_limit: as_i64(s.target_limit),
+            byte_limit: as_i64(s.byte_limit),
+            external: as_i64(s.external),
+            unresolved: as_i64(s.unresolved),
+            missing: as_i64(s.missing),
+            unsupported: as_i64(s.unsupported),
+            oversize: as_i64(s.oversize),
+            root_escaping: as_i64(s.root_escaping),
+            ignored: as_i64(s.ignored),
+            symlink: as_i64(s.symlink),
+            non_utf8: as_i64(s.non_utf8),
+            io: as_i64(s.io),
+        }
+    }
+}
+
+/// Structured outcome from one bounded depth-one prefetch request.
+#[napi(object)]
+pub struct GraphPrefetchResult {
+    pub root: String,
+    pub seeds_requested: i64,
+    pub seeds_processed: i64,
+    pub seeds_indexed: i64,
+    pub imports_examined: i64,
+    pub targets_discovered: i64,
+    pub targets_warmed: i64,
+    pub source_bytes: i64,
+    /// File-cache hits observed while loading seeds and direct targets.
+    pub cache_hits: i64,
+    /// Graph publications that changed resident graph state.
+    pub graph_updates: i64,
+    pub skips: GraphPrefetchSkips,
+    pub truncated: bool,
+}
+
+impl From<proto::GraphPrefetchResult> for GraphPrefetchResult {
+    fn from(r: proto::GraphPrefetchResult) -> Self {
+        Self {
+            root: r.root,
+            seeds_requested: as_i64(r.seeds_requested),
+            seeds_processed: as_i64(r.seeds_processed),
+            seeds_indexed: as_i64(r.seeds_indexed),
+            imports_examined: as_i64(r.imports_examined),
+            targets_discovered: as_i64(r.targets_discovered),
+            targets_warmed: as_i64(r.targets_warmed),
+            source_bytes: as_i64(r.source_bytes),
+            cache_hits: as_i64(r.cache_hits),
+            graph_updates: as_i64(r.graph_updates),
+            skips: r.skips.into(),
+            truncated: r.truncated,
+        }
+    }
+}
+
 #[napi(object)]
 pub struct GraphSymbolsParams {
     pub root: String,

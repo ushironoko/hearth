@@ -37,6 +37,17 @@ Three surfaces, one core:
 - **Daemon + CLI** — `hearthd` (a resident server) and the thin `hearth` client,
   talking length-prefixed msgpack over a Unix socket.
 
+Native Rust and N-API integrations also expose an integration-only hint
+(`graph_prefetch` in Rust, `graphPrefetch` in JavaScript) for warming explicit
+observed files plus their direct in-root imports. It performs no directory walk
+or ignore-file discovery, and retention is opportunistic under the normal
+bounded cache/graph eviction rules.
+Its result keeps cache reuse (`cacheHits`) separate from graph mutations
+(`graphUpdates`). Native hard caps apply per request (32 seeds, 64 imports per
+seed, 256 unique direct targets, 2 MiB/file, 16 MiB total source); caller limits
+can only reduce them. Prefetch is not a `GraphOp`, daemon request, or CLI
+command, so it makes no daemon protocol change.
+
 Full design in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); full benchmark
 methodology in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 

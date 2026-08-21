@@ -8,23 +8,27 @@ use crate::grep::grep_cancellable;
 use crate::util::{ensure_walk_succeeded, resolve_path};
 use compact_str::CompactString;
 use dashmap::DashMap;
-use hearth_core::cache::WalkKey;
+use hearth_core::cache::{FileEntry, WalkKey};
 use hearth_core::{CancelToken, Engine, profile};
 use hearth_graph::graph::{
     Coverage, DepEdge, EdgeTargetOwned, Guarantee, ModuleGraph, ModuleNode, NodeState,
+    UpsertOutcome as GraphUpsertOutcome,
 };
 use hearth_graph::{
     CancelSignal, FileAnalysis, FileSymbols, ImportKind, JsResolveOptions, LanguageRegistry,
-    MAX_SYMBOLS_PER_FILE, ParserPool, ResolverSet, RustResolveOptions, Symbol, SymbolIndex,
-    SymbolKind, UnresolvedReason, analyze_source, js_resolver, rust_resolver,
+    MAX_SYMBOLS_PER_FILE, ParserPool, RawImport, ResolutionCompleteness, ResolutionOutcome,
+    Resolve, Resolved, ResolverSet, RustResolveOptions, Symbol, SymbolIndex, SymbolKind,
+    UnresolvedReason, analyze_source, js_resolver, js_resolver_preserving_symlinks, rust_resolver,
 };
 use hearth_proto::{
-    GraphBasisEntry, GraphCoverage, GraphDefinitionsResult, GraphDepEdge, GraphDepsResult,
-    GraphGuarantee, GraphLanguageStatus, GraphMeta, GraphNeighborhoodResult, GraphNode, GraphOp,
-    GraphOutlineResult, GraphOutput, GraphParams, GraphRdepEntry, GraphRdepsResult, GraphResult,
-    GraphSearchResult, GraphStatusResult, GraphSymbol, GraphSymbolsResult, GraphUnresolvedImport,
-    GrepMode, GrepParams, ToolError, ToolResult, content_hash_hex,
+    ErrorKind, GraphBasisEntry, GraphCoverage, GraphDefinitionsResult, GraphDepEdge,
+    GraphDepsResult, GraphGuarantee, GraphLanguageStatus, GraphMeta, GraphNeighborhoodResult,
+    GraphNode, GraphOp, GraphOutlineResult, GraphOutput, GraphParams, GraphRdepEntry,
+    GraphRdepsResult, GraphResult, GraphSearchResult, GraphStatusResult, GraphSymbol,
+    GraphSymbolsResult, GraphUnresolvedImport, GrepMode, GrepParams, ToolError, ToolResult,
+    content_hash_hex,
 };
+pub use hearth_proto::{GraphPrefetchParams, GraphPrefetchResult, GraphPrefetchSkips};
 use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
@@ -49,6 +53,787 @@ const MAX_GRAPH_QUERY_BYTES: usize = 1024 * 1024;
 const MAX_GRAPH_DEPTH: u32 = 64;
 const MAX_GRAPH_RESULTS: u64 = 100_000;
 const MAX_GRAPH_BUILD_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PREFETCH_SEEDS: usize = 32;
+const MAX_PREFETCH_IMPORTS_PER_SEED: usize = 64;
+const MAX_PREFETCH_TARGETS: usize = 256;
+const MAX_PREFETCH_TOTAL_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Warm explicit files and their resolved direct in-root imports.
+pub fn graph_prefetch(
+    engine: &Engine,
+    params: &GraphPrefetchParams,
+) -> ToolResult<GraphPrefetchResult> {
+    graph_prefetch_cancellable(engine, params, &CancelToken::none())
+}
+
+/// Cancellable form of [`graph_prefetch`]. Completed per-file publications are
+/// additive and remain visible if a later cancellation stops the request.
+pub fn graph_prefetch_cancellable(
+    engine: &Engine,
+    params: &GraphPrefetchParams,
+    cancel: &CancelToken,
+) -> ToolResult<GraphPrefetchResult> {
+    profile!("tool.graph_prefetch", {
+        cancel.check()?;
+        let seed_limit = bounded_prefetch_limit(params.max_seeds, MAX_PREFETCH_SEEDS);
+        if params.root.len() > MAX_GRAPH_PATH_BYTES
+            || params
+                .files
+                .iter()
+                .take(seed_limit)
+                .any(|path| path.len() > MAX_GRAPH_PATH_BYTES)
+        {
+            return Err(ToolError::invalid("graph prefetch path exceeds 64 KiB"));
+        }
+
+        let root_path = resolve_path(engine, &params.root);
+        let metadata = std::fs::metadata(&root_path)
+            .map_err(|_| ToolError::not_found(root_path.display().to_string()))?;
+        if !metadata.is_dir() {
+            return Err(ToolError::invalid(format!(
+                "graph prefetch root is not a directory: {}",
+                root_path.display()
+            ))
+            .with_path(root_path.display().to_string()));
+        }
+        let canonical_root = std::fs::canonicalize(&root_path).map_err(|error| {
+            ToolError::internal(format!(
+                "could not canonicalize graph prefetch root {}: {error}",
+                root_path.display()
+            ))
+            .with_path(root_path.display().to_string())
+        })?;
+
+        let import_limit =
+            bounded_prefetch_limit(params.max_targets_per_seed, MAX_PREFETCH_IMPORTS_PER_SEED);
+        let target_limit = bounded_prefetch_limit(params.max_targets, MAX_PREFETCH_TARGETS);
+        let file_limit = params
+            .max_file_bytes
+            .unwrap_or(MAX_GRAPH_FILE_BYTES)
+            .min(MAX_GRAPH_FILE_BYTES);
+        let total_limit = params
+            .max_total_bytes
+            .unwrap_or(MAX_PREFETCH_TOTAL_SOURCE_BYTES)
+            .min(MAX_PREFETCH_TOTAL_SOURCE_BYTES);
+
+        let graph_state = engine.extension::<GraphState>();
+        let pin = graph_state.root(&root_path);
+        let root = &pin.root;
+        let _build_permit = graph_state.reserve_build()?;
+        let mut sweep = loop {
+            if let Some(sweep) = root.sweep.try_lock_for(Duration::from_millis(10)) {
+                break sweep;
+            }
+            cancel.check()?;
+        };
+        sweep.last_access = graph_state.access_clock.fetch_add(1, Ordering::Relaxed);
+
+        let mut result = GraphPrefetchResult {
+            root: root_path.display().to_string(),
+            seeds_requested: params.files.len() as u64,
+            ..GraphPrefetchResult::default()
+        };
+        if params.files.len() > seed_limit {
+            result.skips.seed_limit = (params.files.len() - seed_limit) as u64;
+            result.truncated = true;
+        }
+
+        let trust = engine.stat_free(&root_path);
+        let mut parser_pool = ParserPool::new(&graph_state.registry);
+        let mut seen_seeds = FxHashSet::default();
+        let mut seen_targets = FxHashSet::default();
+        let mut admitted_seeds = Vec::new();
+
+        for supplied in params.files.iter().take(seed_limit) {
+            cancel.check()?;
+            let candidate = if Path::new(supplied).is_absolute() {
+                PathBuf::from(supplied)
+            } else {
+                root_path.join(supplied)
+            };
+            let Some(seed_path) = prefetch_path(
+                &root_path,
+                &canonical_root,
+                &candidate,
+                params.follow_symlinks,
+                &mut result.skips,
+            ) else {
+                continue;
+            };
+            if !seen_seeds.insert(seed_path.identity.clone()) {
+                result.skips.duplicate_seeds += 1;
+                continue;
+            }
+            result.seeds_processed += 1;
+            admitted_seeds.push(seed_path);
+        }
+
+        let mut inferred_rust_roots: Vec<_> = admitted_seeds
+            .iter()
+            .flat_map(|seed| inferred_rust_crate_roots(&root_path, &canonical_root, &seed.path))
+            .collect();
+        inferred_rust_roots.sort_unstable();
+        inferred_rust_roots.dedup();
+        let resolver_refresh = refresh_prefetch_resolvers(
+            engine,
+            &root_path,
+            &canonical_root,
+            root,
+            &inferred_rust_roots,
+            PrefetchResolverOptions {
+                follow_symlinks: params.follow_symlinks,
+                enable_root_spelling_remap: params.follow_symlinks
+                    && !admitted_seeds.is_empty()
+                    && root_path != canonical_root,
+            },
+            &mut sweep,
+        );
+        result.graph_updates += u64::from(resolver_refresh.changed);
+
+        for seed_path in admitted_seeds {
+            cancel.check()?;
+
+            let Some(prepared) = prepare_prefetch_file(
+                engine,
+                &graph_state.registry,
+                &mut parser_pool,
+                seed_path,
+                file_limit,
+                total_limit.saturating_sub(result.source_bytes),
+                trust,
+                cancel,
+                &mut result,
+            )?
+            else {
+                continue;
+            };
+            let extracted_imports = prepared.analysis.imports.len();
+            cancel.check()?;
+            let Some(published) = publish_prefetch_analysis(
+                engine,
+                &graph_state,
+                &root_path,
+                &canonical_root,
+                root,
+                prepared,
+                import_limit,
+                &resolver_refresh.discovery,
+                cancel,
+                &mut sweep,
+            )?
+            else {
+                result.skips.io += 1;
+                continue;
+            };
+            result.seeds_indexed += 1;
+            result.graph_updates += u64::from(published.changed);
+            result.imports_examined += published.edges.len() as u64;
+            if extracted_imports > published.edges.len() {
+                result.skips.target_limit += (extracted_imports - published.edges.len()) as u64;
+                result.truncated = true;
+            }
+
+            for edge in published.edges {
+                cancel.check()?;
+                let target = match edge.to {
+                    EdgeTargetOwned::Path(target) => target,
+                    EdgeTargetOwned::External(_) => {
+                        result.skips.external += 1;
+                        continue;
+                    }
+                    EdgeTargetOwned::Unresolved(_) => {
+                        result.skips.unresolved += 1;
+                        continue;
+                    }
+                };
+                result.targets_discovered += 1;
+                let Some(target_path) = prefetch_path(
+                    &root_path,
+                    &canonical_root,
+                    Path::new(target.as_str()),
+                    params.follow_symlinks,
+                    &mut result.skips,
+                ) else {
+                    continue;
+                };
+                if seen_targets.contains(&target_path.identity) {
+                    result.skips.duplicate_targets += 1;
+                    continue;
+                }
+                if seen_targets.len() == target_limit {
+                    result.skips.target_limit += 1;
+                    result.truncated = true;
+                    continue;
+                }
+                seen_targets.insert(target_path.identity.clone());
+
+                let Some(prepared) = prepare_prefetch_file(
+                    engine,
+                    &graph_state.registry,
+                    &mut parser_pool,
+                    target_path,
+                    file_limit,
+                    total_limit.saturating_sub(result.source_bytes),
+                    trust,
+                    cancel,
+                    &mut result,
+                )?
+                else {
+                    continue;
+                };
+                cancel.check()?;
+                if let Some(published) = publish_prefetch_analysis(
+                    engine,
+                    &graph_state,
+                    &root_path,
+                    &canonical_root,
+                    root,
+                    prepared,
+                    0,
+                    &resolver_refresh.discovery,
+                    cancel,
+                    &mut sweep,
+                )? {
+                    result.targets_warmed += 1;
+                    result.graph_updates += u64::from(published.changed);
+                } else {
+                    result.skips.io += 1;
+                }
+            }
+        }
+
+        cancel.check()?;
+        result.truncated |= result.skips.seed_limit != 0
+            || result.skips.target_limit != 0
+            || result.skips.byte_limit != 0
+            || result.skips.oversize != 0;
+        Ok(result)
+    })
+}
+
+fn bounded_prefetch_limit(requested: Option<u64>, hard: usize) -> usize {
+    requested
+        .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+        .unwrap_or(hard)
+        .min(hard)
+}
+
+struct PrefetchPath {
+    path: PathBuf,
+    relative: CompactString,
+    identity: PathBuf,
+}
+
+struct PreparedPrefetch {
+    path: PathBuf,
+    relative: CompactString,
+    identity: PathBuf,
+    analysis: FileAnalysis,
+    entry: Arc<FileEntry>,
+    file_limit: u64,
+    trust: bool,
+}
+
+struct PublishedPrefetch {
+    changed: bool,
+    edges: Vec<DepEdge>,
+}
+
+struct PrefetchResolverRefresh {
+    discovery: ResolverSet,
+    changed: bool,
+}
+
+struct PrefetchResolverOptions {
+    follow_symlinks: bool,
+    enable_root_spelling_remap: bool,
+}
+
+fn prefetch_path(
+    root: &Path,
+    canonical_root: &Path,
+    candidate: &Path,
+    follow_symlinks: bool,
+    skips: &mut GraphPrefetchSkips,
+) -> Option<PrefetchPath> {
+    let lexical_inside = match classify_relative_path(root, candidate) {
+        RelativePath::Inside { path, relative } => Some((path, relative)),
+        RelativePath::OutsideRoot | RelativePath::NonUtf8 => None,
+    };
+    if lexical_inside.is_none() && !candidate.starts_with(canonical_root) {
+        skips.root_escaping += 1;
+        return None;
+    }
+    if !follow_symlinks && path_has_symlink_component(root, candidate) {
+        skips.symlink += 1;
+        return None;
+    }
+
+    let identity = match std::fs::canonicalize(candidate) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            skips.missing += 1;
+            return None;
+        }
+        Err(_) => {
+            skips.io += 1;
+            return None;
+        }
+    };
+    if !identity.starts_with(canonical_root) {
+        skips.root_escaping += 1;
+        return None;
+    }
+    let Ok(canonical_relative) = identity.strip_prefix(canonical_root) else {
+        skips.root_escaping += 1;
+        return None;
+    };
+    if canonical_relative.as_os_str().is_empty() {
+        skips.unsupported += 1;
+        return None;
+    }
+    let Some(canonical_relative) = canonical_relative.to_str() else {
+        skips.non_utf8 += 1;
+        return None;
+    };
+    let metadata = match std::fs::metadata(&identity) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            skips.missing += 1;
+            return None;
+        }
+        Err(_) => {
+            skips.io += 1;
+            return None;
+        }
+    };
+    if !metadata.is_file() {
+        skips.unsupported += 1;
+        return None;
+    }
+
+    let root_spelling = || {
+        let path = lexical_normalize(root)?.join(canonical_relative);
+        std::fs::canonicalize(&path)
+            .is_ok_and(|path| path == identity)
+            .then(|| (path, CompactString::from(canonical_relative)))
+    };
+    let (path, relative) = lexical_inside
+        .filter(|(path, _)| std::fs::canonicalize(path).is_ok_and(|path| path == identity))
+        .or_else(root_spelling)
+        .unwrap_or_else(|| (identity.clone(), CompactString::from(canonical_relative)));
+    Some(PrefetchPath {
+        path,
+        relative,
+        identity,
+    })
+}
+
+fn path_has_symlink_component(root: &Path, candidate: &Path) -> bool {
+    if path_prefix_has_symlink(root) {
+        return true;
+    }
+
+    let root_components: Vec<_> = root.components().collect();
+    let candidate_components: Vec<_> = candidate.components().collect();
+    let common = root_components
+        .iter()
+        .zip(&candidate_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut current =
+        candidate_components[..common]
+            .iter()
+            .fold(PathBuf::new(), |mut path, component| {
+                path.push(component.as_os_str());
+                path
+            });
+    for component in &candidate_components[common..] {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => current.push(component.as_os_str()),
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                current.push(component.as_os_str());
+                if std::fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.is_symlink()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn path_prefix_has_symlink(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => current.push(component.as_os_str()),
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                current.push(component.as_os_str());
+                if std::fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.is_symlink()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_prefetch_file(
+    engine: &Engine,
+    registry: &LanguageRegistry,
+    parser_pool: &mut ParserPool<'_>,
+    source: PrefetchPath,
+    file_limit: u64,
+    remaining_bytes: u64,
+    trust: bool,
+    cancel: &CancelToken,
+    result: &mut GraphPrefetchResult,
+) -> ToolResult<Option<PreparedPrefetch>> {
+    if !registry.supports_symbols(&source.path) {
+        result.skips.unsupported += 1;
+        return Ok(None);
+    }
+    let effective_limit = file_limit.min(remaining_bytes);
+    let loaded = engine
+        .files()
+        .get_bounded_trusting(&source.path, effective_limit, trust);
+    let (entry, hit) = match loaded {
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            if remaining_bytes < file_limit {
+                result.skips.byte_limit += 1;
+                result.truncated = true;
+            } else {
+                result.skips.oversize += 1;
+                result.truncated = true;
+            }
+            return Ok(None);
+        }
+        Err(error) => {
+            if error.kind == ErrorKind::NotFound {
+                result.skips.missing += 1;
+            } else {
+                result.skips.io += 1;
+            }
+            return Ok(None);
+        }
+    };
+    if entry.size > file_limit {
+        result.skips.oversize += 1;
+        result.truncated = true;
+        return Ok(None);
+    }
+    if entry.size > remaining_bytes {
+        result.skips.byte_limit += 1;
+        result.truncated = true;
+        return Ok(None);
+    }
+    result.source_bytes = result.source_bytes.saturating_add(entry.size);
+    result.cache_hits += u64::from(hit);
+    cancel.check()?;
+    let Some(source_text) = entry.as_str() else {
+        result.skips.non_utf8 += 1;
+        return Ok(None);
+    };
+    let Some(absolute) = source.path.to_str() else {
+        result.skips.non_utf8 += 1;
+        return Ok(None);
+    };
+    let analysis = analyze_source(source_text, absolute, entry.content_hash(), parser_pool);
+    cancel.check()?;
+    if analysis.language.is_none() {
+        result.skips.unsupported += 1;
+        return Ok(None);
+    }
+    Ok(Some(PreparedPrefetch {
+        path: source.path,
+        relative: source.relative,
+        identity: source.identity,
+        analysis,
+        entry,
+        file_limit,
+        trust,
+    }))
+}
+
+fn refresh_prefetch_resolvers(
+    engine: &Engine,
+    root_path: &Path,
+    canonical_root: &Path,
+    root: &RootGraph,
+    inferred_rust_roots: &[CompactString],
+    options: PrefetchResolverOptions,
+    sweep: &mut SweepMeta,
+) -> PrefetchResolverRefresh {
+    let mut state = root.state.write();
+    let tracked_dependencies = tracked_config_dependencies(root_path, &state.graph);
+    let invalidations = engine
+        .invalidations()
+        .since(state.last_seen_resolver_invalidation);
+    let config_invalidated = match &invalidations.paths {
+        None => !tracked_dependencies.is_empty(),
+        Some(paths) => paths.iter().any(|path| {
+            tracked_dependencies
+                .iter()
+                .any(|dependency| same_invalidation_identity(path, Path::new(dependency.as_str())))
+        }),
+    };
+    state.last_seen_resolver_invalidation = invalidations.revision;
+    let current_config_records: FxHashMap<_, _> = tracked_dependencies
+        .into_iter()
+        .map(|dependency| {
+            let record = stat_record(Path::new(dependency.as_str()));
+            (dependency, record)
+        })
+        .collect();
+    let config_changed = config_invalidated
+        || current_config_records.iter().any(|(dependency, current)| {
+            state.config_records.get(dependency.as_str()) != Some(current)
+        });
+
+    let mut rust_crate_roots: Vec<_> = state
+        .rust_crate_roots
+        .iter()
+        .filter(|path| rust_crate_root_is_live(path.as_str(), canonical_root))
+        .cloned()
+        .collect();
+    rust_crate_roots.extend(
+        inferred_rust_roots
+            .iter()
+            .filter(|path| rust_crate_root_is_live(path.as_str(), canonical_root))
+            .cloned(),
+    );
+    rust_crate_roots.sort_unstable();
+    rust_crate_roots.dedup();
+    let rust_roots_changed = rust_crate_roots != state.rust_crate_roots;
+    let root_spelling_changed = options.enable_root_spelling_remap && !state.remap_to_root_spelling;
+    let changed = config_changed || rust_roots_changed || root_spelling_changed;
+
+    state.config_records = current_config_records;
+    state.rust_crate_roots = rust_crate_roots.clone();
+    state.remap_to_root_spelling |= options.enable_root_spelling_remap;
+    let remap_to_root_spelling = state.remap_to_root_spelling;
+    if changed {
+        state.resolvers = root_resolvers(root_path, &rust_crate_roots, remap_to_root_spelling);
+        state.graph.bump_resolver_generation();
+        state.graph_generation = state.graph_generation.saturating_add(1);
+        let generation = state.graph_generation;
+        state.components.graph_generation = generation;
+        if matches!(state.phase, RootPhase::Ready { .. }) {
+            state.phase = RootPhase::Ready { generation };
+        }
+        sweep.invalidate();
+    }
+    drop(state);
+
+    let discovery = if options.follow_symlinks {
+        root_resolvers(root_path, &rust_crate_roots, remap_to_root_spelling)
+    } else {
+        prefetch_discovery_resolvers(root_path, &rust_crate_roots)
+    };
+    PrefetchResolverRefresh { discovery, changed }
+}
+
+fn rust_crate_root_is_live(path: &str, canonical_root: &Path) -> bool {
+    let path = Path::new(path);
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && std::fs::canonicalize(path).is_ok_and(|identity| identity.starts_with(canonical_root))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_prefetch_analysis(
+    engine: &Engine,
+    graph_state: &GraphState,
+    root_path: &Path,
+    canonical_root: &Path,
+    root: &Arc<RootGraph>,
+    prepared: PreparedPrefetch,
+    max_imports: usize,
+    discovery_resolvers: &ResolverSet,
+    cancel: &CancelToken,
+    sweep: &mut SweepMeta,
+) -> ToolResult<Option<PublishedPrefetch>> {
+    run_graph_test_hook(root_path, GraphTestPoint::PrefetchBeforePublish);
+    cancel.check()?;
+    let Some(attached_root) = graph_state.roots.get(root_path) else {
+        return Err(ToolError::internal(
+            "graph root was cleared or evicted during prefetch; retry",
+        ));
+    };
+    if !Arc::ptr_eq(attached_root.value(), root) {
+        return Err(ToolError::internal(
+            "graph root was replaced during prefetch; retry",
+        ));
+    }
+    let current_identity = match std::fs::canonicalize(&prepared.path) {
+        Ok(identity) if identity.starts_with(canonical_root) => identity,
+        Ok(_) | Err(_) => return Ok(None),
+    };
+    if current_identity != prepared.identity
+        || !std::fs::metadata(&current_identity).is_ok_and(|metadata| metadata.is_file())
+    {
+        return Ok(None);
+    }
+    let current = match engine.files().get_bounded_trusting(
+        &prepared.path,
+        prepared.file_limit,
+        prepared.trust,
+    ) {
+        Ok(Some((entry, _))) => entry,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    if current.size != prepared.entry.size
+        || current.mtime_ns != prepared.entry.mtime_ns
+        || current.content_hash() != prepared.entry.content_hash()
+        || current.bytes() != prepared.entry.bytes()
+    {
+        return Ok(None);
+    }
+    let edges = resolve_prefetch_imports(&prepared.analysis, discovery_resolvers, max_imports);
+    cancel.check()?;
+
+    let mut state = root.state.write();
+    let was_supported = state
+        .supported_universe
+        .contains(prepared.relative.as_str());
+    let hash = prepared.analysis.content_hash;
+    let record = StatRecord {
+        mtime_ns: prepared.entry.mtime_ns,
+        size: prepared.entry.size,
+    };
+    let record_changed = state.records.get(prepared.relative.as_str()) != Some(&record);
+    let absolute = prepared.analysis.path.clone();
+    let (graph_outcome, index_outcome) = {
+        let RootState {
+            graph,
+            resolvers,
+            index,
+            ..
+        } = &mut *state;
+        let imports_supported = graph_state
+            .registry
+            .supports_imports(Path::new(prepared.analysis.path.as_str()));
+        let graph_outcome = graph.upsert_file_bounded(
+            &prepared.analysis,
+            resolvers,
+            imports_supported,
+            max_imports,
+        );
+        let index_outcome = index.upsert(
+            FileSymbols {
+                path: prepared.relative.clone(),
+                content_hash: hash,
+                symbols: prepared.analysis.symbols,
+            },
+            graph_state.registry.generation(),
+        );
+        if !was_supported {
+            graph.set_universe_complete(false);
+        }
+        (graph_outcome, index_outcome)
+    };
+    let changed = !was_supported
+        || record_changed
+        || graph_outcome != GraphUpsertOutcome::Unchanged
+        || index_outcome != hearth_graph::UpsertOutcome::Unchanged;
+    let config_dependencies = state
+        .graph
+        .node(absolute.as_str())
+        .map(|node| node.config_dependencies.clone())
+        .unwrap_or_default();
+
+    if changed {
+        for dependency in config_dependencies {
+            state
+                .config_records
+                .entry(dependency.clone())
+                .or_insert_with(|| stat_record(Path::new(dependency.as_str())));
+        }
+        state.records.insert(prepared.relative.clone(), record);
+        state.supported_universe.insert(prepared.relative);
+        state.graph_generation = state.graph_generation.saturating_add(1);
+        let generation = state.graph_generation;
+        state.components = ComponentsCache {
+            graph_generation: generation,
+            components: component_count(root_path, &state.index, &state.graph),
+        };
+        state.languages = language_statuses(&state.index, &graph_state.registry);
+        if matches!(state.phase, RootPhase::Ready { .. }) {
+            state.phase = RootPhase::Ready { generation };
+        }
+        sweep.invalidate();
+    }
+    drop(state);
+    drop(attached_root);
+    Ok(Some(PublishedPrefetch { changed, edges }))
+}
+
+fn resolve_prefetch_imports(
+    analysis: &FileAnalysis,
+    resolvers: &ResolverSet,
+    max_imports: usize,
+) -> Vec<DepEdge> {
+    analysis
+        .imports
+        .iter()
+        .take(max_imports)
+        .map(|raw| {
+            let outcome = resolvers.resolve(analysis.path.as_str(), raw);
+            let to = match outcome.resolved {
+                Resolved::Path(path) => EdgeTargetOwned::Path(path),
+                Resolved::External(package) => EdgeTargetOwned::External(package),
+                Resolved::Unresolved(reason) => EdgeTargetOwned::Unresolved(reason),
+            };
+            DepEdge {
+                from: analysis.path.clone(),
+                to,
+                specifier: raw.specifier.clone(),
+                kind: raw.kind,
+                line: raw.line,
+                span: raw.span,
+            }
+        })
+        .collect()
+}
+
+fn inferred_rust_crate_roots(
+    root: &Path,
+    canonical_root: &Path,
+    path: &Path,
+) -> Vec<CompactString> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+        return Vec::new();
+    }
+    let Some(root) = lexical_normalize(root) else {
+        return Vec::new();
+    };
+    let Some(path) = lexical_normalize(path) else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    let mut ancestor = path.parent();
+    while let Some(directory) = ancestor {
+        if !directory.starts_with(&root) {
+            break;
+        }
+        for name in ["lib.rs", "main.rs"] {
+            let candidate = directory.join(name);
+            let valid = std::fs::metadata(&candidate).is_ok_and(|metadata| metadata.is_file())
+                && std::fs::canonicalize(&candidate)
+                    .is_ok_and(|identity| identity.starts_with(canonical_root));
+            if valid && let Some(candidate) = candidate.to_str() {
+                roots.push(CompactString::from(candidate));
+            }
+        }
+        ancestor = directory.parent();
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+}
 
 /// Run a graph query without a live cancellation token.
 pub fn graph(engine: &Engine, params: &GraphParams) -> ToolResult<GraphResult> {
@@ -310,7 +1095,9 @@ struct RootState {
     config_records: FxHashMap<CompactString, Option<StatRecord>>,
     supported_universe: FxHashSet<CompactString>,
     rust_crate_roots: Vec<CompactString>,
+    remap_to_root_spelling: bool,
     last_seen_invalidation: u64,
+    last_seen_resolver_invalidation: u64,
     graph_generation: u64,
     components: ComponentsCache,
     counters: RootCounters,
@@ -334,12 +1121,14 @@ impl RootState {
             phase: RootPhase::Uninitialized,
             index: SymbolIndex::new(),
             graph: ModuleGraph::new(),
-            resolvers: root_resolvers(root, &[]),
+            resolvers: root_resolvers(root, &[], false),
             records: FxHashMap::default(),
             config_records,
             supported_universe: FxHashSet::default(),
             rust_crate_roots: Vec::new(),
+            remap_to_root_spelling: false,
             last_seen_invalidation: 0,
+            last_seen_resolver_invalidation: 0,
             graph_generation: 0,
             components: ComponentsCache::default(),
             counters: RootCounters::default(),
@@ -469,6 +1258,11 @@ impl SweepMeta {
         } else {
             self.last_view_sweep = stamp;
         }
+    }
+
+    fn invalidate(&mut self) {
+        self.last_walk_sweep = None;
+        self.last_view_sweep = None;
     }
 }
 
@@ -766,6 +1560,7 @@ fn sweep_and_answer(
         }
 
         let resolver_inputs_changed = config_changed || state.rust_crate_roots != rust_crate_roots;
+        let remap_to_root_spelling = state.remap_to_root_spelling;
         let index_changed = !upserts.is_empty() || !removes.is_empty();
         let topology_changed = index_changed || resolver_inputs_changed;
         {
@@ -795,7 +1590,7 @@ fn sweep_and_answer(
                 );
             }
             if resolver_inputs_changed {
-                *resolvers = root_resolvers(root_path, &rust_crate_roots);
+                *resolvers = root_resolvers(root_path, &rust_crate_roots, remap_to_root_spelling);
                 graph.bump_resolver_generation();
                 graph.reresolve_all(resolvers);
             }
@@ -814,6 +1609,7 @@ fn sweep_and_answer(
         state.supported_universe = supported_universe;
         state.rust_crate_roots = rust_crate_roots;
         state.last_seen_invalidation = invalidation_revision;
+        state.last_seen_resolver_invalidation = invalidation_revision;
         state.counters = counters;
         state.graph_generation = state.graph_generation.saturating_add(1);
         let generation = state.graph_generation;
@@ -904,6 +1700,7 @@ struct SweepSnapshot {
     graph_generation: u64,
     indexed_hashes: FxHashMap<CompactString, u64>,
     indexed_paths: FxHashSet<CompactString>,
+    partial_paths: FxHashSet<CompactString>,
 }
 
 fn sweep_snapshot(root: &Path, state: &RootState) -> SweepSnapshot {
@@ -918,6 +1715,21 @@ fn sweep_snapshot(root: &Path, state: &RootState) -> SweepSnapshot {
         })
         .collect();
     let indexed_paths = state.index.paths().map(CompactString::from).collect();
+    let resolver_generation = state.graph.resolver_generation();
+    let partial_paths = state
+        .index
+        .paths()
+        .filter(|path| {
+            state
+                .graph
+                .node(absolute_graph_path(root, path).as_str())
+                .is_none_or(|node| {
+                    !node.imports_complete()
+                        || node.resolved_generation() != Some(resolver_generation)
+                })
+        })
+        .map(CompactString::from)
+        .collect();
     SweepSnapshot {
         records: state.records.clone(),
         config_records: state.config_records.clone(),
@@ -926,6 +1738,7 @@ fn sweep_snapshot(root: &Path, state: &RootState) -> SweepSnapshot {
         graph_generation: state.graph_generation,
         indexed_hashes,
         indexed_paths,
+        partial_paths,
     }
 }
 
@@ -1131,12 +1944,13 @@ fn build_sweep_delta(
         });
         let hash = entry.content_hash();
         let hash_matches = snapshot.indexed_hashes.get(relative.as_str()) == Some(&hash);
+        let graph_is_partial = snapshot.partial_paths.contains(relative.as_str());
         records.insert(relative.clone(), record);
 
-        if stat_matches && hash_matches {
+        if stat_matches && hash_matches && !graph_is_partial {
             continue;
         }
-        if hash_matches && !force_reindex {
+        if hash_matches && !force_reindex && !graph_is_partial {
             continue;
         }
 
@@ -1920,6 +2734,7 @@ fn rdeps_node_is_structurally_exact(graph: &ModuleGraph, path: &str) -> bool {
             ..
         }
     ) && node.imports_supported()
+        && node.imports_complete()
         && node.resolver_live()
         && node.resolution_complete()
         && node.resolved_generation() == Some(graph.resolver_generation())
@@ -2136,10 +2951,20 @@ fn run_rdeps_repair(
         match confirmation {
             Some(true) => continue,
             Some(false) => {
-                // Re-publishing identical non-exact analysis cannot improve
-                // it, so preserve the repair budget and surface grep evidence.
-                approximate_entries.push(approximate_rdep_entry(root_path, root, &candidate));
-                continue;
+                let deliberately_partial = root
+                    .state
+                    .read()
+                    .graph
+                    .node(absolute.as_str())
+                    .is_some_and(|node| !node.imports_complete());
+                if !deliberately_partial {
+                    // Re-publishing identical non-exact full analysis cannot
+                    // improve it, so preserve the repair budget and surface
+                    // grep evidence. Prefetch partials must be upgraded by an
+                    // ordinary full repair.
+                    approximate_entries.push(approximate_rdep_entry(root_path, root, &candidate));
+                    continue;
+                }
             }
             None => {}
         }
@@ -2368,6 +3193,7 @@ fn publish_rdeps_repairs(
     let mut state = root.state.write();
     let mut published = Vec::with_capacity(repairs.len());
     let mut generation_changed = false;
+    let resolver_generation = state.graph.resolver_generation();
     for repair in repairs {
         let PreparedRdepsRepair {
             candidate,
@@ -2383,6 +3209,13 @@ fn publish_rdeps_repairs(
             .index
             .contains(relative.as_str(), hash, graph_state.registry.generation())
             && state.graph.contains(analysis.path.as_str(), hash)
+            && state
+                .graph
+                .node(analysis.path.as_str())
+                .is_some_and(|node| {
+                    node.imports_complete()
+                        && node.resolved_generation() == Some(resolver_generation)
+                })
         {
             RepairPublish::AlreadyCurrent
         } else {
@@ -2581,10 +3414,33 @@ fn absolute_graph_path(root: &Path, path: &str) -> CompactString {
     } else {
         root.join(path)
     };
+    let absolute = lexical_normalize(&absolute).unwrap_or(absolute);
     CompactString::from(absolute.to_string_lossy().as_ref())
 }
 
-fn root_resolvers(root: &Path, rust_crate_roots: &[CompactString]) -> ResolverSet {
+fn root_resolvers(
+    root: &Path,
+    rust_crate_roots: &[CompactString],
+    remap_to_root_spelling: bool,
+) -> ResolverSet {
+    root_resolvers_with_js(root, rust_crate_roots, js_resolver, remap_to_root_spelling)
+}
+
+fn prefetch_discovery_resolvers(root: &Path, rust_crate_roots: &[CompactString]) -> ResolverSet {
+    root_resolvers_with_js(
+        root,
+        rust_crate_roots,
+        js_resolver_preserving_symlinks,
+        false,
+    )
+}
+
+fn root_resolvers_with_js(
+    root: &Path,
+    rust_crate_roots: &[CompactString],
+    js: fn(JsResolveOptions) -> Box<dyn Resolve>,
+    remap_to_root_spelling: bool,
+) -> ResolverSet {
     let tsconfig = root.join("tsconfig.json");
     let jsconfig = root.join("jsconfig.json");
     let configured_js = if tsconfig.is_file() {
@@ -2594,15 +3450,73 @@ fn root_resolvers(root: &Path, rust_crate_roots: &[CompactString]) -> ResolverSe
     } else {
         None
     };
+    let js = js(JsResolveOptions {
+        tsconfig: configured_js,
+        ..JsResolveOptions::default()
+    });
+    let js = if remap_to_root_spelling {
+        root_spelling_resolver(root, js)
+    } else {
+        js
+    };
     ResolverSet {
-        js: Some(js_resolver(JsResolveOptions {
-            tsconfig: configured_js,
-            ..JsResolveOptions::default()
-        })),
+        js: Some(js),
         rust: Some(rust_resolver(RustResolveOptions {
             crate_roots: rust_crate_roots.to_vec(),
         })),
     }
+}
+
+struct RootSpellingResolver {
+    inner: Box<dyn Resolve>,
+    root: PathBuf,
+    canonical_root: PathBuf,
+}
+
+impl Resolve for RootSpellingResolver {
+    fn baseline_completeness(&self) -> ResolutionCompleteness {
+        self.inner.baseline_completeness()
+    }
+
+    fn resolve(&self, from_file: &str, import: &RawImport) -> ResolutionOutcome {
+        let mut outcome = self.inner.resolve(from_file, import);
+        let remapped = match &outcome.resolved {
+            Resolved::Path(target) => Path::new(target.as_str())
+                .strip_prefix(&self.canonical_root)
+                .ok()
+                .map(|relative| {
+                    let path = self.root.join(relative);
+                    let path = lexical_normalize(&path).unwrap_or(path);
+                    CompactString::from(path.to_string_lossy().as_ref())
+                }),
+            Resolved::External(_) | Resolved::Unresolved(_) => None,
+        };
+        if let Some(target) = remapped {
+            outcome.resolved = Resolved::Path(target);
+        }
+        outcome
+    }
+
+    fn clear_cache(&self) {
+        self.inner.clear_cache();
+    }
+}
+
+fn root_spelling_resolver(root: &Path, inner: Box<dyn Resolve>) -> Box<dyn Resolve> {
+    let Some(root) = lexical_normalize(root) else {
+        return inner;
+    };
+    let Ok(canonical_root) = std::fs::canonicalize(&root) else {
+        return inner;
+    };
+    if root == canonical_root {
+        return inner;
+    }
+    Box::new(RootSpellingResolver {
+        inner,
+        root,
+        canonical_root,
+    })
 }
 
 fn rust_crate_roots(
@@ -2749,6 +3663,9 @@ fn graph_meta(root: &Path, state: &RootState, freshness: Freshness) -> GraphMeta
 fn status_query(engine: &Engine, root_path: &Path, root: &RootGraph) -> GraphResult {
     let sweep = root.sweep.try_lock();
     let sweep_busy = sweep.is_none();
+    let has_completed_sweep = sweep
+        .as_ref()
+        .is_some_and(|sweep| sweep.last_walk_sweep.is_some() || sweep.last_view_sweep.is_some());
     let Some(state) = root.state.try_read() else {
         return empty_status(root_path, true, GraphGuarantee::Approximate);
     };
@@ -2792,11 +3709,12 @@ fn status_query(engine: &Engine, root_path: &Path, root: &RootGraph) -> GraphRes
         last_sweep_ms_ago: state.last_sweep_at.map(|at| elapsed_ms(at.elapsed())),
         build_duration_us: state.build_duration_us,
     };
-    let guarantee = if building || pending_files > 0 || stale_files > 0 {
-        GraphGuarantee::Approximate
-    } else {
-        GraphGuarantee::Exact
-    };
+    let guarantee =
+        if !built || building || !has_completed_sweep || pending_files > 0 || stale_files > 0 {
+            GraphGuarantee::Approximate
+        } else {
+            GraphGuarantee::Exact
+        };
     GraphResult {
         meta: graph_meta(
             root_path,
@@ -2959,6 +3877,7 @@ enum GraphTestPoint {
     RootPinned,
     RdepsRepairStarted,
     RdepsFollowerWaiting,
+    PrefetchBeforePublish,
 }
 
 #[cfg(test)]
@@ -3149,19 +4068,24 @@ fn saturating_u64(value: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphState, GraphTestHook, GraphTestPoint, MAX_GRAPH_ROOTS, RootState, SweepKey, SweepMeta,
-        graph, graph_cancellable, graph_clear, graph_test_root_count, graph_test_set_hook,
-        rdeps_flight_key,
+        EdgeTargetOwned, GraphState, GraphTestHook, GraphTestPoint, MAX_GRAPH_ROOTS, NodeState,
+        RootState, SweepKey, SweepMeta, graph, graph_cancellable, graph_clear, graph_prefetch,
+        graph_prefetch_cancellable, graph_test_root_count, graph_test_set_hook, rdeps_flight_key,
     };
     #[cfg(unix)]
     use super::{RelativePath, classify_relative_path};
     use compact_str::CompactString;
     use hearth_core::{CancelToken, Engine, EngineConfig};
-    use hearth_proto::{ErrorKind, GraphGuarantee, GraphOp, GraphOutput, GraphParams, GraphResult};
+    use hearth_proto::{
+        ErrorKind, GraphGuarantee, GraphOp, GraphOutput, GraphParams, GraphPrefetchParams,
+        GraphResult,
+    };
     #[cfg(unix)]
     use std::ffi::OsStr;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
@@ -3804,6 +4728,235 @@ mod tests {
         drop(sweep_guards);
         graph(&engine, &query(&root_a)).unwrap();
         assert_eq!(graph_test_root_count(&engine), MAX_GRAPH_ROOTS);
+    }
+
+    #[test]
+    fn prefetch_cancellation_between_files_preserves_only_completed_publications() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        seed(&root, "first.rs");
+        seed(&root, "second.rs");
+        let engine = engine();
+        let cancel = CancelToken::new();
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook: GraphTestHook = {
+            let cancel = cancel.clone();
+            let hook_calls = Arc::clone(&hook_calls);
+            Arc::new(move |point| {
+                if point == GraphTestPoint::PrefetchBeforePublish
+                    && hook_calls.fetch_add(1, Ordering::SeqCst) == 1
+                {
+                    cancel.cancel();
+                }
+            })
+        };
+        graph_test_set_hook(&root, Some(hook));
+
+        let result = graph_prefetch_cancellable(
+            &engine,
+            &GraphPrefetchParams::new(
+                root.display().to_string(),
+                vec!["first.rs".into(), "second.rs".into()],
+            ),
+            &cancel,
+        );
+
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+        let graph_state = engine.extension::<GraphState>();
+        let resident = graph_state
+            .roots
+            .get(&root)
+            .expect("the first publication keeps the root resident");
+        let state = resident.state.read();
+        assert_eq!(state.index.file_count(), 1);
+        assert!(matches!(state.phase, super::RootPhase::Uninitialized));
+        drop(state);
+        drop(resident);
+        graph_test_set_hook(&root, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefetch_followed_rust_symlink_promotes_the_resolver_edge_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let crate_root = root.join("src/lib.rs");
+        let alias = root.join("src/alias.rs");
+        let real = root.join("src/real.rs");
+        std::fs::create_dir_all(crate_root.parent().unwrap()).unwrap();
+        std::fs::write(&crate_root, "mod alias;\n").unwrap();
+        std::fs::write(&real, "pub fn value() {}\n").unwrap();
+        symlink("real.rs", &alias).unwrap();
+        let engine = engine();
+        let mut params = GraphPrefetchParams::new(
+            root.display().to_string(),
+            vec![crate_root.display().to_string()],
+        );
+        params.follow_symlinks = true;
+
+        let result = graph_prefetch(&engine, &params).unwrap();
+
+        assert_eq!(result.targets_warmed, 1);
+        let resident = root_graph(&engine, &root);
+        let state = resident.state.read();
+        let deps = state.graph.deps(crate_root.to_str().unwrap()).unwrap();
+        assert!(matches!(
+            &deps.edges[0].to,
+            EdgeTargetOwned::Path(path) if path.as_str() == alias.to_str().unwrap()
+        ));
+        assert!(matches!(
+            state.graph.node(alias.to_str().unwrap()).unwrap().state,
+            NodeState::Analyzed { .. }
+        ));
+        assert!(state.graph.node(real.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn prefetch_config_refresh_defers_unselected_node_resolution_until_a_normal_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("longer-b")).unwrap();
+        let config = root.join("tsconfig.json");
+        let first = root.join("src/first.ts");
+        let second = root.join("src/second.ts");
+        let first_target = root.join("a/dep.ts");
+        let second_target = root.join("longer-b/dep.ts");
+        std::fs::write(
+            &config,
+            r##"{"compilerOptions":{"baseUrl":".","paths":{"#dep":["a/dep.ts"]}}}"##,
+        )
+        .unwrap();
+        for importer in [&first, &second] {
+            std::fs::write(importer, "import '#dep';\n").unwrap();
+        }
+        std::fs::write(&first_target, "export const dep = 'a';\n").unwrap();
+        std::fs::write(&second_target, "export const dep = 'b';\n").unwrap();
+        let engine = engine();
+        let files = [&first, &second, &first_target, &second_target]
+            .map(|path| path.display().to_string())
+            .to_vec();
+        let mut build = GraphParams::new(
+            root.display().to_string(),
+            GraphOp::Search {
+                query: String::new(),
+                limit: 10,
+            },
+        );
+        build.files = files.clone();
+        graph(&engine, &build).unwrap();
+
+        std::fs::write(
+            &config,
+            r##"{"compilerOptions":{"baseUrl":".","paths":{"#dep":["longer-b/dep.ts"]}}}"##,
+        )
+        .unwrap();
+        graph_prefetch(
+            &engine,
+            &GraphPrefetchParams::new(
+                root.display().to_string(),
+                vec![first.display().to_string()],
+            ),
+        )
+        .unwrap();
+
+        let graph_state = engine.extension::<GraphState>();
+        let resident = graph_state.roots.get(&root).unwrap();
+        let state = resident.state.read();
+        let first_edge = state.graph.deps(first.to_str().unwrap()).unwrap().edges[0]
+            .to
+            .clone();
+        let second_edge = state.graph.deps(second.to_str().unwrap()).unwrap().edges[0]
+            .to
+            .clone();
+        assert!(matches!(
+            first_edge,
+            hearth_graph::graph::EdgeTargetOwned::Path(path)
+                if path.as_str() == second_target.to_str().unwrap()
+        ));
+        assert!(matches!(
+            second_edge,
+            hearth_graph::graph::EdgeTargetOwned::Path(path)
+                if path.as_str() == first_target.to_str().unwrap()
+        ));
+        assert_ne!(
+            state
+                .graph
+                .node(second.to_str().unwrap())
+                .unwrap()
+                .resolved_generation(),
+            Some(state.graph.resolver_generation())
+        );
+        drop(state);
+        drop(resident);
+
+        let mut query = GraphParams::new(
+            root.display().to_string(),
+            GraphOp::Deps {
+                path: second.display().to_string(),
+                depth: 1,
+            },
+        );
+        query.files = files;
+        graph(&engine, &query).unwrap();
+
+        let resident = graph_state.roots.get(&root).unwrap();
+        let state = resident.state.read();
+        let second_edge = state.graph.deps(second.to_str().unwrap()).unwrap().edges[0]
+            .to
+            .clone();
+        assert!(matches!(
+            second_edge,
+            hearth_graph::graph::EdgeTargetOwned::Path(path)
+                if path.as_str() == second_target.to_str().unwrap()
+        ));
+        assert_eq!(
+            state
+                .graph
+                .node(second.to_str().unwrap())
+                .unwrap()
+                .resolved_generation(),
+            Some(state.graph.resolver_generation())
+        );
+    }
+
+    #[test]
+    fn clear_during_prefetch_rejects_the_detached_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        seed(&root, "seed.rs");
+        let engine = engine();
+        let before_publish = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let hook: GraphTestHook = {
+            let before_publish = Arc::clone(&before_publish);
+            let release = Arc::clone(&release);
+            Arc::new(move |point| {
+                if point == GraphTestPoint::PrefetchBeforePublish {
+                    before_publish.wait();
+                    release.wait();
+                }
+            })
+        };
+        graph_test_set_hook(&root, Some(hook));
+
+        let thread_engine = engine.clone();
+        let thread_root = root.display().to_string();
+        let handle = std::thread::spawn(move || {
+            graph_prefetch_cancellable(
+                &thread_engine,
+                &GraphPrefetchParams::new(thread_root, vec!["seed.rs".into()]),
+                &CancelToken::none(),
+            )
+        });
+        before_publish.wait();
+        assert_eq!(graph_clear(&engine), 1);
+        release.wait();
+
+        assert!(handle.join().unwrap().is_err());
+        assert_eq!(graph_test_root_count(&engine), 0);
+        graph_test_set_hook(&root, None);
     }
 
     #[test]

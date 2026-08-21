@@ -10,7 +10,7 @@ use hearth_graph::{
     FileAnalysis, ImportKind, JsResolveOptions, RawImport, ResolutionCompleteness,
     ResolutionOutcome, Resolved, ResolverSet, UnresolvedReason,
     graph::{Guarantee, ModuleGraph},
-    js_resolver, js_resolver_with_fs,
+    js_resolver, js_resolver_preserving_symlinks, js_resolver_with_fs,
     resolve::FailedKind,
 };
 use oxc_resolver::{FileMetadata, FileSystem, ResolveError};
@@ -29,6 +29,57 @@ fn resolves_relative_import_with_extension_probing() {
     );
 
     assert_eq!(outcome.resolved, Resolved::Path(compact_path(&expected)));
+}
+
+#[cfg(unix)]
+#[test]
+fn js_resolution_can_preserve_symlink_target_spelling_for_discovery() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let importer = fixture.write("src/app.ts", "");
+    let canonical = fixture.write("src/real/dep.ts", "export const dep = true;");
+    let alias = fixture.root.join("src/alias");
+    symlink("real", &alias).unwrap();
+    let import = raw_import("./alias/dep", ImportKind::EsStatic);
+
+    let normal = js_resolver(JsResolveOptions::default()).resolve(path_str(&importer), &import);
+    let discovery = js_resolver_preserving_symlinks(JsResolveOptions::default())
+        .resolve(path_str(&importer), &import);
+
+    assert_eq!(normal.resolved, Resolved::Path(compact_path(&canonical)));
+    assert_eq!(
+        discovery.resolved,
+        Resolved::Path(compact_path(&alias.join("dep.ts")))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn preserving_symlinks_keeps_bare_workspace_packages_classified_as_paths() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let importer = fixture.write("src/app.ts", "");
+    let canonical = fixture.write("packages/pkg/index.js", "module.exports = {};");
+    fixture.write(
+        "packages/pkg/package.json",
+        r#"{"name":"pkg","main":"index.js"}"#,
+    );
+    fs::create_dir_all(fixture.root.join("node_modules")).unwrap();
+    let alias = fixture.root.join("node_modules/pkg");
+    symlink("../packages/pkg", &alias).unwrap();
+    let import = raw_import("pkg", ImportKind::EsStatic);
+
+    let normal = js_resolver(JsResolveOptions::default()).resolve(path_str(&importer), &import);
+    let discovery = js_resolver_preserving_symlinks(JsResolveOptions::default())
+        .resolve(path_str(&importer), &import);
+
+    assert_eq!(normal.resolved, Resolved::Path(compact_path(&canonical)));
+    assert_eq!(
+        discovery.resolved,
+        Resolved::Path(compact_path(&alias.join("index.js")))
+    );
 }
 
 #[test]

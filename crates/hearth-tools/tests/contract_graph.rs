@@ -6,10 +6,13 @@ mod common;
 use common::{abs, engine, seed, trusting_engine, watching_engine};
 use hearth_core::CancelToken;
 use hearth_proto::{
-    ErrorKind, GraphGuarantee, GraphOp, GraphOutput, GraphParams, GraphResult, GraphStatusResult,
-    Request, Response, WriteParams,
+    ErrorKind, GraphGuarantee, GraphOp, GraphOutput, GraphParams, GraphPrefetchParams, GraphResult,
+    GraphStatusResult, ReadParams, Request, Response, WriteParams,
 };
-use hearth_tools::{dispatch, graph, graph_cancellable, graph_clear, write};
+use hearth_tools::{
+    dispatch, graph, graph_cancellable, graph_clear, graph_prefetch, graph_prefetch_cancellable,
+    read, write,
+};
 #[cfg(unix)]
 use std::ffi::OsStr;
 use std::fs::{FileTimes, OpenOptions};
@@ -70,6 +73,1051 @@ fn dep_targets(result: &GraphResult) -> Vec<&str> {
         GraphOutput::Deps(result) => result.edges.iter().map(|edge| edge.to.as_str()).collect(),
         other => panic!("expected deps, got {other:?}"),
     }
+}
+
+#[test]
+fn prefetch_warms_only_seeds_and_direct_imports_without_ignore_or_walk_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let seed_path = seed(
+        &root,
+        "src/seed.ts",
+        concat!(
+            "import './.direct';\n",
+            "import './missing';\n",
+            "import 'external-package';\n",
+            "export const seedValue = true;\n",
+        ),
+    );
+    seed(
+        &root,
+        "src/.direct.ts",
+        "import './deep';\nexport const directValue = true;\n",
+    );
+    let deep_path = seed(&root, "src/deep.ts", "export const deepValue = true;\n");
+    seed(
+        &root,
+        "src/unrelated.ts",
+        "export const unrelatedValue = true;\n",
+    );
+    std::fs::write(root.join(".gitignore"), "src/.direct.ts\n").unwrap();
+    std::fs::write(root.join(".ignore"), "src/.direct.ts\n").unwrap();
+    std::fs::write(root.join(".rgignore"), "src/.direct.ts\n").unwrap();
+    std::fs::create_dir_all(root.join("node_modules/external-package")).unwrap();
+    std::fs::write(
+        root.join("node_modules/external-package/package.json"),
+        r#"{"name":"external-package","main":"index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("node_modules/external-package/index.js"),
+        "module.exports = {};\n",
+    )
+    .unwrap();
+
+    let eng = engine(&root);
+    let result = graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(
+            root.display().to_string(),
+            vec![seed_path.clone(), seed_path],
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(result.seeds_indexed, 1);
+    assert_eq!(result.targets_warmed, 1);
+    assert_eq!(result.skips.duplicate_seeds, 1);
+    assert_eq!(result.skips.unresolved, 1);
+    assert_eq!(result.skips.external, 1);
+    assert_eq!(result.skips.ignored, 0);
+    assert_eq!(eng.files().len(), 2, "deep and unrelated files stay cold");
+    assert!(
+        eng.walks().is_empty(),
+        "prefetch must not populate WalkCache"
+    );
+
+    let current = graph(&eng, &params(&root, GraphOp::Status)).unwrap();
+    assert!(!status(&current).built);
+    assert_eq!(status(&current).indexed_files, 2);
+    assert_eq!(status(&current).languages[0].files, 2);
+    assert_eq!(status(&current).components, 0);
+    assert_eq!(current.meta.guarantee, GraphGuarantee::Approximate);
+
+    let direct_path = root.join("src/.direct.ts").display().to_string();
+    let mut upgrade = params(
+        &root,
+        GraphOp::Deps {
+            path: direct_path.clone(),
+            depth: 1,
+        },
+    );
+    upgrade.files = vec![direct_path, deep_path];
+    let upgraded = graph(&eng, &upgrade).unwrap();
+    assert_eq!(dep_targets(&upgraded).len(), 1);
+    assert!(eng.walks().is_empty(), "an explicit upgrade must not walk");
+}
+
+#[test]
+fn prefetch_infers_cold_rust_crate_roots_without_reading_the_root_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    seed(&root, "src/lib.rs", "mod shared;\n");
+    let feature = seed(
+        &root,
+        "src/nested/feature.rs",
+        "use crate::shared;\npub fn feature() {}\n",
+    );
+    seed(&root, "src/shared.rs", "mod deep;\npub fn shared() {}\n");
+    seed(&root, "src/shared/deep.rs", "pub fn deep() {}\n");
+    let eng = engine(&root);
+
+    let result = graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(root.display().to_string(), vec![feature]),
+    )
+    .unwrap();
+
+    assert_eq!(result.targets_warmed, 1);
+    assert_eq!(eng.files().len(), 2, "lib.rs and deep.rs must stay cold");
+    assert!(eng.walks().is_empty());
+}
+
+#[test]
+fn prefetch_infers_rust_roots_under_parent_component_and_nested_bin_layouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("discarded")).unwrap();
+    seed(&root, "src/lib.rs", "mod shared;\n");
+    let library_seed = seed(
+        &root,
+        "src/nested/feature.rs",
+        "use crate::shared;\npub fn feature() {}\n",
+    );
+    seed(&root, "src/shared.rs", "pub fn shared() {}\n");
+    let spelled_root = root.join("discarded").join("..");
+    let eng = engine(&root);
+
+    let library = graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(spelled_root.display().to_string(), vec![library_seed]),
+    )
+    .unwrap();
+    assert_eq!(library.targets_warmed, 1);
+
+    seed(&root, "src/bin/tool/main.rs", "mod shared;\n");
+    let binary_seed = seed(
+        &root,
+        "src/bin/tool/worker.rs",
+        "use crate::shared;\npub fn worker() {}\n",
+    );
+    seed(
+        &root,
+        "src/bin/tool/shared.rs",
+        "pub fn binary_shared() {}\n",
+    );
+    let binary = graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(root.display().to_string(), vec![binary_seed]),
+    )
+    .unwrap();
+    assert_eq!(binary.targets_warmed, 1);
+}
+
+#[test]
+fn prefetch_prunes_deleted_rust_crate_roots_before_request_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let crate_root = root.join("src/lib.rs");
+    seed(&root, "src/lib.rs", "mod shared;\n");
+    let feature = seed(
+        &root,
+        "src/nested/feature.rs",
+        "use crate::shared;\npub fn feature() {}\n",
+    );
+    seed(&root, "src/shared.rs", "pub fn shared() {}\n");
+    let eng = engine(&root);
+    let options = GraphPrefetchParams::new(root.display().to_string(), vec![feature]);
+
+    assert_eq!(graph_prefetch(&eng, &options).unwrap().targets_warmed, 1);
+    std::fs::remove_file(crate_root).unwrap();
+    let without_root = graph_prefetch(&eng, &options).unwrap();
+
+    assert_eq!(without_root.targets_discovered, 0);
+    assert_eq!(without_root.targets_warmed, 0);
+    assert_eq!(without_root.skips.unresolved, 1);
+}
+
+#[test]
+fn prefetch_refreshes_root_and_extended_js_config_only_when_stats_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let importer = seed(
+        &root,
+        "src/app.ts",
+        "import { value } from '@lib/value';\nexport { value };\n",
+    );
+    seed(&root, "a/value.ts", "export const value = 'a';\n");
+    seed(&root, "longer-b/value.ts", "export const value = 'b';\n");
+    seed(&root, "third/value.ts", "export const value = 'c';\n");
+    let base = seed(
+        &root,
+        "base.json",
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib/*":["a/*"]}}}"#,
+    );
+    let config = seed(&root, "tsconfig.json", r#"{"extends":"./base.json"}"#);
+    let eng = engine(&root);
+    let options = GraphPrefetchParams::new(root.display().to_string(), vec![importer]);
+
+    let first = graph_prefetch(&eng, &options).unwrap();
+    assert_eq!(first.targets_warmed, 1);
+
+    std::fs::write(
+        &base,
+        r#"{"compilerOptions": {"baseUrl":".","paths":{"@lib/*":["longer-b/*"]}}}"#,
+    )
+    .unwrap();
+    let extended_change = graph_prefetch(&eng, &options).unwrap();
+    assert_eq!(extended_change.targets_warmed, 1);
+    assert!(extended_change.graph_updates >= 1);
+
+    std::fs::write(&config, r#"{"extends":"./third.json"}"#).unwrap();
+    seed(
+        &root,
+        "third.json",
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib/*":["third/*"]}}}"#,
+    );
+    let root_change = graph_prefetch(&eng, &options).unwrap();
+    assert_eq!(root_change.targets_warmed, 1);
+    assert!(root_change.graph_updates >= 1);
+
+    let unchanged = graph_prefetch(&eng, &options).unwrap();
+    assert_eq!(unchanged.targets_warmed, 1);
+    assert_eq!(unchanged.graph_updates, 0);
+    assert!(unchanged.cache_hits >= 2);
+    assert!(eng.walks().is_empty());
+}
+
+#[test]
+fn prefetch_honors_explicit_config_invalidation_when_stat_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let importer = seed(&root, "src/app.ts", "import '#dep';\n");
+    seed(&root, "a/dep.ts", "export const value = 'a';\n");
+    let second_target = seed(&root, "b/dep.ts", "export const value = 'b';\n");
+    let config = root.join("tsconfig.json");
+    std::fs::write(
+        &config,
+        r##"{"compilerOptions":{"baseUrl":".","paths":{"#dep":["a/dep.ts"]}}}"##,
+    )
+    .unwrap();
+    let original_mtime = std::fs::metadata(&config).unwrap().modified().unwrap();
+    let eng = engine(&root);
+    let options = GraphPrefetchParams::new(root.display().to_string(), vec![importer]);
+
+    assert_eq!(graph_prefetch(&eng, &options).unwrap().targets_warmed, 1);
+    std::fs::write(
+        &config,
+        r##"{"compilerOptions":{"baseUrl":".","paths":{"#dep":["b/dep.ts"]}}}"##,
+    )
+    .unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(&config)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(original_mtime))
+        .unwrap();
+    eng.invalidate_path(&config);
+
+    let refreshed = graph_prefetch(&eng, &options).unwrap();
+    assert_eq!(refreshed.targets_warmed, 1);
+    assert!(refreshed.graph_updates >= 1);
+    assert!(
+        read(&eng, &ReadParams::new(second_target))
+            .unwrap()
+            .cache_hit
+    );
+}
+
+#[test]
+fn prefetch_prunes_obsolete_resolver_dependencies_before_stat_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let importer = root.join("src/app.ts");
+    seed(&root, "src/app.ts", "import 'package-a';\n");
+    let package_a = root.join("node_modules/package-a/package.json");
+    seed(
+        &root,
+        "node_modules/package-a/package.json",
+        r#"{"name":"package-a","main":"index.js"}"#,
+    );
+    seed(
+        &root,
+        "node_modules/package-a/index.js",
+        "module.exports = {};\n",
+    );
+    seed(
+        &root,
+        "node_modules/package-b/package.json",
+        r#"{"name":"package-b","main":"index.js"}"#,
+    );
+    seed(
+        &root,
+        "node_modules/package-b/index.js",
+        "module.exports = {};\n",
+    );
+    let eng = engine(&root);
+    let options = GraphPrefetchParams::new(
+        root.display().to_string(),
+        vec![importer.display().to_string()],
+    );
+
+    assert_eq!(graph_prefetch(&eng, &options).unwrap().graph_updates, 1);
+    std::fs::write(&importer, "import 'package-b';\n").unwrap();
+    eng.invalidate_path(&importer);
+    assert_eq!(graph_prefetch(&eng, &options).unwrap().graph_updates, 1);
+
+    std::fs::write(package_a, r#"{"name":"package-a","main":"different.js"}"#).unwrap();
+    let unchanged = graph_prefetch(&eng, &options).unwrap();
+    assert_eq!(unchanged.graph_updates, 0);
+}
+
+#[test]
+fn prefetch_reduced_limits_are_clamped_and_report_each_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let first = seed(
+        &root,
+        "src/first.ts",
+        "import './one';\nimport './two';\nexport const first = true;\n",
+    );
+    let second = seed(&root, "src/second.ts", "export const second = true;\n");
+    seed(&root, "src/one.ts", "export const one = true;\n");
+    seed(&root, "src/two.ts", "export const two = true;\n");
+
+    let mut seed_limited =
+        GraphPrefetchParams::new(root.display().to_string(), vec![first.clone(), second]);
+    seed_limited.max_seeds = Some(1);
+    let seed_result = graph_prefetch(&engine(&root), &seed_limited).unwrap();
+    assert_eq!(seed_result.seeds_processed, 1);
+    assert_eq!(seed_result.skips.seed_limit, 1);
+    assert!(seed_result.truncated);
+
+    let mut import_limited =
+        GraphPrefetchParams::new(root.display().to_string(), vec![first.clone()]);
+    import_limited.max_targets_per_seed = Some(1);
+    let import_result = graph_prefetch(&engine(&root), &import_limited).unwrap();
+    assert_eq!(import_result.imports_examined, 1);
+    assert_eq!(import_result.targets_warmed, 1);
+    assert_eq!(import_result.skips.target_limit, 1);
+    assert!(import_result.truncated);
+
+    let mut target_limited =
+        GraphPrefetchParams::new(root.display().to_string(), vec![first.clone()]);
+    target_limited.max_targets = Some(1);
+    let target_result = graph_prefetch(&engine(&root), &target_limited).unwrap();
+    assert_eq!(target_result.imports_examined, 2);
+    assert_eq!(target_result.targets_discovered, 2);
+    assert_eq!(target_result.targets_warmed, 1);
+    assert_eq!(target_result.skips.target_limit, 1);
+    assert!(target_result.truncated);
+
+    let mut file_limited =
+        GraphPrefetchParams::new(root.display().to_string(), vec![first.clone()]);
+    file_limited.max_file_bytes = Some(8);
+    let file_result = graph_prefetch(&engine(&root), &file_limited).unwrap();
+    assert_eq!(file_result.skips.oversize, 1);
+    assert!(file_result.truncated);
+
+    let mut total_limited = GraphPrefetchParams::new(root.display().to_string(), vec![first]);
+    total_limited.max_total_bytes = Some(8);
+    let total_result = graph_prefetch(&engine(&root), &total_limited).unwrap();
+    assert_eq!(total_result.skips.byte_limit, 1);
+    assert!(total_result.truncated);
+}
+
+#[test]
+fn prefetch_does_not_validate_seed_paths_beyond_the_admitted_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let admitted = seed(&root, "admitted.ts", "export const admitted = true;\n");
+    let mut options = GraphPrefetchParams::new(
+        root.display().to_string(),
+        vec![admitted, "x".repeat(64 * 1024 + 1)],
+    );
+    options.max_seeds = Some(1);
+
+    let result = graph_prefetch(&engine(&root), &options).unwrap();
+
+    assert_eq!(result.seeds_indexed, 1);
+    assert_eq!(result.skips.seed_limit, 1);
+    assert!(result.truncated);
+}
+
+#[test]
+fn prefetch_hard_caps_bound_seeds_imports_targets_file_bytes_and_total_bytes() {
+    const FILE_CAP: usize = 2 * 1024 * 1024;
+    const TOTAL_CAP: u64 = 16 * 1024 * 1024;
+
+    let seed_dir = tempfile::tempdir().unwrap();
+    let seed_root = seed_dir.path().canonicalize().unwrap();
+    let seeds: Vec<_> = (0..33)
+        .map(|index| seed(&seed_root, &format!("seed-{index}.ts"), ""))
+        .collect();
+    let mut seed_options = GraphPrefetchParams::new(seed_root.display().to_string(), seeds);
+    seed_options.max_seeds = Some(u64::MAX);
+    let seed_result = graph_prefetch(&engine(&seed_root), &seed_options).unwrap();
+    assert_eq!(seed_result.seeds_indexed, 32);
+    assert_eq!(seed_result.skips.seed_limit, 1);
+    assert!(seed_result.truncated);
+
+    let import_dir = tempfile::tempdir().unwrap();
+    let import_root = import_dir.path().canonicalize().unwrap();
+    let mut source = String::new();
+    for index in 0..65 {
+        source.push_str(&format!("import './target-{index}';\n"));
+        seed(&import_root, &format!("target-{index}.ts"), "");
+    }
+    let importer = seed(&import_root, "importer.ts", &source);
+    let mut import_options =
+        GraphPrefetchParams::new(import_root.display().to_string(), vec![importer]);
+    import_options.max_targets_per_seed = Some(u64::MAX);
+    let import_result = graph_prefetch(&engine(&import_root), &import_options).unwrap();
+    assert_eq!(import_result.imports_examined, 64);
+    assert_eq!(import_result.targets_warmed, 64);
+    assert_eq!(import_result.skips.target_limit, 1);
+    assert!(import_result.truncated);
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let target_root = target_dir.path().canonicalize().unwrap();
+    let mut importers = Vec::new();
+    let mut target = 0usize;
+    for seed_index in 0..5 {
+        let count = if seed_index == 4 { 1 } else { 64 };
+        let mut source = String::new();
+        for _ in 0..count {
+            source.push_str(&format!("import './target-{target}';\n"));
+            seed(&target_root, &format!("target-{target}.ts"), "");
+            target += 1;
+        }
+        importers.push(seed(
+            &target_root,
+            &format!("importer-{seed_index}.ts"),
+            &source,
+        ));
+    }
+    let mut target_options = GraphPrefetchParams::new(target_root.display().to_string(), importers);
+    target_options.max_targets = Some(u64::MAX);
+    let target_result = graph_prefetch(&engine(&target_root), &target_options).unwrap();
+    assert_eq!(target_result.targets_discovered, 257);
+    assert_eq!(target_result.targets_warmed, 256);
+    assert_eq!(target_result.skips.target_limit, 1);
+    assert!(target_result.truncated);
+
+    let file_dir = tempfile::tempdir().unwrap();
+    let file_root = file_dir.path().canonicalize().unwrap();
+    let oversize = seed(&file_root, "oversize.ts", &"x".repeat(FILE_CAP + 1));
+    let mut file_options =
+        GraphPrefetchParams::new(file_root.display().to_string(), vec![oversize]);
+    file_options.max_file_bytes = Some(u64::MAX);
+    let file_result = graph_prefetch(&engine(&file_root), &file_options).unwrap();
+    assert_eq!(file_result.skips.oversize, 1);
+    assert_eq!(file_result.source_bytes, 0);
+    assert!(file_result.truncated);
+
+    let total_dir = tempfile::tempdir().unwrap();
+    let total_root = total_dir.path().canonicalize().unwrap();
+    let exact_cap_source = format!("/*{}*/", "x".repeat(FILE_CAP - 4));
+    let mut total_files: Vec<_> = (0..8)
+        .map(|index| seed(&total_root, &format!("large-{index}.ts"), &exact_cap_source))
+        .collect();
+    total_files.push(seed(&total_root, "after-cap.ts", "x"));
+    let mut total_options = GraphPrefetchParams::new(total_root.display().to_string(), total_files);
+    total_options.max_total_bytes = Some(u64::MAX);
+    let total_result = graph_prefetch(&engine(&total_root), &total_options).unwrap();
+    assert_eq!(total_result.source_bytes, TOTAL_CAP);
+    assert_eq!(total_result.seeds_indexed, 8);
+    assert_eq!(total_result.skips.byte_limit, 1);
+    assert!(total_result.truncated);
+}
+
+#[test]
+fn prefetch_full_node_reuse_obeys_import_cap_without_downgrading_exact_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let importer = seed(
+        &root,
+        "src/importer.ts",
+        "import './one';\nimport './two';\nimport './three';\n",
+    );
+    let one = seed(&root, "src/one.ts", "export const one = 1;\n");
+    let two = seed(&root, "src/two.ts", "export const two = 2;\n");
+    let three = seed(&root, "src/three.ts", "export const three = 3;\n");
+    let eng = engine(&root);
+    let mut full = params(
+        &root,
+        GraphOp::Deps {
+            path: importer.clone(),
+            depth: 1,
+        },
+    );
+    full.files = vec![importer.clone(), one, two, three];
+    assert_eq!(dep_targets(&graph(&eng, &full).unwrap()).len(), 3);
+
+    let mut limited = GraphPrefetchParams::new(root.display().to_string(), vec![importer]);
+    limited.max_targets_per_seed = Some(1);
+    let result = graph_prefetch(&eng, &limited).unwrap();
+    assert_eq!(result.imports_examined, 1);
+    assert_eq!(result.targets_warmed, 1);
+    assert_eq!(result.skips.target_limit, 2);
+    assert_eq!(result.graph_updates, 0);
+
+    full.max_stale_ms = Some(u64::MAX);
+    let preserved = graph(&eng, &full).unwrap();
+    assert!(!preserved.meta.swept);
+    assert_eq!(preserved.meta.guarantee, GraphGuarantee::Exact);
+    assert_eq!(dep_targets(&preserved).len(), 3);
+}
+
+#[test]
+fn prefetch_later_seed_can_admit_a_target_rejected_by_an_earlier_import_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let first = seed(
+        &root,
+        "first.ts",
+        "import './first-only';\nimport './shared';\n",
+    );
+    let second = seed(&root, "second.ts", "import './shared';\n");
+    seed(&root, "first-only.ts", "");
+    seed(&root, "shared.ts", "");
+    let mut options = GraphPrefetchParams::new(root.display().to_string(), vec![first, second]);
+    options.max_targets_per_seed = Some(1);
+
+    let result = graph_prefetch(&engine(&root), &options).unwrap();
+
+    assert_eq!(result.imports_examined, 2);
+    assert_eq!(result.targets_warmed, 2);
+    assert_eq!(result.skips.target_limit, 1);
+    assert_eq!(result.skips.duplicate_targets, 0);
+}
+
+#[test]
+fn prefetch_trust_cache_reuses_stale_source_until_explicit_invalidation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let file = seed(&root, "seed.rs", "pub fn original() {}\n");
+    let eng = trusting_engine(&root);
+    let options = GraphPrefetchParams::new(root.display().to_string(), vec![file.clone()]);
+
+    assert_eq!(graph_prefetch(&eng, &options).unwrap().graph_updates, 1);
+    std::fs::write(&file, "pub fn changed_with_a_different_size() {}\n").unwrap();
+    let stale = graph_prefetch(&eng, &options).unwrap();
+    assert_eq!(stale.cache_hits, 1);
+    assert_eq!(stale.graph_updates, 0);
+
+    eng.invalidate_path(Path::new(&file));
+    let refreshed = graph_prefetch(&eng, &options).unwrap();
+    assert_eq!(refreshed.graph_updates, 1);
+}
+
+#[test]
+fn prefetch_real_insert_invalidates_reusable_sweep_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    seed(&root, "old.rs", "pub fn old() {}\n");
+    let eng = engine(&root);
+    let mut search = params(
+        &root,
+        GraphOp::Search {
+            query: String::new(),
+            limit: 20,
+        },
+    );
+    graph(&eng, &search).unwrap();
+
+    let inserted = seed(&root, "new.rs", "pub fn new() {}\n");
+    eng.invalidate_path(Path::new(&inserted));
+    let result = graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(root.display().to_string(), vec![inserted]),
+    )
+    .unwrap();
+    assert_eq!(result.graph_updates, 1);
+
+    search.max_stale_ms = Some(u64::MAX);
+    let refreshed = graph(&eng, &search).unwrap();
+    assert!(refreshed.meta.swept);
+    assert_eq!(refreshed.meta.indexed_files, 2);
+}
+
+#[test]
+fn prefetch_same_content_stat_change_updates_records_and_invalidates_sweep_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let file = seed(&root, "same.rs", "pub fn same() {}\n");
+    let eng = engine(&root);
+    let mut search = params(
+        &root,
+        GraphOp::Search {
+            query: String::new(),
+            limit: 20,
+        },
+    );
+    graph(&eng, &search).unwrap();
+
+    let original_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(original_mtime + Duration::from_secs(5)))
+        .unwrap();
+    let result = graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(root.display().to_string(), vec![file.clone()]),
+    )
+    .unwrap();
+    assert_eq!(result.graph_updates, 1);
+
+    search.max_stale_ms = Some(u64::MAX);
+    assert!(graph(&eng, &search).unwrap().meta.swept);
+    assert_eq!(
+        graph_prefetch(
+            &eng,
+            &GraphPrefetchParams::new(root.display().to_string(), vec![file]),
+        )
+        .unwrap()
+        .graph_updates,
+        0
+    );
+}
+
+#[test]
+fn prefetch_rejects_missing_non_regular_unsupported_and_non_utf8_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("directory.rs")).unwrap();
+    let unsupported = seed(&root, "plain.txt", "plain text\n");
+    let invalid = root.join("invalid.rs");
+    std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+    let result = graph_prefetch(
+        &engine(&root),
+        &GraphPrefetchParams::new(
+            root.display().to_string(),
+            vec![
+                "missing.rs".into(),
+                "directory.rs".into(),
+                unsupported,
+                invalid.display().to_string(),
+            ],
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(result.skips.missing, 1);
+    assert_eq!(result.skips.unsupported, 2);
+    assert_eq!(result.skips.non_utf8, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn prefetch_skips_a_source_beneath_a_non_utf8_absolute_root_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(OsStr::from_bytes(b"root-\xff"));
+    if std::fs::create_dir(&root).is_err() {
+        return;
+    }
+    std::fs::write(root.join("seed.rs"), "pub fn seed() {}\n").unwrap();
+
+    let mut options = GraphPrefetchParams::new(".", vec!["seed.rs".into()]);
+    options.follow_symlinks = true;
+    let result = graph_prefetch(&engine(&root), &options).unwrap();
+
+    assert_eq!(result.seeds_processed, 1);
+    assert_eq!(result.seeds_indexed, 0);
+    assert_eq!(result.skips.non_utf8, 1);
+}
+
+#[test]
+fn prefetch_honors_a_pre_cancelled_request_without_warming() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let path = seed(&root, "seed.ts", "export const seedValue = true;\n");
+    let eng = engine(&root);
+    let cancel = CancelToken::new();
+    cancel.cancel();
+
+    let error = graph_prefetch_cancellable(
+        &eng,
+        &GraphPrefetchParams::new(root.display().to_string(), vec![path]),
+        &cancel,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Cancelled);
+    assert!(eng.files().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn prefetch_canonical_containment_blocks_root_and_symlink_escapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let root = root.canonicalize().unwrap();
+    let outside_file = seed(&outside, "outside.rs", "pub fn outside() {}\n");
+    symlink(&outside_file, root.join("escape.rs")).unwrap();
+
+    let direct = graph_prefetch(
+        &engine(&root),
+        &GraphPrefetchParams::new(root.display().to_string(), vec![outside_file]),
+    )
+    .unwrap();
+    assert_eq!(direct.skips.root_escaping, 1);
+
+    let blocked_link = graph_prefetch(
+        &engine(&root),
+        &GraphPrefetchParams::new(root.display().to_string(), vec!["escape.rs".into()]),
+    )
+    .unwrap();
+    assert_eq!(blocked_link.skips.symlink, 1);
+
+    let mut followed =
+        GraphPrefetchParams::new(root.display().to_string(), vec!["escape.rs".into()]);
+    followed.follow_symlinks = true;
+    let escaped_link = graph_prefetch(&engine(&root), &followed).unwrap();
+    assert_eq!(escaped_link.skips.root_escaping, 1);
+
+    let invalid_name = OsStr::from_bytes(b"invalid-\xff.rs");
+    let invalid_path = root.join(invalid_name);
+    if std::fs::write(&invalid_path, "pub fn invalid_name() {}\n").is_err() {
+        return;
+    }
+    symlink(&invalid_path, root.join("utf8-link.rs")).unwrap();
+    let mut non_utf8 =
+        GraphPrefetchParams::new(root.display().to_string(), vec!["utf8-link.rs".into()]);
+    non_utf8.follow_symlinks = true;
+    let non_utf8_result = graph_prefetch(&engine(&root), &non_utf8).unwrap();
+    assert_eq!(non_utf8_result.skips.non_utf8, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn prefetch_rejects_raw_seed_symlinks_even_when_parent_components_hide_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+    seed(&root, "seed.rs", "pub fn lexical_seed() {}\n");
+    let resolved_seed = seed(&root, "nested/seed.rs", "pub fn resolved_seed() {}\n");
+    symlink("nested/deeper", root.join("step")).unwrap();
+
+    let blocked = graph_prefetch(
+        &engine(&root),
+        &GraphPrefetchParams::new(root.display().to_string(), vec!["step/../seed.rs".into()]),
+    )
+    .unwrap();
+
+    assert_eq!(blocked.seeds_processed, 0);
+    assert_eq!(blocked.skips.symlink, 1);
+
+    let mut followed =
+        GraphPrefetchParams::new(root.display().to_string(), vec!["step/../seed.rs".into()]);
+    followed.follow_symlinks = true;
+    let eng = engine(&root);
+    let warmed = graph_prefetch(&eng, &followed).unwrap();
+    assert_eq!(warmed.seeds_indexed, 1);
+    assert!(
+        read(&eng, &ReadParams::new(resolved_seed))
+            .unwrap()
+            .cache_hit
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn prefetch_rejects_a_symlink_in_the_explicit_root_spelling() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let real_root = base.join("real-root");
+    std::fs::create_dir(&real_root).unwrap();
+    seed(&real_root, "seed.rs", "pub fn seed() {}\n");
+    let linked_root = base.join("linked-root");
+    symlink(&real_root, &linked_root).unwrap();
+
+    let blocked = graph_prefetch(
+        &engine(&base),
+        &GraphPrefetchParams::new(linked_root.display().to_string(), vec!["seed.rs".into()]),
+    )
+    .unwrap();
+
+    assert_eq!(blocked.seeds_processed, 0);
+    assert_eq!(blocked.skips.symlink, 1);
+
+    let canonical_seed = real_root
+        .join("seed.rs")
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let canonical_spelling = graph_prefetch(
+        &engine(&base),
+        &GraphPrefetchParams::new(linked_root.display().to_string(), vec![canonical_seed]),
+    )
+    .unwrap();
+    assert_eq!(canonical_spelling.seeds_processed, 0);
+    assert_eq!(canonical_spelling.skips.symlink, 1);
+
+    let canonical_importer = seed(&real_root, "app.ts", "import './target';\n");
+    seed(&real_root, "target.ts", "export const target = true;\n");
+    let mut followed =
+        GraphPrefetchParams::new(linked_root.display().to_string(), vec![canonical_importer]);
+    followed.follow_symlinks = true;
+    let eng = engine(&base);
+    let warmed = graph_prefetch(&eng, &followed).unwrap();
+    assert_eq!(warmed.targets_warmed, 1);
+
+    let linked_importer = linked_root.join("app.ts").display().to_string();
+    let linked_target = linked_root.join("target.ts").display().to_string();
+    let mut deps = GraphParams::new(
+        linked_root.display().to_string(),
+        GraphOp::Deps {
+            path: linked_importer.clone(),
+            depth: 1,
+        },
+    );
+    deps.files = vec![linked_importer, linked_target.clone()];
+    assert_eq!(dep_targets(&graph(&eng, &deps).unwrap()), [linked_target]);
+
+    let real_parent = base.join("real-parent");
+    std::fs::create_dir_all(real_parent.join("subdir")).unwrap();
+    seed(&real_parent, "subdir/nested.rs", "pub fn nested() {}\n");
+    let linked_parent = base.join("linked-parent");
+    symlink(&real_parent, &linked_parent).unwrap();
+    let intermediate = graph_prefetch(
+        &engine(&base),
+        &GraphPrefetchParams::new(
+            linked_parent.join("subdir").display().to_string(),
+            vec!["nested.rs".into()],
+        ),
+    )
+    .unwrap();
+    assert_eq!(intermediate.seeds_processed, 0);
+    assert_eq!(intermediate.skips.symlink, 1);
+
+    let canonical_importer = seed(
+        &real_parent,
+        "subdir/app.ts",
+        "import { target } from './target';\nexport { target };\n",
+    );
+    seed(
+        &real_parent,
+        "subdir/target.ts",
+        "export const target = true;\n",
+    );
+    let intermediate_root = linked_parent.join("subdir");
+    let mut followed = GraphPrefetchParams::new(
+        intermediate_root.display().to_string(),
+        vec![canonical_importer],
+    );
+    followed.follow_symlinks = true;
+    let eng = engine(&base);
+    let warmed = graph_prefetch(&eng, &followed).unwrap();
+    assert_eq!(warmed.targets_warmed, 1);
+
+    let linked_importer = intermediate_root.join("app.ts").display().to_string();
+    let linked_target = intermediate_root.join("target.ts").display().to_string();
+    let mut deps = GraphParams::new(
+        intermediate_root.display().to_string(),
+        GraphOp::Deps {
+            path: linked_importer.clone(),
+            depth: 1,
+        },
+    );
+    deps.files = vec![linked_importer, linked_target.clone()];
+    assert_eq!(dep_targets(&graph(&eng, &deps).unwrap()), [linked_target]);
+}
+
+#[test]
+fn prefetch_accepts_a_root_spelling_with_parent_components() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("discarded")).unwrap();
+    let seed_path = seed(&root, "seed.rs", "pub fn seed() {}\n");
+    let spelled_root = root.join("discarded").join("..");
+    let eng = engine(&root);
+
+    let result = graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(spelled_root.display().to_string(), vec!["seed.rs".into()]),
+    )
+    .unwrap();
+
+    assert_eq!(result.seeds_indexed, 1);
+    assert_eq!(result.skips.symlink, 0);
+    assert!(
+        read(&eng, &ReadParams::new(seed_path)).unwrap().cache_hit,
+        "prefetch and ordinary reads must share the normalized cache key"
+    );
+}
+
+#[test]
+fn prefetch_partial_targets_upgrade_under_a_root_with_parent_components() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("discarded")).unwrap();
+    let importer = seed(&root, "src/app.ts", "import './direct';\n");
+    let direct = seed(&root, "src/direct.ts", "import './deep';\n");
+    let deep = seed(&root, "src/deep.ts", "export const deep = true;\n");
+    let spelled_root = root.join("discarded").join("..");
+    let eng = engine(&root);
+
+    let prefetched = graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(spelled_root.display().to_string(), vec![importer]),
+    )
+    .unwrap();
+    assert_eq!(prefetched.targets_warmed, 1);
+
+    let mut upgrade = GraphParams::new(
+        spelled_root.display().to_string(),
+        GraphOp::Deps {
+            path: direct.clone(),
+            depth: 1,
+        },
+    );
+    upgrade.files = vec![direct, deep.clone()];
+    let upgraded = graph(&eng, &upgrade).unwrap();
+    assert!(upgraded.meta.swept);
+    assert_eq!(dep_targets(&upgraded), [deep.as_str()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn prefetch_discovery_rejects_symlink_spelling_without_changing_resident_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let importer = seed(
+        &root,
+        "src/app.ts",
+        "import { dep } from './alias/dep';\nexport { dep };\n",
+    );
+    let canonical = seed(&root, "src/real/dep.ts", "export const dep = true;\n");
+    symlink("real", root.join("src/alias")).unwrap();
+    let eng = engine(&root);
+
+    let blocked = graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(root.display().to_string(), vec![importer.clone()]),
+    )
+    .unwrap();
+    assert_eq!(blocked.targets_discovered, 1);
+    assert_eq!(blocked.targets_warmed, 0);
+    assert_eq!(blocked.skips.symlink, 1);
+
+    let mut build = params(
+        &root,
+        GraphOp::Deps {
+            path: importer.clone(),
+            depth: 1,
+        },
+    );
+    build.files = vec![importer.clone(), canonical.clone()];
+    assert_eq!(
+        dep_targets(&graph(&eng, &build).unwrap()),
+        [canonical.as_str()]
+    );
+
+    let mut followed = GraphPrefetchParams::new(root.display().to_string(), vec![importer]);
+    followed.follow_symlinks = true;
+    let warmed = graph_prefetch(&eng, &followed).unwrap();
+    assert_eq!(warmed.targets_warmed, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn prefetch_treats_a_symlinked_workspace_package_as_an_in_root_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let importer = seed(
+        &root,
+        "src/app.ts",
+        "import { value } from 'workspace-pkg';\nexport { value };\n",
+    );
+    seed(
+        &root,
+        "packages/workspace-pkg/index.js",
+        "export const value = true;\n",
+    );
+    seed(
+        &root,
+        "packages/workspace-pkg/package.json",
+        r#"{"name":"workspace-pkg","main":"index.js"}"#,
+    );
+    std::fs::create_dir(root.join("node_modules")).unwrap();
+    symlink(
+        "../packages/workspace-pkg",
+        root.join("node_modules/workspace-pkg"),
+    )
+    .unwrap();
+    let eng = engine(&root);
+
+    let blocked = graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(root.display().to_string(), vec![importer.clone()]),
+    )
+    .unwrap();
+    assert_eq!(blocked.targets_discovered, 1);
+    assert_eq!(blocked.targets_warmed, 0);
+    assert_eq!(blocked.skips.symlink, 1);
+    assert_eq!(blocked.skips.external, 0);
+
+    let mut followed = GraphPrefetchParams::new(root.display().to_string(), vec![importer]);
+    followed.follow_symlinks = true;
+    let warmed = graph_prefetch(&eng, &followed).unwrap();
+    assert_eq!(warmed.targets_discovered, 1);
+    assert_eq!(warmed.targets_warmed, 1);
+    assert_eq!(warmed.skips.external, 0);
+}
+
+#[test]
+fn prefetch_keeps_cold_status_unbuilt_and_preserves_an_existing_ready_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let first = seed(&root, "first.rs", "pub fn first() {}\n");
+    let eng = engine(&root);
+
+    graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(root.display().to_string(), vec![first.clone()]),
+    )
+    .unwrap();
+    let cold = graph(&eng, &params(&root, GraphOp::Status)).unwrap();
+    assert!(!status(&cold).built);
+    assert!(!cold.meta.swept);
+    assert_eq!(cold.meta.guarantee, GraphGuarantee::Approximate);
+
+    let mut build = params(
+        &root,
+        GraphOp::Search {
+            query: String::new(),
+            limit: 10,
+        },
+    );
+    build.files = vec![first];
+    assert!(graph(&eng, &build).unwrap().meta.swept);
+    assert!(status(&graph(&eng, &params(&root, GraphOp::Status)).unwrap()).built);
+
+    let second = seed(&root, "second.rs", "pub fn second() {}\n");
+    graph_prefetch(
+        &eng,
+        &GraphPrefetchParams::new(root.display().to_string(), vec![second]),
+    )
+    .unwrap();
+    let dirty = graph(&eng, &params(&root, GraphOp::Status)).unwrap();
+    assert!(status(&dirty).built);
+    assert_eq!(dirty.meta.guarantee, GraphGuarantee::Approximate);
 }
 
 #[test]

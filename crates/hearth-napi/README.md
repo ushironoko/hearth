@@ -73,6 +73,44 @@ nothing is still running.
 `aborted`/`timedOut` set and the partial output intact, so a caller keeps what
 it already rendered.
 
+## Dependency prefetch (integration primitive)
+
+`graphPrefetch` and its cancellable worker-thread twin `graphPrefetchAsync` let
+an integration adapter opportunistically warm explicitly observed source files
+and their resolved, in-root direct imports:
+
+```ts
+const warmed = await engine.graphPrefetchAsync(
+  { root: process.cwd(), files: ["src/current.ts"] },
+  controller.signal,
+);
+```
+
+This is an integration-only primitive, not an agent-facing graph operation. It
+does no directory walking and discovers or parses no ignore files; only the
+supplied seeds and dependency targets resolved from those seeds are candidates.
+Consequently `hidden` and `respectGitignore` exist only for graph-call option
+parity and do not filter explicit/resolved paths. Canonical root containment,
+supported-language checks, regular-file checks, UTF-8 checks, and symlink policy
+still apply.
+
+Retention is opportunistic: warmed file-cache entries and graph roots remain
+subject to the engine's normal bounded eviction and invalidation. The result
+therefore reports file-cache reuse (`cacheHits`) separately from graph-state
+changes (`graphUpdates`); one does not imply the other. `skips` accounts for
+individual candidates and `truncated` reports budget truncation.
+
+Native hard caps remain authoritative: 32 seeds, 64 imports examined per seed,
+256 unique direct targets, 2 MiB per file, and 16 MiB total source per request.
+The optional `maxSeeds`, `maxTargetsPerSeed`, `maxTargets`, `maxFileBytes`, and
+`maxTotalBytes` fields may only reduce those limits. They must be non-negative
+JavaScript safe integers; invalid numeric values are rejected instead of being
+coerced.
+
+Prefetch is exposed only through the native Rust and N-API integration
+surfaces. It adds no `GraphOp`, daemon request, CLI command, or daemon protocol
+change.
+
 ## Errors
 
 Every failure — a synchronous throw or a promise rejection — is a JS `Error`

@@ -5,8 +5,9 @@
 use hearth_proto::{
     GraphBasisEntry, GraphCoverage, GraphDefinitionsResult, GraphDepEdge, GraphDepsResult,
     GraphGuarantee, GraphLanguageStatus, GraphMeta, GraphNeighborhoodResult, GraphNode, GraphOp,
-    GraphOutlineResult, GraphOutput, GraphParams, GraphRdepEntry, GraphRdepsResult, GraphResult,
-    GraphSearchResult, GraphStatusResult, GraphSymbol, GraphSymbolsResult, content_hash_hex,
+    GraphOutlineResult, GraphOutput, GraphParams, GraphPrefetchParams, GraphPrefetchResult,
+    GraphPrefetchSkips, GraphRdepEntry, GraphRdepsResult, GraphResult, GraphSearchResult,
+    GraphStatusResult, GraphSymbol, GraphSymbolsResult, PROTOCOL_VERSION, content_hash_hex,
 };
 
 fn symbol(kind: &str) -> GraphSymbol {
@@ -216,6 +217,68 @@ fn minimal_json_applies_graph_defaults() {
             path: "a".into(),
             depth: 1
         }
+    );
+}
+
+#[test]
+fn standalone_prefetch_contract_applies_defaults_and_round_trips() {
+    let params: GraphPrefetchParams =
+        serde_json::from_str(r#"{"root":"/tmp/r","files":["src/a.ts"]}"#).unwrap();
+    assert_eq!(
+        params,
+        GraphPrefetchParams::new("/tmp/r", vec!["src/a.ts".into()])
+    );
+
+    let bytes = rmp_serde::to_vec_named(&params).unwrap();
+    let back: GraphPrefetchParams = rmp_serde::from_slice(&bytes).unwrap();
+    assert_eq!(back, params);
+
+    let result = GraphPrefetchResult {
+        root: "/tmp/r".into(),
+        seeds_requested: 2,
+        seeds_processed: 1,
+        seeds_indexed: 1,
+        imports_examined: 3,
+        targets_discovered: 2,
+        targets_warmed: 1,
+        source_bytes: 99,
+        cache_hits: 1,
+        graph_updates: 2,
+        skips: GraphPrefetchSkips {
+            seed_limit: 1,
+            unresolved: 1,
+            ..GraphPrefetchSkips::default()
+        },
+        truncated: true,
+    };
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["seedsRequested"], 2);
+    assert_eq!(json["skips"]["seedLimit"], 1);
+    let bytes = rmp_serde::to_vec_named(&result).unwrap();
+    let back: GraphPrefetchResult = rmp_serde::from_slice(&bytes).unwrap();
+    assert_eq!(back, result);
+
+    assert_eq!(
+        PROTOCOL_VERSION, 3,
+        "standalone prefetch must not bump transport"
+    );
+    assert!(
+        serde_json::from_value::<GraphOp>(serde_json::json!({"prefetch": {}})).is_err(),
+        "prefetch must not become an LLM-visible graph operation"
+    );
+    assert!(
+        serde_json::from_value::<hearth_proto::Request>(serde_json::json!({
+            "graphPrefetch": {"root": "/tmp/r", "files": []}
+        }))
+        .is_err(),
+        "prefetch must not become a daemon request"
+    );
+    assert!(
+        serde_json::from_value::<hearth_proto::Response>(serde_json::json!({
+            "graphPrefetch": result
+        }))
+        .is_err(),
+        "prefetch must not become a daemon response"
     );
 }
 

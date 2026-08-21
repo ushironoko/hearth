@@ -612,6 +612,95 @@ test("invalidateRoot covers what a shell command did", async () => {
 // ---------------------------------------------------------------------------
 suite("graph");
 
+test("prefetches only direct dependencies and reports cache and graph outcomes separately", () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const seedPath = seed(
+    root,
+    "seed.ts",
+    'import { direct } from "./direct";\nexport const value = direct;\n',
+  );
+  const directPath = seed(
+    root,
+    "direct.ts",
+    'import { deep } from "./deep";\nexport const direct = deep;\n',
+  );
+  const deepPath = seed(root, "deep.ts", "export const deep = 42;\n");
+  const params = { root, files: ["seed.ts"] };
+
+  const cold = engine.graphPrefetch(params);
+  assert.equal(cold.seedsRequested, 1);
+  assert.equal(cold.seedsProcessed, 1);
+  assert.equal(cold.seedsIndexed, 1);
+  assert.equal(cold.importsExamined, 1);
+  assert.equal(cold.targetsDiscovered, 1);
+  assert.equal(cold.targetsWarmed, 1);
+  assert.equal(cold.cacheHits, 0, "the first file-cache loads are cold");
+  assert.equal(cold.graphUpdates, 2, "the seed and direct target update graph state");
+  assert.equal(cold.truncated, false);
+
+  const warm = engine.graphPrefetch(params);
+  assert.equal(warm.cacheHits, 2, "the seed and direct target reuse cached bytes");
+  assert.equal(warm.graphUpdates, 0, "cache reuse does not imply a graph update");
+  assert.equal(engine.read({ path: seedPath }).cacheHit, true);
+  assert.equal(engine.read({ path: directPath }).cacheHit, true);
+  assert.equal(engine.read({ path: deepPath }).cacheHit, false, "depth two stays cold");
+});
+
+test("prefetches successfully on a worker thread", async () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  seed(root, "async.ts", 'import "./target";\n');
+  seed(root, "target.ts", "export const target = true;\n");
+
+  const result = await engine.graphPrefetchAsync({ root, files: ["async.ts"] });
+  assert.equal(result.seedsIndexed, 1);
+  assert.equal(result.targetsWarmed, 1);
+  assert.equal(result.graphUpdates, 2);
+  assert.equal(result.truncated, false);
+});
+
+test("rejects a pre-aborted prefetch without warming its seed", async () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const seedPath = seed(root, "cancelled.ts", "export const untouched = true;\n");
+  const controller = new AbortController();
+  controller.abort();
+
+  const error = await rejects(() =>
+    engine.graphPrefetchAsync({ root, files: [seedPath] }, controller.signal),
+  );
+  assert.equal(errorKind(error), "cancelled");
+  assert.equal(engine.read({ path: seedPath }).cacheHit, false);
+});
+
+test("rejects hostile prefetch limits instead of coercing them", () => {
+  const root = realpathSync(tempDir());
+  const engine = new HearthEngine({ cwd: root, enableOptimizer: false });
+  const fields = [
+    "maxSeeds",
+    "maxTargetsPerSeed",
+    "maxTargets",
+    "maxFileBytes",
+    "maxTotalBytes",
+  ];
+  const hostile = [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53, Number.MAX_VALUE];
+
+  for (const field of fields) {
+    for (const value of hostile) {
+      const error = throws(() => engine.graphPrefetch({ root, files: [], [field]: value }));
+      assert.equal(errorKind(error), "invalidInput", `${field} must reject ${String(value)}`);
+    }
+  }
+
+  const accepted = engine.graphPrefetch({
+    root,
+    files: [],
+    maxSeeds: Number.MAX_SAFE_INTEGER,
+  });
+  assert.equal(accepted.seedsRequested, 0, "safe integers reach the native cap logic");
+});
+
 test("keeps all graph operations in sync and async parity", async () => {
   const root = realpathSync(tempDir());
   const engine = new HearthEngine({ cwd: root, enableOptimizer: false });

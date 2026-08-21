@@ -106,6 +106,8 @@ pub struct ModuleNode {
     /// Deduplicated resolver configuration paths consulted by outgoing edges.
     pub config_dependencies: Vec<CompactString>,
     imports_supported: bool,
+    imports_complete: bool,
+    imports_analyzed: usize,
     resolver_live: bool,
     resolution_complete: bool,
     resolved_at: u64,
@@ -120,6 +122,8 @@ impl ModuleNode {
             rdeps: FxHashSet::default(),
             config_dependencies: Vec::new(),
             imports_supported: false,
+            imports_complete: false,
+            imports_analyzed: 0,
             resolver_live: false,
             resolution_complete: false,
             resolved_at: 0,
@@ -136,6 +140,12 @@ impl ModuleNode {
     #[must_use]
     pub fn imports_supported(&self) -> bool {
         self.imports_supported
+    }
+
+    /// Whether every extracted import was resolved when this node was upserted.
+    #[must_use]
+    pub fn imports_complete(&self) -> bool {
+        self.imports_complete
     }
 
     /// Whether the matching resolver was live when this node was resolved.
@@ -289,7 +299,36 @@ impl ModuleGraph {
         resolvers: &ResolverSet,
         imports_supported: bool,
     ) -> UpsertOutcome {
+        self.upsert_file_bounded(analysis, resolvers, imports_supported, usize::MAX)
+    }
+
+    /// Inserts or refreshes one file while resolving at most `max_imports`.
+    ///
+    /// Bounded upserts deliberately leave a node structurally partial until a
+    /// later full upsert supplies every extracted import. Repeating a narrower
+    /// bounded upsert of unchanged content never downgrades a fuller node.
+    pub fn upsert_file_bounded(
+        &mut self,
+        analysis: &FileAnalysis,
+        resolvers: &ResolverSet,
+        imports_supported: bool,
+        max_imports: usize,
+    ) -> UpsertOutcome {
         let existing = self.by_path.get(analysis.path.as_str()).copied();
+        let imports_analyzed = analysis.imports.len().min(max_imports);
+        let unchanged_content = existing.is_some_and(|slot| {
+            matches!(
+                self.occupied(slot).state,
+                NodeState::Analyzed { content_hash, .. }
+                    if content_hash == analysis.content_hash
+            )
+        });
+
+        if unchanged_content
+            && existing.is_some_and(|slot| self.occupied(slot).imports_analyzed > imports_analyzed)
+        {
+            return UpsertOutcome::Unchanged;
+        }
         if existing.is_some_and(|slot| {
             let node = self.occupied(slot);
             matches!(
@@ -299,13 +338,15 @@ impl ModuleGraph {
                     ..
                 } if content_hash == analysis.content_hash
             ) && node.resolved_at == self.resolver_generation
+                && node.imports_analyzed >= imports_analyzed
         }) {
             return UpsertOutcome::Unchanged;
         }
 
-        let resolutions = resolve_imports(resolvers, &analysis.path, &analysis.imports);
+        let analyzed_imports = &analysis.imports[..imports_analyzed];
+        let resolutions = resolve_imports(resolvers, &analysis.path, analyzed_imports);
         let resolver_live =
-            resolver_is_live(analysis.language.as_deref(), &analysis.imports, resolvers);
+            resolver_is_live(analysis.language.as_deref(), analyzed_imports, resolvers);
         let outcome = if existing.is_some() {
             UpsertOutcome::Updated
         } else {
@@ -336,6 +377,8 @@ impl ModuleGraph {
         node.out = edges;
         node.config_dependencies = config_dependencies;
         node.imports_supported = imports_supported;
+        node.imports_complete = imports_analyzed == analysis.imports.len();
+        node.imports_analyzed = imports_analyzed;
         node.resolver_live = resolver_live;
         node.resolution_complete = resolution_complete;
         node.resolved_at = resolved_at;
@@ -372,6 +415,8 @@ impl ModuleGraph {
             node.out.clear();
             node.config_dependencies.clear();
             node.imports_supported = false;
+            node.imports_complete = false;
+            node.imports_analyzed = 0;
             node.resolver_live = false;
             node.resolution_complete = false;
             node.resolved_at = 0;
@@ -653,6 +698,7 @@ impl ModuleGraph {
                 ..
             }
         ) && node.imports_supported
+            && node.imports_complete
             && node.resolver_live
             && node.resolution_complete
             // Edges resolved under an older resolver configuration may point
@@ -843,6 +889,7 @@ fn rdeps_node_is_exact(node: &ModuleNode, resolver_generation: u64) -> bool {
             ..
         }
     ) && node.imports_supported
+        && node.imports_complete
         && node.resolver_live
         && node.resolution_complete
         && node.resolved_at == resolver_generation

@@ -41,6 +41,10 @@ export declare class HearthEngine {
   /** Synchronous glob discovery. Prefer `findAsync` for cold large trees. */
   find(params: FindParams): FindResult
   findAsync(params: FindParams, signal?: AbortSignal): Promise<FindResult>
+  /** Warm explicit seed files and their resolved direct in-root imports. */
+  graphPrefetch(params: GraphPrefetchParams): GraphPrefetchResult
+  /** Asynchronously warm explicit seeds and their direct imports. */
+  graphPrefetchAsync(params: GraphPrefetchParams, signal?: AbortSignal): Promise<GraphPrefetchResult>
   /** Synchronously list symbols extracted from one file. */
   graphSymbols(params: GraphSymbolsParams): GraphResult
   /** Synchronously return the nested symbol outline for one file. */
@@ -476,6 +480,67 @@ export interface GraphOutlineResult {
   nodeId: string
   symbols: Array<GraphSymbol>
   truncated: boolean
+}
+
+/** Bounded depth-one graph prefetch for integration adapters. */
+export interface GraphPrefetchParams {
+  /** Root that contains every admitted seed and resolved target. */
+  root: string
+  /** Explicit seed paths. Relative paths are resolved beneath `root`. */
+  files?: Array<string>
+  /** Optional caller reduction of the native seed cap. */
+  maxSeeds?: number
+  /** Optional caller reduction of imports examined for each seed. */
+  maxTargetsPerSeed?: number
+  /** Optional caller reduction of the unique resolved-target cap. */
+  maxTargets?: number
+  /** Optional caller reduction of the native per-file byte cap. */
+  maxFileBytes?: number
+  /** Optional caller reduction of the native total-source byte cap. */
+  maxTotalBytes?: number
+  /** Retained for graph-call parity; explicit paths are never hidden-filtered. */
+  hidden?: boolean
+  /** Retained for graph-call parity; prefetch never discovers ignore files. */
+  respectGitignore?: boolean
+  /** Follow explicit symlink components whose targets remain under `root`. */
+  followSymlinks?: boolean
+}
+
+/** Structured outcome from one bounded depth-one prefetch request. */
+export interface GraphPrefetchResult {
+  root: string
+  seedsRequested: number
+  seedsProcessed: number
+  seedsIndexed: number
+  importsExamined: number
+  targetsDiscovered: number
+  targetsWarmed: number
+  sourceBytes: number
+  /** File-cache hits observed while loading seeds and direct targets. */
+  cacheHits: number
+  /** Graph publications that changed resident graph state. */
+  graphUpdates: number
+  skips: GraphPrefetchSkips
+  truncated: boolean
+}
+
+/** Per-reason accounting for candidates that prefetch did not warm. */
+export interface GraphPrefetchSkips {
+  seedLimit: number
+  duplicateSeeds: number
+  duplicateTargets: number
+  targetLimit: number
+  byteLimit: number
+  external: number
+  unresolved: number
+  missing: number
+  unsupported: number
+  oversize: number
+  rootEscaping: number
+  ignored: number
+  symlink: number
+  nonUtf8: number
+  io: number
 }
 
 export interface GraphRdepEntry {

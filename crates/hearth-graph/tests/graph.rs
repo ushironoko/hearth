@@ -4,6 +4,7 @@
     feature = "resolve-rust"
 ))]
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use compact_str::CompactString;
@@ -28,6 +29,7 @@ struct MockData {
     targets: FxHashMap<CompactString, Resolved>,
     dependencies: FxHashMap<CompactString, Vec<CompactString>>,
     completeness: FxHashMap<CompactString, ResolutionCompleteness>,
+    resolve_calls: AtomicUsize,
 }
 
 #[derive(Clone, Default)]
@@ -82,6 +84,14 @@ impl MockState {
             rust: None,
         }
     }
+
+    fn resolve_calls(&self) -> usize {
+        self.0
+            .read()
+            .expect("mock resolver lock poisoned")
+            .resolve_calls
+            .load(Ordering::Relaxed)
+    }
 }
 
 struct MockResolver {
@@ -91,6 +101,7 @@ struct MockResolver {
 impl Resolve for MockResolver {
     fn resolve(&self, _from_file: &str, import: &RawImport) -> ResolutionOutcome {
         let data = self.state.0.read().expect("mock resolver lock poisoned");
+        data.resolve_calls.fetch_add(1, Ordering::Relaxed);
         ResolutionOutcome {
             resolved: data
                 .targets
@@ -248,6 +259,75 @@ fn resolved_paths_create_stubs_and_upsert_promotes_them_in_place() {
     assert!(matches!(promoted.state, NodeState::Analyzed { .. }));
     assert_eq!(graph.rdeps_paths("/repo/child.ts").unwrap().len(), 1);
     assert_eq!(graph.rdeps("/repo/child.ts").unwrap().edges.len(), 1);
+}
+
+#[test]
+fn bounded_upserts_upgrade_without_narrower_downgrades_or_deep_stubs() {
+    let state = MockState::with_targets([
+        ("first", Resolved::Path("/repo/first.ts".into())),
+        ("second", Resolved::Path("/repo/second.ts".into())),
+        ("deep", Resolved::Path("/repo/deep.ts".into())),
+    ]);
+    let resolvers = state.resolvers();
+    let mut graph = ModuleGraph::new();
+    let seed = analysis("/repo/seed.ts", 1, &["first", "second"], false);
+    let first = analysis("/repo/first.ts", 2, &["deep"], false);
+
+    assert_eq!(
+        graph.upsert_file_bounded(&seed, &resolvers, true, 1),
+        UpsertOutcome::Inserted
+    );
+    assert_eq!(graph.deps("/repo/seed.ts").unwrap().edges.len(), 1);
+    assert_eq!(
+        graph.deps("/repo/seed.ts").unwrap().guarantee,
+        Guarantee::Approximate
+    );
+    assert!(!graph.node("/repo/seed.ts").unwrap().imports_complete());
+
+    assert_eq!(
+        graph.upsert_file_bounded(&first, &resolvers, true, 0),
+        UpsertOutcome::Updated
+    );
+    assert!(graph.node("/repo/deep.ts").is_none());
+    assert!(graph.deps("/repo/first.ts").unwrap().edges.is_empty());
+
+    assert_eq!(
+        graph.upsert_file(&seed, &resolvers, true),
+        UpsertOutcome::Updated
+    );
+    assert_eq!(graph.deps("/repo/seed.ts").unwrap().edges.len(), 2);
+    assert!(graph.node("/repo/seed.ts").unwrap().imports_complete());
+
+    graph.bump_resolver_generation();
+    state.set_target("first", Resolved::Path("/repo/reconfigured.ts".into()));
+    let calls_before_narrower = state.resolve_calls();
+    assert_eq!(
+        graph.upsert_file_bounded(&seed, &resolvers, true, 0),
+        UpsertOutcome::Unchanged
+    );
+    assert_eq!(state.resolve_calls(), calls_before_narrower);
+    assert_eq!(graph.deps("/repo/seed.ts").unwrap().edges.len(), 2);
+    assert!(graph.node("/repo/seed.ts").unwrap().imports_complete());
+    assert!(
+        graph.deps("/repo/seed.ts").unwrap().edges.iter().any(
+            |edge| matches!(&edge.to, EdgeTargetOwned::Path(path) if path == "/repo/first.ts")
+        )
+    );
+
+    assert_eq!(
+        graph.upsert_file(&seed, &resolvers, true),
+        UpsertOutcome::Updated
+    );
+    assert!(graph.deps("/repo/seed.ts").unwrap().edges.iter().any(
+        |edge| matches!(&edge.to, EdgeTargetOwned::Path(path) if path == "/repo/reconfigured.ts")
+    ));
+
+    let calls_before_noop = state.resolve_calls();
+    assert_eq!(
+        graph.upsert_file(&seed, &resolvers, true),
+        UpsertOutcome::Unchanged
+    );
+    assert_eq!(state.resolve_calls(), calls_before_noop);
 }
 
 #[test]
