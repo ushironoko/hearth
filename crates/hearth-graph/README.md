@@ -76,7 +76,7 @@ of reading resolver configuration through a potentially redirected path.
 ## Versioning and MSRV
 
 The minimum supported Rust version is **1.95**. The crate is currently in the
-`0.2` series; public APIs may evolve between minor releases. Pin an exact
+`0.3` series; public APIs may evolve between minor releases. Pin an exact
 version when integrating a compatibility facade.
 
 The detailed cache adapter, freshness model, and graph guarantees used by the

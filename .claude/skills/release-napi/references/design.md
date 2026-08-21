@@ -60,8 +60,10 @@ to propagate it to `npm/*`. Nothing needs hand-editing — do not bump
 `package.json` before tagging, or the tag is no longer the single source of
 truth.
 
-The Rust crates carry their own `version` in the workspace `Cargo.toml` and are
-released independently; they are not published to crates.io today.
+Rust crate versions are independent of the npm package version. `hearth-graph`
+carries its own version in `crates/hearth-graph/Cargo.toml` and is published
+separately to crates.io; the other workspace Rust crates are not currently
+published.
 
 ## The jobs
 
