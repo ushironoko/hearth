@@ -110,6 +110,10 @@ signal blocks on its real deadline as before.
 * `graph` → `WalkCache` for the universe + `FileCache` for bytes and hashes +
   the `GraphState` engine extension + `InvalidationLog` for derived-state
   coherence.
+* `graph_prefetch` / `graphPrefetch` (native/N-API integration only) →
+  `FileCache` plus additive `GraphState` publication for explicit seeds and
+  their direct resolved targets. It never populates `WalkCache` or
+  discovers/parses ignore files.
 * `bash` → a fresh shell per command in its own process group, or the opt-in
   warm pool. Both stream ordered chunks.
 
@@ -298,6 +302,26 @@ symbols, outlines, symbol search, definitions, and status; Stage B layers deps,
 rdeps, and neighborhood traversal on the same analyzed files. Cross-language
 import resolution is outside that stage's scope.
 
+The native/N-API dependency-prefetch primitive (`graph_prefetch` in Rust,
+`graphPrefetch` in JavaScript) is deliberately outside those query operations.
+An integration adapter supplies explicit observed seeds; Hearth
+loads and analyzes those seeds, resolves their imports, and may additionally
+warm only direct in-root targets. It performs no directory walking and no
+ignore-file discovery or parsing. Explicit/resolved paths are still subject to
+canonical root containment, regular-file, supported-language, UTF-8, byte, and
+symlink checks. `hidden` and `respectGitignore` are retained only for graph-call
+option parity and do not cause filtering or discovery.
+
+Prefetch publication is additive, but retention is opportunistic: `FileCache`
+entries and `GraphState` roots remain bounded and can be evicted or invalidated.
+The structured result therefore preserves cache and graph outcomes separately:
+`cacheHits` counts reused file entries while `graphUpdates` counts publications
+that changed graph state. Candidate-specific `skips` and `truncated` expose
+partial work without turning warming into a durability guarantee. The native
+hard caps are 32 seeds, 64 imports examined per seed, 256 unique direct targets,
+2 MiB per file, and 16 MiB total source per request; caller-supplied limits can
+only reduce them.
+
 `GraphState` is an `Engine` extension with one `RootGraph` per resolved
 absolute root. Roots are not canonicalized by the shared adapter, so two
 symlink spellings of the same directory build two independent indexes; the
@@ -412,6 +436,10 @@ restarting the daemon before new clients use it. Compatibility is asymmetric: an
 requests to a new daemon, while a newer CLI whose daemon exchange fails falls
 back to the existing cold inline path.
 
+Dependency prefetch intentionally adds neither a ninth `GraphOp` nor any
+`Request`/`Response` variant. It is an in-process integration API only, so the
+daemon protocol and CLI surface do not change.
+
 ## Cache coherence
 
 `trustCache` skips the per-hit freshness `stat` — where most of the warm-read
@@ -501,6 +529,9 @@ atomic stdout.
   `index.d.ts` describes the real shapes, with no `any` on any tool method.
   Sync methods run on the JS thread; every `*Async` twin offloads to a libuv
   worker via `AsyncTask` (no embedded tokio) and takes an optional `AbortSignal`.
+  This includes the integration-only `graphPrefetch`/`graphPrefetchAsync` pair;
+  its numeric reduction limits are validated as non-negative JavaScript safe
+  integers before the native hard caps are applied.
   `bashStream` additionally takes a chunk callback, invoked from the worker
   through a `ThreadsafeFunction` in non-blocking mode so a slow JS consumer
   cannot stall the pipe readers into a deadlock. The engine is an explicit object
@@ -558,5 +589,6 @@ atomic stdout.
 | Grep pattern/globs/context/matches | 1 MiB / 256×16 KiB / 10,000 / 1,000,000 |
 | Graph files/path/query/depth/results | 100,000 / 64 KiB / 1 MiB / 64 / 100,000 |
 | Graph build/resident roots | 2 concurrent builds; 256 MiB build estimate; 16 roots / 512 MiB resident estimate |
+| Graph prefetch | 32 seeds; 64 imports/seed; 256 unique direct targets; 2 MiB/file; 16 MiB total source |
 
 Walks intentionally honor only regular root-local `.ignore` and `.rgignore` files. Ancestor/global Git ignore discovery and `.git/info/exclude` are disabled because they escape the bounded root. JavaScript resolver config reads are same-FD, regular-file-only, and capped at 1 MiB; automatic tsconfig project-reference fan-out is disabled.

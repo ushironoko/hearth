@@ -25,7 +25,10 @@ mod write;
 pub use bash::{bash, bash_cancellable, bash_stream};
 pub use edit::{edit, edit_batch, edit_batch_cancellable, edit_cancellable};
 pub use find::{find, find_cancellable};
-pub use graph::{graph, graph_cancellable, graph_clear};
+pub use graph::{
+    GraphPrefetchParams, GraphPrefetchResult, GraphPrefetchSkips, graph, graph_cancellable,
+    graph_clear, graph_prefetch, graph_prefetch_cancellable,
+};
 pub use grep::{grep, grep_cancellable};
 pub use read::{read, read_bytes, read_bytes_cancellable, read_cancellable};
 pub use write::{write, write_cancellable, write_owned, write_owned_cancellable};

@@ -28,7 +28,9 @@ pub use imports::{ImportKind, RawImport};
 pub use lang::{ImportSpec, LanguageId, LanguageRegistry, LanguageSpec};
 pub use parse::ParserPool;
 #[cfg(feature = "resolve-js")]
-pub use resolve::js::{JsResolveOptions, js_resolver, js_resolver_with_fs};
+pub use resolve::js::{
+    JsResolveOptions, js_resolver, js_resolver_preserving_symlinks, js_resolver_with_fs,
+};
 #[cfg(feature = "resolve-rust")]
 pub use resolve::rust::{RustResolveOptions, rust_resolver};
 pub use resolve::{

@@ -731,6 +731,104 @@ pub struct FindResult {
 // graph
 // ---------------------------------------------------------------------------
 
+/// Bounded depth-one graph-prefetch options.
+///
+/// This standalone serde contract is intentionally not a daemon request: it
+/// is shared by in-process/native adapters without changing protocol framing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphPrefetchParams {
+    /// Root that contains every admitted seed and resolved target.
+    pub root: String,
+    /// Explicit seed paths. Relative paths are resolved beneath `root`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// Optional caller reduction of the native seed cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seeds: Option<u64>,
+    /// Optional caller reduction of imports examined for each seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_targets_per_seed: Option<u64>,
+    /// Optional caller reduction of the unique resolved-target cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_targets: Option<u64>,
+    /// Optional caller reduction of the native per-file byte cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_file_bytes: Option<u64>,
+    /// Optional caller reduction of the native total-source byte cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_bytes: Option<u64>,
+    /// Retained for graph-call option parity. Explicit paths are not filtered
+    /// by hidden-name policy because prefetch never performs a walk.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Retained for graph-call option parity. Prefetch never discovers or
+    /// parses ignore files; explicit/resolved paths remain eligible.
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
+    /// Permit explicit symlink components whose canonical targets stay under
+    /// `root`. Canonical containment is enforced regardless of this flag.
+    #[serde(default)]
+    pub follow_symlinks: bool,
+}
+
+impl GraphPrefetchParams {
+    /// Default bounded prefetch configuration for explicit `files`.
+    pub fn new(root: impl Into<String>, files: Vec<String>) -> Self {
+        Self {
+            root: root.into(),
+            files,
+            max_seeds: None,
+            max_targets_per_seed: None,
+            max_targets: None,
+            max_file_bytes: None,
+            max_total_bytes: None,
+            hidden: false,
+            respect_gitignore: true,
+            follow_symlinks: false,
+        }
+    }
+}
+
+/// Per-reason accounting for prefetch candidates that were not warmed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphPrefetchSkips {
+    pub seed_limit: u64,
+    pub duplicate_seeds: u64,
+    pub duplicate_targets: u64,
+    pub target_limit: u64,
+    pub byte_limit: u64,
+    pub external: u64,
+    pub unresolved: u64,
+    pub missing: u64,
+    pub unsupported: u64,
+    pub oversize: u64,
+    pub root_escaping: u64,
+    pub ignored: u64,
+    pub symlink: u64,
+    pub non_utf8: u64,
+    pub io: u64,
+}
+
+/// Structured outcome from one bounded depth-one prefetch request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphPrefetchResult {
+    pub root: String,
+    pub seeds_requested: u64,
+    pub seeds_processed: u64,
+    pub seeds_indexed: u64,
+    pub imports_examined: u64,
+    pub targets_discovered: u64,
+    pub targets_warmed: u64,
+    pub source_bytes: u64,
+    pub cache_hits: u64,
+    pub graph_updates: u64,
+    pub skips: GraphPrefetchSkips,
+    pub truncated: bool,
+}
+
 /// Parameters for a code-graph query rooted at a file or directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

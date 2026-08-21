@@ -84,7 +84,14 @@ impl Default for JsResolveOptions {
 
 /// Build a JavaScript resolver backed by the operating system filesystem.
 pub fn js_resolver(options: JsResolveOptions) -> Box<dyn Resolve> {
-    build_js_resolver(SecureOsFileSystem::new(), options)
+    build_js_resolver(SecureOsFileSystem::new(), options, true)
+}
+
+/// Build a JavaScript resolver that preserves symlink spellings in resolved
+/// paths. This is intended for callers whose admission policy must inspect the
+/// path that resolution traversed rather than only its canonical identity.
+pub fn js_resolver_preserving_symlinks(options: JsResolveOptions) -> Box<dyn Resolve> {
+    build_js_resolver(SecureOsFileSystem::new(), options, false)
 }
 
 /// Build a JavaScript resolver backed by an injected filesystem.
@@ -92,14 +99,16 @@ pub fn js_resolver_with_fs<FS: FileSystem + 'static>(
     fs: FS,
     options: JsResolveOptions,
 ) -> Box<dyn Resolve> {
-    build_js_resolver(fs, options)
+    build_js_resolver(fs, options, true)
 }
 
 fn build_js_resolver<FS: FileSystem + 'static>(
     fs: FS,
     options: JsResolveOptions,
+    resolve_symlinks: bool,
 ) -> Box<dyn Resolve> {
-    let (import_options, require_options, configured_tsconfig) = resolver_options(options);
+    let (import_options, require_options, configured_tsconfig) =
+        resolver_options(options, resolve_symlinks);
     let file_system = SharedFileSystem::from_file_system(fs);
     let import_resolver =
         ResolverGeneric::new_with_file_system(file_system.clone(), import_options);
@@ -109,6 +118,7 @@ fn build_js_resolver<FS: FileSystem + 'static>(
         require_resolver,
         file_system,
         configured_tsconfig,
+        preserve_symlink_spelling: !resolve_symlinks,
         dependency_memo: Mutex::new(HashMap::new()),
         #[cfg(debug_assertions)]
         in_flight: AtomicU32::new(0),
@@ -120,6 +130,7 @@ struct JsResolver {
     require_resolver: ResolverGeneric<SharedFileSystem>,
     file_system: SharedFileSystem,
     configured_tsconfig: Option<PathBuf>,
+    preserve_symlink_spelling: bool,
     dependency_memo: Mutex<HashMap<ResolutionMemoKey, Vec<CompactString>>>,
     #[cfg(debug_assertions)]
     in_flight: AtomicU32,
@@ -215,12 +226,14 @@ impl Resolve for JsResolver {
                 let package_json = resolution.package_json();
                 dependency_paths
                     .extend(package_json.map(|package_json| package_json.path().to_path_buf()));
+                let manifest_name = package_json.and_then(|package_json| package_json.name());
+                let resolved = self.classify_resolution(
+                    import.specifier.as_str(),
+                    resolution.path(),
+                    manifest_name,
+                );
                 ResolutionOutcome {
-                    resolved: classify_resolution(
-                        import.specifier.as_str(),
-                        resolution.path(),
-                        package_json.and_then(|package_json| package_json.name()),
-                    ),
+                    resolved,
                     dependencies: collect_dependencies(context, dependency_paths),
                     notes,
                     completeness: ResolutionCompleteness::Complete,
@@ -255,6 +268,25 @@ impl Resolve for JsResolver {
 }
 
 impl JsResolver {
+    fn classify_resolution(
+        &self,
+        specifier: &str,
+        path: &Path,
+        manifest_name: Option<&str>,
+    ) -> Resolved {
+        if !self.preserve_symlink_spelling {
+            return classify_resolution(specifier, path, manifest_name);
+        }
+        let identity = self
+            .file_system
+            .canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf());
+        match classify_resolution(specifier, &identity, manifest_name) {
+            Resolved::Path(_) => Resolved::Path(path_string(&absolute_path(path))),
+            external => external,
+        }
+    }
+
     fn resolver_for(&self, kind: ImportKind) -> &ResolverGeneric<SharedFileSystem> {
         match kind {
             ImportKind::CommonJs | ImportKind::TsImportRequire => &self.require_resolver,
@@ -456,6 +488,7 @@ impl JsResolver {
 
 fn resolver_options(
     options: JsResolveOptions,
+    resolve_symlinks: bool,
 ) -> (ResolveOptions, ResolveOptions, Option<PathBuf>) {
     let JsResolveOptions {
         tsconfig,
@@ -477,12 +510,14 @@ fn resolver_options(
         tsconfig: tsconfig.clone(),
         condition_names: family_conditions("import", &common_conditions),
         extensions: extensions.clone(),
+        symlinks: resolve_symlinks,
         ..ResolveOptions::default()
     };
     let require_options = ResolveOptions {
         tsconfig,
         condition_names: family_conditions("require", &common_conditions),
         extensions,
+        symlinks: resolve_symlinks,
         ..ResolveOptions::default()
     };
     (import_options, require_options, configured_tsconfig)

@@ -497,6 +497,45 @@ impl HearthEngine {
 
     // -- graph -----------------------------------------------------------
 
+    /// Warm explicit seed files and their resolved direct in-root imports.
+    #[napi]
+    pub fn graph_prefetch(
+        &self,
+        env: Env,
+        params: GraphPrefetchParams,
+    ) -> Result<GraphPrefetchResult> {
+        let params =
+            proto::GraphPrefetchParams::try_from(params).map_err(|e| structured_err(&env, e))?;
+        hearth_tools::graph_prefetch(&self.engine, &params)
+            .map(Into::into)
+            .map_err(|e| structured_err(&env, e))
+    }
+
+    /// Asynchronously warm explicit seeds and their direct imports.
+    #[napi(
+        ts_args_type = "params: GraphPrefetchParams, signal?: AbortSignal",
+        ts_return_type = "Promise<GraphPrefetchResult>"
+    )]
+    pub fn graph_prefetch_async(
+        &self,
+        env: Env,
+        params: GraphPrefetchParams,
+        signal: Option<Abort>,
+    ) -> Result<AsyncTask<GraphPrefetchTask>> {
+        let params =
+            proto::GraphPrefetchParams::try_from(params).map_err(|e| structured_err(&env, e))?;
+        let (cancel, signal) = split(signal);
+        Ok(AsyncTask::with_optional_signal(
+            GraphPrefetchTask {
+                engine: self.engine.clone(),
+                params,
+                cancel,
+                failure: None,
+            },
+            signal,
+        ))
+    }
+
     /// Synchronously list symbols extracted from one file.
     #[napi]
     pub fn graph_symbols(&self, env: Env, params: GraphSymbolsParams) -> Result<GraphResult> {
@@ -917,6 +956,13 @@ tool_task!(
     proto::FindResult,
     FindResult,
     hearth_tools::find_cancellable
+);
+tool_task!(
+    GraphPrefetchTask,
+    proto::GraphPrefetchParams,
+    proto::GraphPrefetchResult,
+    GraphPrefetchResult,
+    hearth_tools::graph_prefetch_cancellable
 );
 tool_task!(
     GraphTask,
