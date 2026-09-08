@@ -15,11 +15,12 @@ use hearth_tools::transport::{
     effective_uid, prepare_default_endpoint, validate_endpoint_path, verify_peer_uid, write_msg,
 };
 use std::io::{self, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -31,8 +32,9 @@ const MIN_FRAME_RESERVATION_BYTES: usize = 256 * 1024 * 1024;
 const MAX_IN_FLIGHT_FRAME_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 5_000;
 const MAX_DRAIN_TIMEOUT_MS: u64 = 60_000;
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const IDLE_CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const WORKER_REAP_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_FRAME_BYTES: u32 = 4096;
 const MAX_OVERLOAD_CONTROL_CONNECTIONS: usize = 4;
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(1);
@@ -139,14 +141,19 @@ enum LifecycleState {
 struct Lifecycle {
     state: AtomicU8,
     cancel: CancelToken,
+    shutdown_reader: UnixStream,
+    shutdown_writer: UnixStream,
 }
 
 impl Lifecycle {
-    fn new() -> Self {
-        Self {
+    fn new() -> io::Result<Self> {
+        let (shutdown_reader, shutdown_writer) = UnixStream::pair()?;
+        Ok(Self {
             state: AtomicU8::new(LifecycleState::Accepting as u8),
             cancel: CancelToken::new(),
-        }
+            shutdown_reader,
+            shutdown_writer,
+        })
     }
 
     fn state(&self) -> LifecycleState {
@@ -164,13 +171,19 @@ impl Lifecycle {
     }
 
     fn begin_draining(&self) {
-        self.cancel.cancel();
-        let _ = self.state.compare_exchange(
-            LifecycleState::Accepting as u8,
-            LifecycleState::Draining as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self
+            .state
+            .compare_exchange(
+                LifecycleState::Accepting as u8,
+                LifecycleState::Draining as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.cancel.cancel();
+            let _ = self.shutdown_writer.shutdown(Shutdown::Write);
+        }
     }
 
     fn finish_drain(&self, drained: bool) {
@@ -334,6 +347,13 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListenerWake {
+    Connection,
+    Shutdown,
+    Maintenance,
+}
+
 fn run(args: Args) -> io::Result<LifecycleState> {
     validate_daemon_uid(effective_uid())?;
     let connections = ConnectionPool::new(args.max_connections)?;
@@ -361,12 +381,24 @@ fn run(args: Args) -> io::Result<LifecycleState> {
         hearth_core::profiler::global_profiler().enable();
     }
 
-    let lifecycle = Arc::new(Lifecycle::new());
+    let lifecycle = Arc::new(Lifecycle::new()?);
     let mut workers = Vec::new();
+    let mut accept_error = None;
     eprintln!("hearthd: listening on {}", endpoint.path().display());
 
     while lifecycle.is_accepting() {
         reap_finished_workers(&mut workers);
+        let maintenance_timeout = (!workers.is_empty()).then_some(WORKER_REAP_INTERVAL);
+        match wait_for_listener(bound.listener(), &lifecycle, maintenance_timeout) {
+            Ok(ListenerWake::Connection) => {}
+            Ok(ListenerWake::Shutdown) => break,
+            Ok(ListenerWake::Maintenance) => continue,
+            Err(error) => {
+                lifecycle.begin_draining();
+                accept_error = Some(error);
+                break;
+            }
+        }
         match bound.listener().accept() {
             Ok((stream, _address)) => {
                 if let Err(error) = stream.set_nonblocking(false) {
@@ -438,13 +470,24 @@ fn run(args: Args) -> io::Result<LifecycleState> {
                     Err(error) => eprintln!("hearthd: failed to spawn connection thread: {error}"),
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL_INTERVAL);
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::ConnectionAborted
+                ) => {}
             Err(error) => {
                 eprintln!("hearthd: accept error: {error}");
-                std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                match wait_for_shutdown(&lifecycle, ACCEPT_ERROR_BACKOFF) {
+                    Ok(false) => {}
+                    Ok(true) => break,
+                    Err(error) => {
+                        lifecycle.begin_draining();
+                        accept_error = Some(error);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -465,7 +508,117 @@ fn run(args: Args) -> io::Result<LifecycleState> {
     if !removed {
         eprintln!("hearthd: endpoint path was absent or replaced; cleanup preserved it");
     }
+    if let Some(error) = accept_error {
+        return Err(error);
+    }
     Ok(lifecycle.state())
+}
+
+fn wait_for_listener(
+    listener: &impl AsRawFd,
+    lifecycle: &Lifecycle,
+    timeout: Option<Duration>,
+) -> io::Result<ListenerWake> {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    loop {
+        let mut pollfds = [
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: lifecycle.shutdown_reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let timeout_ms = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(ListenerWake::Maintenance);
+                }
+                duration_to_poll_timeout(remaining)
+            }
+            None => -1,
+        };
+        // SAFETY: both descriptors remain owned for this call and `pollfds` is a valid stack array.
+        let ready = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            return Ok(ListenerWake::Maintenance);
+        }
+
+        let shutdown_events = pollfds[1].revents;
+        if shutdown_events & libc::POLLNVAL != 0 {
+            return Err(io::Error::other("shutdown descriptor is invalid"));
+        }
+        if shutdown_events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+            || !lifecycle.is_accepting()
+        {
+            return Ok(ListenerWake::Shutdown);
+        }
+
+        let listener_events = pollfds[0].revents;
+        if listener_events & libc::POLLIN != 0 {
+            return Ok(ListenerWake::Connection);
+        }
+        if listener_events & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other(format!(
+                "listener readiness failed with poll events {listener_events:#x}"
+            )));
+        }
+    }
+}
+
+fn wait_for_shutdown(lifecycle: &Lifecycle, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let mut pollfd = libc::pollfd {
+            fd: lifecycle.shutdown_reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the lifecycle owns the descriptor for this call and `pollfd` is initialized.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, duration_to_poll_timeout(remaining)) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            return Ok(false);
+        }
+        if pollfd.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::other("shutdown descriptor is invalid"));
+        }
+        if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn duration_to_poll_timeout(duration: Duration) -> i32 {
+    i32::try_from(duration.as_millis().max(1)).unwrap_or(i32::MAX)
 }
 
 fn validate_daemon_uid(uid: u32) -> io::Result<()> {
@@ -652,9 +805,17 @@ fn handle_conn(
         }
 
         let request_cancel = CancelToken::new();
-        let monitor_stop = Arc::new(AtomicBool::new(false));
-        let monitor =
-            start_disconnect_monitor(&stream, &request_cancel, &lifecycle.cancel, &monitor_stop);
+        let monitor = match start_disconnect_monitor(&stream, &request_cancel, &lifecycle) {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                let _ = write_response(
+                    &stream,
+                    &Response::Error(ToolError::from(error)),
+                    RESPONSE_IO_TIMEOUT,
+                );
+                break;
+            }
+        };
         // Zero-copy fast path: if the client passed its stdout fd with a Read,
         // write the cached content straight to that fd and return only metadata.
         let resp = if let (Some(fd), Request::Read(params)) = (fd.as_ref(), &req) {
@@ -662,44 +823,120 @@ fn handle_conn(
         } else {
             dispatch_cancellable(&engine, req, &request_cancel)
         };
-        monitor_stop.store(true, Ordering::Release);
-        let _ = monitor.join();
+        monitor.finish();
         if write_response(&stream, &resp, RESPONSE_IO_TIMEOUT).is_err() || is_shutdown {
             break;
         }
     }
 }
 
+struct DisconnectMonitor {
+    stop_writer: Option<UnixStream>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl DisconnectMonitor {
+    fn finish(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        if let Some(stop_writer) = self.stop_writer.take() {
+            let _ = stop_writer.shutdown(Shutdown::Write);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for DisconnectMonitor {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
 fn start_disconnect_monitor(
     stream: &UnixStream,
     cancel: &CancelToken,
-    shutdown: &CancelToken,
-    stop: &Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    let fd = stream.as_raw_fd();
+    lifecycle: &Arc<Lifecycle>,
+) -> io::Result<DisconnectMonitor> {
+    let monitored_stream = stream.try_clone()?;
+    let (stop_reader, stop_writer) = UnixStream::pair()?;
     let cancel = cancel.clone();
-    let shutdown = shutdown.clone();
-    let stop = Arc::clone(stop);
-    std::thread::spawn(move || {
-        while !stop.load(Ordering::Acquire) && !cancel.is_cancelled() {
-            if shutdown.is_cancelled() {
-                cancel.cancel();
-                break;
-            }
-            let mut pollfd = libc::pollfd {
-                fd,
+    let lifecycle = Arc::clone(lifecycle);
+    let worker = std::thread::Builder::new()
+        .name("hearthd-disconnect-monitor".into())
+        .spawn(
+            move || match wait_for_disconnect(&monitored_stream, &stop_reader, &lifecycle) {
+                Ok(false) => {}
+                Ok(true) | Err(_) => cancel.cancel(),
+            },
+        )?;
+    Ok(DisconnectMonitor {
+        stop_writer: Some(stop_writer),
+        worker: Some(worker),
+    })
+}
+
+fn wait_for_disconnect(
+    stream: &UnixStream,
+    stop_reader: &UnixStream,
+    lifecycle: &Lifecycle,
+) -> io::Result<bool> {
+    loop {
+        if lifecycle.cancel.is_cancelled() {
+            return Ok(true);
+        }
+        let mut pollfds = [
+            libc::pollfd {
+                fd: stream.as_raw_fd(),
                 events: libc::POLLHUP | libc::POLLERR,
                 revents: 0,
-            };
-            // SAFETY: the connection thread joins this monitor before dropping
-            // the stream, so `fd` remains valid throughout polling.
-            let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
-            if ready > 0 && pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                cancel.cancel();
-                break;
+            },
+            libc::pollfd {
+                fd: stop_reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: lifecycle.shutdown_reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: all descriptors remain owned for this call and `pollfds` is a valid stack array.
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
+            return Err(error);
         }
-    })
+
+        let connection_events = pollfds[0].revents;
+        let shutdown_events = pollfds[2].revents;
+        if shutdown_events & libc::POLLNVAL != 0 {
+            return Err(io::Error::other("shutdown descriptor is invalid"));
+        }
+        if connection_events & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            || shutdown_events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+            || lifecycle.cancel.is_cancelled()
+        {
+            return Ok(true);
+        }
+
+        let stop_events = pollfds[1].revents;
+        if stop_events & libc::POLLNVAL != 0 {
+            return Err(io::Error::other(
+                "disconnect monitor stop descriptor is invalid",
+            ));
+        }
+        if stop_events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            return Ok(false);
+        }
+    }
 }
 
 /// Run `read`, then write its content directly to the client-supplied fd.
@@ -825,8 +1062,89 @@ mod tests {
     }
 
     #[test]
+    fn listener_wait_wakes_for_readiness_and_shutdown() {
+        let ready_lifecycle = Lifecycle::new().unwrap();
+        let (ready, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(&[1]).unwrap();
+        assert_eq!(
+            wait_for_listener(&ready, &ready_lifecycle, Some(Duration::from_millis(100))).unwrap(),
+            ListenerWake::Connection
+        );
+
+        let shutdown_lifecycle = Lifecycle::new().unwrap();
+        let inherited_writer = shutdown_lifecycle.shutdown_writer.try_clone().unwrap();
+        let (idle, _peer) = UnixStream::pair().unwrap();
+        shutdown_lifecycle.begin_draining();
+        assert_eq!(
+            wait_for_listener(&idle, &shutdown_lifecycle, Some(Duration::from_millis(100)),)
+                .unwrap(),
+            ListenerWake::Shutdown
+        );
+        drop(inherited_writer);
+    }
+
+    #[test]
+    fn maintenance_wake_reaps_finished_workers() {
+        let lifecycle = Lifecycle::new().unwrap();
+        let (idle, _peer) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(|| {});
+        while !worker.is_finished() {
+            std::thread::yield_now();
+        }
+        let mut workers = vec![worker];
+        assert_eq!(
+            wait_for_listener(&idle, &lifecycle, Some(Duration::from_millis(1))).unwrap(),
+            ListenerWake::Maintenance
+        );
+        reap_finished_workers(&mut workers);
+        assert!(workers.is_empty());
+    }
+
+    #[test]
+    fn shutdown_signal_interrupts_accept_error_backoff() {
+        let lifecycle = Lifecycle::new().unwrap();
+        let inherited_writer = lifecycle.shutdown_writer.try_clone().unwrap();
+        lifecycle.begin_draining();
+        let start = Instant::now();
+        assert!(wait_for_shutdown(&lifecycle, Duration::from_secs(1)).unwrap());
+        assert!(start.elapsed() < Duration::from_millis(500));
+        drop(inherited_writer);
+    }
+
+    #[test]
+    fn monitor_completion_and_cancellation_events_are_distinct() {
+        let lifecycle = Arc::new(Lifecycle::new().unwrap());
+        let (server, client) = UnixStream::pair().unwrap();
+        let request_cancel = CancelToken::new();
+        let monitor = start_disconnect_monitor(&server, &request_cancel, &lifecycle).unwrap();
+        let inherited_writer = monitor.stop_writer.as_ref().unwrap().try_clone().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let finisher = std::thread::spawn(move || {
+            monitor.finish();
+            finished_tx.send(()).unwrap();
+        });
+        assert!(finished_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        drop(inherited_writer);
+        finisher.join().unwrap();
+        assert!(!request_cancel.is_cancelled());
+
+        let disconnected_cancel = CancelToken::new();
+        let monitor = start_disconnect_monitor(&server, &disconnected_cancel, &lifecycle).unwrap();
+        drop(client);
+        monitor.finish();
+        assert!(disconnected_cancel.is_cancelled());
+
+        let (server, _client) = UnixStream::pair().unwrap();
+        let shutdown_cancel = CancelToken::new();
+        let monitor = start_disconnect_monitor(&server, &shutdown_cancel, &lifecycle).unwrap();
+        lifecycle.begin_draining();
+        monitor.finish();
+        assert!(shutdown_cancel.is_cancelled());
+    }
+
+    #[test]
     fn overload_control_lane_keeps_shutdown_reachable() {
-        let lifecycle = Arc::new(Lifecycle::new());
+        let lifecycle = Arc::new(Lifecycle::new().unwrap());
         let frames = FrameBudget::new(DEFAULT_MAX_IN_FLIGHT_FRAME_BYTES).unwrap();
         let (server, mut client) = UnixStream::pair().unwrap();
         let worker_lifecycle = Arc::clone(&lifecycle);
@@ -860,7 +1178,7 @@ mod tests {
             enable_watch: false,
             ..EngineConfig::default()
         });
-        let lifecycle = Arc::new(Lifecycle::new());
+        let lifecycle = Arc::new(Lifecycle::new().unwrap());
         let worker_lifecycle = Arc::clone(&lifecycle);
         let (server, client) = UnixStream::pair().unwrap();
         let frames = FrameBudget::new(DEFAULT_MAX_IN_FLIGHT_FRAME_BYTES).unwrap();
@@ -911,7 +1229,7 @@ mod tests {
 
     #[test]
     fn drain_reaches_stopped_after_last_permit_returns() {
-        let lifecycle = Arc::new(Lifecycle::new());
+        let lifecycle = Arc::new(Lifecycle::new().unwrap());
         let pool = ConnectionPool::new(1).unwrap();
         let permit = pool.try_acquire().unwrap();
         lifecycle.begin_draining();
@@ -929,7 +1247,7 @@ mod tests {
 
     #[test]
     fn drain_timeout_is_a_terminal_explicit_state() {
-        let lifecycle = Lifecycle::new();
+        let lifecycle = Lifecycle::new().unwrap();
         let pool = ConnectionPool::new(1).unwrap();
         let _permit = pool.try_acquire().unwrap();
         lifecycle.begin_draining();
@@ -947,7 +1265,7 @@ mod tests {
             enable_watch: false,
             ..EngineConfig::default()
         });
-        let lifecycle = Arc::new(Lifecycle::new());
+        let lifecycle = Arc::new(Lifecycle::new().unwrap());
         let worker_lifecycle = Arc::clone(&lifecycle);
         let (server, client) = UnixStream::pair().unwrap();
         let frames = FrameBudget::new(DEFAULT_MAX_IN_FLIGHT_FRAME_BYTES).unwrap();
