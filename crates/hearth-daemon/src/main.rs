@@ -34,6 +34,7 @@ const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 5_000;
 const MAX_DRAIN_TIMEOUT_MS: u64 = 60_000;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const IDLE_CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const WORKER_REAP_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_FRAME_BYTES: u32 = 4096;
 const MAX_OVERLOAD_CONTROL_CONNECTIONS: usize = 4;
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(1);
@@ -141,7 +142,7 @@ struct Lifecycle {
     state: AtomicU8,
     cancel: CancelToken,
     shutdown_reader: UnixStream,
-    shutdown_writer: Mutex<Option<UnixStream>>,
+    shutdown_writer: UnixStream,
 }
 
 impl Lifecycle {
@@ -151,7 +152,7 @@ impl Lifecycle {
             state: AtomicU8::new(LifecycleState::Accepting as u8),
             cancel: CancelToken::new(),
             shutdown_reader,
-            shutdown_writer: Mutex::new(Some(shutdown_writer)),
+            shutdown_writer,
         })
     }
 
@@ -181,13 +182,7 @@ impl Lifecycle {
             .is_ok()
         {
             self.cancel.cancel();
-            let mut writer = self
-                .shutdown_writer
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(writer) = writer.take() {
-                let _ = writer.shutdown(Shutdown::Write);
-            }
+            let _ = self.shutdown_writer.shutdown(Shutdown::Write);
         }
     }
 
@@ -352,6 +347,13 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListenerWake {
+    Connection,
+    Shutdown,
+    Maintenance,
+}
+
 fn run(args: Args) -> io::Result<LifecycleState> {
     validate_daemon_uid(effective_uid())?;
     let connections = ConnectionPool::new(args.max_connections)?;
@@ -386,9 +388,11 @@ fn run(args: Args) -> io::Result<LifecycleState> {
 
     while lifecycle.is_accepting() {
         reap_finished_workers(&mut workers);
-        match wait_for_listener(bound.listener(), &lifecycle) {
-            Ok(true) => {}
-            Ok(false) => break,
+        let maintenance_timeout = (!workers.is_empty()).then_some(WORKER_REAP_INTERVAL);
+        match wait_for_listener(bound.listener(), &lifecycle, maintenance_timeout) {
+            Ok(ListenerWake::Connection) => {}
+            Ok(ListenerWake::Shutdown) => break,
+            Ok(ListenerWake::Maintenance) => continue,
             Err(error) => {
                 lifecycle.begin_draining();
                 accept_error = Some(error);
@@ -510,11 +514,13 @@ fn run(args: Args) -> io::Result<LifecycleState> {
     Ok(lifecycle.state())
 }
 
-fn wait_for_listener(listener: &impl AsRawFd, lifecycle: &Lifecycle) -> io::Result<bool> {
+fn wait_for_listener(
+    listener: &impl AsRawFd,
+    lifecycle: &Lifecycle,
+    timeout: Option<Duration>,
+) -> io::Result<ListenerWake> {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
-        if !lifecycle.is_accepting() {
-            return Ok(false);
-        }
         let mut pollfds = [
             libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -527,7 +533,24 @@ fn wait_for_listener(listener: &impl AsRawFd, lifecycle: &Lifecycle) -> io::Resu
                 revents: 0,
             },
         ];
-        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, -1) };
+        let timeout_ms = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(ListenerWake::Maintenance);
+                }
+                duration_to_poll_timeout(remaining)
+            }
+            None => -1,
+        };
+        // SAFETY: both descriptors remain owned for this call and `pollfds` is a valid stack array.
+        let ready = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -535,17 +558,23 @@ fn wait_for_listener(listener: &impl AsRawFd, lifecycle: &Lifecycle) -> io::Resu
             }
             return Err(error);
         }
+        if ready == 0 {
+            return Ok(ListenerWake::Maintenance);
+        }
 
         let shutdown_events = pollfds[1].revents;
-        if shutdown_events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        if shutdown_events & libc::POLLNVAL != 0 {
+            return Err(io::Error::other("shutdown descriptor is invalid"));
+        }
+        if shutdown_events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
             || !lifecycle.is_accepting()
         {
-            return Ok(false);
+            return Ok(ListenerWake::Shutdown);
         }
 
         let listener_events = pollfds[0].revents;
         if listener_events & libc::POLLIN != 0 {
-            return Ok(true);
+            return Ok(ListenerWake::Connection);
         }
         if listener_events & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             return Err(io::Error::other(format!(
@@ -556,17 +585,19 @@ fn wait_for_listener(listener: &impl AsRawFd, lifecycle: &Lifecycle) -> io::Resu
 }
 
 fn wait_for_shutdown(lifecycle: &Lifecycle, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
     loop {
-        if !lifecycle.is_accepting() {
-            return Ok(true);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
         }
         let mut pollfd = libc::pollfd {
             fd: lifecycle.shutdown_reader.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        // SAFETY: the lifecycle owns the descriptor for this call and `pollfd` is initialized.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, duration_to_poll_timeout(remaining)) };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -575,7 +606,7 @@ fn wait_for_shutdown(lifecycle: &Lifecycle, timeout: Duration) -> io::Result<boo
             return Err(error);
         }
         if ready == 0 {
-            return Ok(!lifecycle.is_accepting());
+            return Ok(false);
         }
         if pollfd.revents & libc::POLLNVAL != 0 {
             return Err(io::Error::other("shutdown descriptor is invalid"));
@@ -584,6 +615,10 @@ fn wait_for_shutdown(lifecycle: &Lifecycle, timeout: Duration) -> io::Result<boo
             return Ok(true);
         }
     }
+}
+
+fn duration_to_poll_timeout(duration: Duration) -> i32 {
+    i32::try_from(duration.as_millis().max(1)).unwrap_or(i32::MAX)
 }
 
 fn validate_daemon_uid(uid: u32) -> io::Result<()> {
@@ -870,6 +905,7 @@ fn wait_for_disconnect(
                 revents: 0,
             },
         ];
+        // SAFETY: all descriptors remain owned for this call and `pollfds` is a valid stack array.
         let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, -1) };
         if ready < 0 {
             let error = io::Error::last_os_error();
@@ -881,9 +917,11 @@ fn wait_for_disconnect(
 
         let connection_events = pollfds[0].revents;
         let shutdown_events = pollfds[2].revents;
+        if shutdown_events & libc::POLLNVAL != 0 {
+            return Err(io::Error::other("shutdown descriptor is invalid"));
+        }
         if connection_events & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
-            || shutdown_events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
-                != 0
+            || shutdown_events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
             || lifecycle.cancel.is_cancelled()
         {
             return Ok(true);
@@ -1028,26 +1066,49 @@ mod tests {
         let ready_lifecycle = Lifecycle::new().unwrap();
         let (ready, mut peer) = UnixStream::pair().unwrap();
         peer.write_all(&[1]).unwrap();
-        assert!(wait_for_listener(&ready, &ready_lifecycle).unwrap());
+        assert_eq!(
+            wait_for_listener(&ready, &ready_lifecycle, Some(Duration::from_millis(100))).unwrap(),
+            ListenerWake::Connection
+        );
 
         let shutdown_lifecycle = Lifecycle::new().unwrap();
+        let inherited_writer = shutdown_lifecycle.shutdown_writer.try_clone().unwrap();
         let (idle, _peer) = UnixStream::pair().unwrap();
         shutdown_lifecycle.begin_draining();
-        assert!(!wait_for_listener(&idle, &shutdown_lifecycle).unwrap());
+        assert_eq!(
+            wait_for_listener(&idle, &shutdown_lifecycle, Some(Duration::from_millis(100)),)
+                .unwrap(),
+            ListenerWake::Shutdown
+        );
+        drop(inherited_writer);
     }
 
     #[test]
-    fn accept_error_backoff_is_interrupted_by_shutdown() {
-        let lifecycle = Arc::new(Lifecycle::new().unwrap());
-        let waiter_lifecycle = Arc::clone(&lifecycle);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            wait_for_shutdown(&waiter_lifecycle, Duration::from_secs(1)).unwrap()
-        });
-        started_rx.recv().unwrap();
+    fn maintenance_wake_reaps_finished_workers() {
+        let lifecycle = Lifecycle::new().unwrap();
+        let (idle, _peer) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(|| {});
+        while !worker.is_finished() {
+            std::thread::yield_now();
+        }
+        let mut workers = vec![worker];
+        assert_eq!(
+            wait_for_listener(&idle, &lifecycle, Some(Duration::from_millis(1))).unwrap(),
+            ListenerWake::Maintenance
+        );
+        reap_finished_workers(&mut workers);
+        assert!(workers.is_empty());
+    }
+
+    #[test]
+    fn shutdown_signal_interrupts_accept_error_backoff() {
+        let lifecycle = Lifecycle::new().unwrap();
+        let inherited_writer = lifecycle.shutdown_writer.try_clone().unwrap();
         lifecycle.begin_draining();
-        assert!(waiter.join().unwrap());
+        let start = Instant::now();
+        assert!(wait_for_shutdown(&lifecycle, Duration::from_secs(1)).unwrap());
+        assert!(start.elapsed() < Duration::from_millis(500));
+        drop(inherited_writer);
     }
 
     #[test]
