@@ -103,7 +103,7 @@ jobs:
           # Native runners for every declared target: no cross toolchain, and
           # the binary is exercised on the platform it ships to.
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           # macos-13 was retired in December 2025; macos-15-intel is the
           # free-tier x86_64 macOS image that replaced it. Apple has dropped
           # x86_64, so GitHub removes this architecture entirely when the
@@ -126,6 +126,12 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: rustup target add "$TARGET"
+
+      # Keep Rust's existing ARM64 minimum for both Rust and native C/C++
+      # dependencies when the runner's macOS SDK changes.
+      - name: Preserve the ARM64 macOS deployment target
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=11.0' >> "$GITHUB_ENV"
 
       # No caching anywhere in this workflow. A cache is written by other
       # workflows on other refs, so restoring one here would let a branch build
