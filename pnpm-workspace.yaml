@@ -5,4 +5,4 @@ packages:
 saveExact: true
 
 overrides:
-  "@napi-rs/cli@3.7.4>js-yaml": "4.3.1"
+  "@napi-rs/cli@3.7.4>js-yaml": "4.3.2"
