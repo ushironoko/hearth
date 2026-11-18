@@ -74,6 +74,42 @@ describe 0 = \"zero\"
 describe value = show value
 ";
 
+/// Functions with signatures, a class, an instance with an instance signature
+/// and adjacent equations, a parameterless binding, and data/newtype/type
+/// declarations. Symbol rows are the 0.23.1 outline, which 0.24.1 reproduces.
+const REALISTIC_HASKELL: &str = "\
+{-# LANGUAGE InstanceSigs #-}
+module Example.Widget
+  ( Widget(..)
+  , Label
+  , describe
+  ) where
+
+import Data.Text (Text)
+
+data Widget = Widget Int Text
+  deriving (Eq, Show)
+
+newtype UserId = UserId Int
+
+type Label = Text
+
+class Renderable a where
+  render :: a -> String
+
+instance Renderable Widget where
+  render :: Widget -> String
+  render (Widget 0 _) = \"zero\"
+  render (Widget n _) = show n
+
+describe :: Widget -> String
+describe (Widget 0 _) = \"zero\"
+describe value = render value
+
+unrelated :: Int
+unrelated = 1
+";
+
 const ZIG_SOURCE: &str = "\
 const Point = struct { x: i32 };
 pub fn add(a: i32, b: i32) i32 { return a + b; }
@@ -361,6 +397,100 @@ fn extract_haskell_declarations_and_merges_function_equations() {
 }
 
 #[test]
+fn extract_realistic_haskell_keeps_signatures_instances_and_merged_equations() {
+    let registry = LanguageRegistry::bundled();
+    let mut pool = ParserPool::new(&registry);
+    let symbols = extract_symbols(REALISTIC_HASKELL, "Example/Widget.hs", &mut pool);
+    let actual: Vec<_> = symbols
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.name.as_str(),
+                symbol.kind,
+                symbol.line,
+                symbol.column,
+                symbol.depth,
+                symbol.name_start,
+                symbol.def_start,
+                symbol.def_end,
+            )
+        })
+        .collect();
+    let declarations = [
+        (
+            "module Example.Widget\n  ( Widget(..)\n  , Label\n  , describe\n  ) where",
+            "Example.Widget",
+            SymbolKind::Module,
+            2,
+            7,
+        ),
+        (
+            "data Widget = Widget Int Text\n  deriving (Eq, Show)",
+            "Widget",
+            SymbolKind::Class,
+            10,
+            5,
+        ),
+        (
+            "newtype UserId = UserId Int",
+            "UserId",
+            SymbolKind::Class,
+            13,
+            8,
+        ),
+        ("type Label = Text", "Label", SymbolKind::Type, 15, 5),
+        (
+            "class Renderable a where\n  render :: a -> String",
+            "Renderable",
+            SymbolKind::Interface,
+            17,
+            6,
+        ),
+        (
+            "render (Widget 0 _) = \"zero\"",
+            "render",
+            SymbolKind::Function,
+            22,
+            2,
+        ),
+        (
+            "describe (Widget 0 _) = \"zero\"",
+            "describe",
+            SymbolKind::Function,
+            26,
+            0,
+        ),
+    ];
+    let expected: Vec<_> = declarations
+        .into_iter()
+        .map(|(definition, name, kind, line, column)| {
+            let (def_start, def_end) = byte_range(REALISTIC_HASKELL, definition);
+            let name_at = u32::try_from(definition.find(name).expect("name is in definition"))
+                .expect("name offset fits u32");
+            (
+                name,
+                kind,
+                line,
+                column,
+                0,
+                def_start + name_at,
+                def_start,
+                def_end,
+            )
+        })
+        .collect();
+
+    assert_eq!(actual, expected);
+    for name in ["render", "describe"] {
+        assert_eq!(
+            symbols.iter().filter(|symbol| symbol.name == name).count(),
+            1,
+            "{name} has a signature and two equations, and stays one function"
+        );
+    }
+}
+
+#[test]
 fn extract_zig_uses_bundled_query() {
     let names = names(ZIG_SOURCE, "point.zig");
     assert!(names.contains(&"Point".to_string()), "got {names:?}");
@@ -558,6 +688,7 @@ fn extracted_byte_ranges_are_coherent() {
         (C_SHARP_SOURCE, "Service.cs"),
         (C_SHARP_OVERLOAD_SOURCE, "Overloads.cs"),
         (HASKELL_SOURCE, "Fixture.hs"),
+        (REALISTIC_HASKELL, "Example/Widget.hs"),
         (ZIG_SOURCE, "point.zig"),
         (BASH_SOURCE, "deploy.sh"),
         (MARKDOWN_SOURCE, "README.md"),

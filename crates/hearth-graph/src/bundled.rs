@@ -243,6 +243,17 @@ mod tests {
     }
 
     #[test]
+    fn haskell_tags_query_compiles() {
+        let source = include_str!("../queries/haskell/tags.scm");
+        assert!(
+            source.contains("(type_synonym name: (name) @name) @definition.type"),
+            "haskell tags must name the 0.24.1 type synonym node"
+        );
+        tree_sitter::Query::new(&tree_sitter_haskell::LANGUAGE.into(), source)
+            .expect("haskell tags query compiles");
+    }
+
+    #[test]
     fn bundled_injection_queries_compile_and_are_pool_reachable() {
         let registry = LanguageRegistry::bundled();
         let mut pool = ParserPool::new(&registry);
